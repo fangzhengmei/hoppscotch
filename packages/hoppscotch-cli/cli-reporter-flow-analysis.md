@@ -546,7 +546,105 @@ processRequest (src/utils/request.ts:230-397)      RequestReport[]
 
 ---
 
-## 7. 关键设计决策总结
+## 7. 迭代执行中 selected 与 global 环境变量的行为
+
+### 7.1 核心行为差异
+
+在多轮迭代执行中，`selected` 和 `global` 环境变量的隔离策略**完全不同**：
+
+| 环境变量类型 | 迭代间隔离 | 重置时机 | 代码位置 |
+|------------|-----------|---------|---------|
+| `selected` | ✅ 完全隔离 | 每次迭代开始时重置为初始状态 | `collections.ts:68,76` |
+| `global` | ❌ 无隔离 | 永不重置，在迭代间持续累积 | 无重置代码 |
+
+### 7.2 selected 环境变量的隔离机制
+
+**代码证据**：`src/utils/collections.ts:68,76`
+
+```typescript
+// 第68行：迭代开始前，保存 selected 的初始快照
+const originalSelectedEnvs = [...envs.selected];
+
+for (let count = 0; count < resolvedIterationCount; count++) {
+  // ...
+  // 第76行：每次迭代开始时，重置 selected 到初始状态
+  envs.selected = [...originalSelectedEnvs];
+  
+  // 第78-90行：应用 iterationData（如指定），优先级高于初始 selected
+  if (iterationData) {
+    const iterationDataItem = iterationData[Math.min(count, iterationData.length - 1)];
+    envs.selected = envs.selected
+      .filter((envPair) => !iterationDataItem.some((dataPair) => dataPair.key === envPair.key))
+      .concat(iterationDataItem);
+  }
+  // ... 执行请求 ...
+}
+```
+
+**行为说明**：
+1. 迭代开始前，对 `envs.selected` 做一次浅拷贝作为基准
+2. 每次迭代开始时，将 `envs.selected` 重置为该基准值
+3. 如有 `iterationData`，则在基准值基础上应用迭代数据（迭代数据优先级更高）
+4. 迭代内部的请求可以修改 `selected`，修改会在迭代内的请求间传递，但不会影响下一轮迭代
+
+### 7.3 global 环境变量的累积行为
+
+**代码证据**：`src/utils/collections.ts:155-157`
+
+```typescript
+// processCollection 函数中，每次请求完成后更新环境变量
+const result = await processRequest(processRequestParams)();
+const { global, selected } = result.envs;
+envs.global = global;    // global 被更新，但从未被重置
+envs.selected = selected;
+```
+
+**关键发现**：代码中**没有任何地方**保存或重置 `envs.global` 的初始值。
+
+**行为说明**：
+1. `global` 环境变量在整个 `collectionsRunner` 生命周期内**持续累积变化**
+2. 第1轮迭代中修改的 `global` 值会被第2轮、第3轮...迭代继承
+3. 即使使用 `iterationData`，也只影响 `selected`，不影响 `global`
+4. 迭代内的请求修改 `global` 后，后续迭代的所有请求都能看到这些修改
+
+### 7.4 边界情况说明
+
+**场景 1：测试脚本修改 global 环境变量**
+```javascript
+// 测试脚本
+pw.env.set("counter", String(Number(pw.env.get("counter")) + 1));
+```
+- 迭代1结束后：`counter = 1`
+- 迭代2结束后：`counter = 2`（继承自迭代1）
+- 迭代3结束后：`counter = 3`（继承自迭代2）
+
+**场景 2：测试脚本修改 selected 环境变量**
+```javascript
+// 测试脚本
+pw.env.set("token", "new-value");
+```
+- 迭代1：`token` 被修改为 `new-value`，迭代内后续请求可见
+- 迭代2开始：`token` 被重置为初始值，迭代1的修改丢失
+- 迭代3开始：`token` 再次被重置为初始值
+
+**场景 3：iterationData 与 selected 冲突**
+- 初始 `selected` 包含 `{ key: "userId", value: "100" }`
+- `iterationData` 包含 `{ key: "userId", value: "200" }`
+- 迭代开始时：`userId = 200`（迭代数据优先级更高）
+- 下次迭代：继续重置并应用迭代数据，与上次迭代的修改无关
+
+### 7.5 设计意图分析
+
+这种不对称设计可能的考虑：
+- `selected` 通常包含请求特定的可变参数，需要每次迭代从干净状态开始
+- `global` 可能包含需要跨迭代累积的全局状态（如计数器、令牌等）
+- `iterationData` 机制专门用于数据驱动测试，通过 `selected` 注入每次迭代的差异化数据
+
+> **重要提示**：如果期望每次迭代完全隔离，应避免在测试脚本中修改 `global` 环境变量，或在每次迭代的第一个请求中显式重置 `global`。
+
+---
+
+## 8. 关键设计决策总结
 
 1. **错误与测试失败分离**：脚本执行错误放入 `errors`，断言失败放入 `tests`，便于区分是代码问题还是业务校验不通过
 
@@ -554,7 +652,7 @@ processRequest (src/utils/request.ts:230-397)      RequestReport[]
 
 3. **多报告并行输出**：控制台和 JUnit 报告从同一数据源生成，保证输出一致性
 
-4. **迭代执行隔离**：每次迭代开始时重置环境变量，避免迭代间的数据污染
+4. **迭代执行的不对称隔离**：`selected` 环境变量每次迭代重置，`global` 环境变量在迭代间持续累积（详见第7章）
 
 5. **脚本继承机制**：预请求脚本按"根→当前"顺序执行，测试脚本按"当前→根"顺序执行
 
