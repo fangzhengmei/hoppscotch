@@ -11,7 +11,8 @@
 5. [统计口径说明](#5-统计口径说明)
 6. [完整数据流图](#6-完整数据流图)
 7. [迭代执行中 selected 与 global 环境变量的行为](#7-迭代执行中-selected-与-global-环境变量的行为)
-8. [关键设计决策总结](#8-关键设计决策总结)
+8. [环境变量设置 API 行为详解](#8-环境变量设置-api-行为详解)
+9. [关键设计决策总结](#9-关键设计决策总结)
 
 ---
 
@@ -809,6 +810,8 @@ pm.environment.set("requestId", generateUUID());
 
 ## 附录：相关文件索引
 
+### CLI 执行流相关
+
 | 文件路径 | 主要职责 |
 |---------|---------|
 | `src/commands/test.ts` | test 命令入口，参数解析与流程编排 |
@@ -822,3 +825,12 @@ pm.environment.set("requestId", generateUUID());
 | `src/types/request.ts` | RequestReport 等核心类型定义 |
 | `src/types/response.ts` | TestMetrics 等统计类型定义 |
 | `src/types/errors.ts` | 错误码定义 |
+
+### 环境变量 API 相关（hoppscotch-js-sandbox 包）
+
+| 文件路径 | 主要职责 |
+|---------|---------|
+| `../hoppscotch-js-sandbox/src/utils/shared.ts:60-108` | `setEnv` 核心实现，pw.env.set 命中顺序逻辑 |
+| `../hoppscotch-js-sandbox/src/__tests__/pw-namespace/env/set.spec.ts` | pw.env.set 行为测试用例 |
+| `../hoppscotch-js-sandbox/src/__tests__/pm-namespace/environment.spec.ts` | pm.globals.set / pm.environment.set 行为测试 |
+| `../hoppscotch-js-sandbox/src/__tests__/combined/env-fallback-behavior.spec.ts` | 环境变量回退与作用域行为综合测试 |
