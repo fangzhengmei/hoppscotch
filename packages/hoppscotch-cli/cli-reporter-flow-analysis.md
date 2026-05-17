@@ -10,6 +10,8 @@
 4. [退出码判定逻辑](#4-退出码判定逻辑)
 5. [统计口径说明](#5-统计口径说明)
 6. [完整数据流图](#6-完整数据流图)
+7. [迭代执行中 selected 与 global 环境变量的行为](#7-迭代执行中-selected-与-global-环境变量的行为)
+8. [关键设计决策总结](#8-关键设计决策总结)
 
 ---
 
@@ -644,7 +646,154 @@ pw.env.set("token", "new-value");
 
 ---
 
-## 8. 关键设计决策总结
+## 8. 环境变量设置 API 行为详解
+
+### 8.1 pw.env.set 的命中顺序（默认 source=all）
+
+`pw.env.set` 在默认 `source=all` 模式下遵循 **"先 selected，后 global，不存在则新建到 selected"** 的查找与更新顺序。
+
+**核心实现证据**：`packages/hoppscotch-js-sandbox/src/utils/shared.ts:60-108`
+
+```typescript
+const setEnv = (
+  envName: string,
+  envValue: SandboxValue,
+  envs: SandboxEnvs,
+  options: { setInitialValue?: boolean; source: EnvSource } = {
+    setInitialValue: false,
+    source: "all",
+  }
+): SandboxEnvs => {
+  const { global, selected } = envs;
+  const indexInSelected = findEnvIndex(envName, selected);
+  const indexInGlobal = findEnvIndex(envName, global);
+
+  // 优先级1：如果 selected 中存在该 key，更新 selected
+  if (["all", "active"].includes(options.source) && indexInSelected >= 0) {
+    selected[indexInSelected][targetProperty] = envValue;
+  }
+  // 优先级2：如果 global 中存在该 key，更新 global
+  else if (["all", "global"].includes(options.source) && indexInGlobal >= 0) {
+    global[indexInGlobal][targetProperty] = envValue;
+  }
+  // 优先级3：都不存在时，新建到 selected
+  else if (["all", "active"].includes(options.source)) {
+    selected.push({ key: envName, currentValue: envValue, initialValue: envValue, secret: false });
+  }
+  // ...
+};
+```
+
+**测试用例证据**：`packages/hoppscotch-js-sandbox/src/__tests__/pw-namespace/env/set.spec.ts`
+
+| 场景 | 初始状态 | 执行操作 | 结果 | 测试代码位置 |
+|-----|---------|---------|------|-------------|
+| 仅 selected 存在 | selected: [{key:"a", value:"b"}]<br>global: [] | `pw.env.set("a", "c")` | selected[0].value = "c" | 第5-35行 |
+| 仅 global 存在 | selected: []<br>global: [{key:"a", value:"b"}] | `pw.env.set("a", "c")` | global[0].value = "c" | 第37-67行 |
+| 两者都存在 | selected: [{key:"a", value:"d"}]<br>global: [{key:"a", value:"b"}] | `pw.env.set("a", "c")` | selected[0].value = "c"<br>global[0].value 保持 "b" | 第69-114行 |
+| 两者都不存在 | selected: []<br>global: [] | `pw.env.set("a", "c")` | selected 新增 {key:"a", value:"c"} | 第116-140行 |
+
+### 8.2 pw.env.set 与 pm.globals.set 的作用域差异
+
+| API | 作用域 | 行为 | 代码位置 |
+|-----|-------|------|---------|
+| `pw.env.set(key, value)` | 默认 source=all，跨 selected/global 智能查找 | 按优先级查找并更新，不存在则新建到 selected | `shared.ts:60-108` |
+| `pm.globals.set(key, value)` | 仅 global 作用域 | 只读写 global，完全不碰 selected | `environment.spec.ts:232-256` |
+| `pm.environment.set(key, value)` | 仅 selected 作用域 | 只读写 selected，完全不碰 global | `environment.spec.ts:5-28` |
+| `pm.variables.set(key, value)` | 跨 selected/global（get 时） | get 时先 selected 后 global，set 时新建到 selected | `environment.spec.ts:502-526` |
+
+**pm.globals.set 行为证据**：`packages/hoppscotch-js-sandbox/src/__tests__/pm-namespace/environment.spec.ts:232-256`
+
+```typescript
+test("pm.globals.set creates and retrieves global variable", () => {
+  return expect(
+    runTest(
+      `
+        pm.globals.set("test_global", "global_value")
+        const retrieved = pm.globals.get("test_global")
+        pm.expect(retrieved).toBe("global_value")
+      `,
+      { global: [], selected: [] }
+    )()
+  ).resolves.toEqualRight([...]);  // 变量被创建到 global 数组
+});
+```
+
+### 8.3 边界情况说明
+
+**场景 1：在迭代中使用 pw.env.set 修改仅存在于 global 的变量**
+
+初始状态：
+- global: `[{ key: "accessToken", value: "initial" }]`
+- selected: `[]`
+
+```javascript
+// 测试脚本
+pw.env.set("accessToken", "new_token");
+```
+
+行为：由于 `accessToken` 只存在于 global，`pw.env.set` 会更新 global 中的值。由于 global 在迭代间不重置，后续迭代都会看到 "new_token"。
+
+**场景 2：在迭代中使用 pw.env.set 新建变量**
+
+初始状态：
+- global: `[]`
+- selected: `[]`
+
+```javascript
+// 测试脚本
+pw.env.set("tempVar", "temp_value");
+```
+
+行为：由于两个作用域都不存在，变量被新建到 selected。由于 selected 在每次迭代开始时重置，下一次迭代开始时 `tempVar` 会消失。
+
+**场景 3：pm.globals.set vs pw.env.set 的跨迭代影响对比**
+
+| 操作 | 迭代1结果 | 迭代2是否可见 | 原因 |
+|-----|----------|--------------|------|
+| `pw.env.set("a", "1")`（a 不存在） | a 在 selected | ❌ 不可见 | selected 每次迭代重置 |
+| `pw.env.set("b", "2")`（b 仅在 global） | b 在 global 被更新 | ✅ 可见 | global 不重置 |
+| `pm.globals.set("c", "3")` | c 在 global | ✅ 可见 | 只写 global，不重置 |
+| `pm.environment.set("d", "4")` | d 在 selected | ❌ 不可见 | 只写 selected，每次迭代重置 |
+
+### 8.4 修正后的示例与最佳实践
+
+**❌ 原误导性示例（假设所有 set 都会跨迭代累积）**：
+```javascript
+// 错误假设：认为 counter 会跨迭代累加
+pw.env.set("counter", String(Number(pw.env.get("counter")) + 1));
+// 实际：如果 counter 初始不存在于 global，它会被创建到 selected，下次迭代重置
+```
+
+**✅ 正确示例 - 跨迭代累加（使用 pm.globals.set）**：
+```javascript
+// 初始化（仅第一次迭代时执行）
+if (!pw.env.get("counter")) {
+  pm.globals.set("counter", "0");  // 明确写入 global
+}
+// 累加
+const current = Number(pm.globals.get("counter"));
+pm.globals.set("counter", String(current + 1));
+// 每次迭代都会看到递增的 counter 值
+```
+
+**✅ 正确示例 - 迭代内临时变量（使用 pw.env.set 或 pm.environment.set）**：
+```javascript
+// 写入 selected，迭代结束后自动重置，不影响下一次迭代
+pw.env.set("requestId", generateUUID());
+// 或者
+pm.environment.set("requestId", generateUUID());
+```
+
+**最佳实践建议**：
+1. 需要跨迭代累积的状态 → 使用 `pm.globals.set` 明确写入 global
+2. 仅当前迭代/请求使用的临时变量 → 使用 `pw.env.set` 或 `pm.environment.set`
+3. 不确定变量初始存在于哪个作用域时 → 优先用 `pm.globals.set` 或 `pm.environment.set` 明确指定作用域
+4. 数据驱动测试 → 依赖 `iterationData` 机制，不要依赖环境变量传递迭代差异
+
+---
+
+## 9. 关键设计决策总结
 
 1. **错误与测试失败分离**：脚本执行错误放入 `errors`，断言失败放入 `tests`，便于区分是代码问题还是业务校验不通过
 
