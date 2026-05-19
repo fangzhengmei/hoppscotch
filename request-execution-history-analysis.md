@@ -17,11 +17,11 @@ createRESTNetworkRequestStream (网络请求流创建)
         ↓
 RESTRequest.toRequest (协议适配: HoppRESTRequest → RelayRequest)
         ↓
-KernelInterceptorService.execute (协议路由: 选择拦截器)
+KernelInterceptorService.execute (协议路由: 选择当前激活的拦截器)
         ↓
-NativeKernelInterceptorService.execute (具体拦截器执行)
+[当前拦截器].execute (具体拦截器执行 - 由平台配置和用户设置共同决定)
         ↓
-Relay.execute (内核实际发送请求)
+[实际发送逻辑: Relay.execute / 代理服务器 / Agent服务 / 浏览器扩展]
         ↓
 收到响应 → RESTResponse.toResponse (协议适配: RelayResponse → HoppRESTResponse)
         ↓
@@ -118,7 +118,8 @@ export function runRESTRequest$(
 
 **核心文件**: 
 - `packages/hoppscotch-common/src/services/kernel-interceptor.service.ts`
-- `packages/hoppscotch-common/src/platform/std/kernel-interceptors/native/index.ts`
+- `packages/hoppscotch-common/src/modules/kernel-interceptors.ts`
+- `packages/hoppscotch-common/src/services/initialization.service.ts`
 
 #### 2.3.1 拦截器服务架构
 
@@ -145,71 +146,364 @@ export type KernelInterceptor = {
   id: string
   name: (t: ReturnType<typeof getI18n>) => string
   capabilities: RelayCapabilities  // 声明支持的能力
+  selectable: SelectableStatus     // 是否可选择
+  settingsEntry?: {                // 设置面板配置
+    title: (t) => string
+    component: Component
+  }
   execute: (request: RelayRequest) => ExecutionResult
 }
 ```
 
-#### 2.3.3 Native 拦截器实现
+#### 2.3.3 拦截器注册流程
 
-NativeKernelInterceptorService 是默认的拦截器，负责通过内核 Relay 发送请求：
+拦截器注册发生在两个阶段：
 
+**阶段1：Desktop 模式预初始化** (`initialization.service.ts:84-92`)
 ```typescript
-export class NativeKernelInterceptorService extends Service implements KernelInterceptor {
-  public readonly id = "native"
+private async initNativeKernelNetworking() {
+  const interceptorService = getService(KernelInterceptorService)
+  const nativeInterceptorService = getService(NativeKernelInterceptorService)
+  interceptorService.register(nativeInterceptorService)
+  interceptorService.setActive("native")  // 临时设置为 native
   
-  public execute(request: RelayRequest): ExecutionResult {
-    return {
-      cancel: async () => { /* 取消逻辑 */ },
-      response: pipe(
-        this.executeRequest(request, ...),
-        // 错误处理和用户友好消息转换
-      )
-    }
-  }
-
-  private async executeRequest(
-    request: RelayRequest,
-    setRelayExecution: ...
-  ): Promise<E.Either<any, RelayResponse>> {
-    // 1. 预处理请求 (添加 cookies, user-agent 等)
-    const effectiveRequest = this.store.completeRequest(preProcessRelayRequest(request))
-    
-    // 2. 转换为内核原生格式
-    const nativeRequest = await relayRequestToNativeAdapter(effectiveRequestWithUserAgent)
-    
-    // 3. 调用内核 Relay 执行
-    const relayExecution = Relay.execute(postProcessedRequest)
-    
-    return await relayExecution.response
-  }
+  this.initState.nativeKernelNetworking = true
+  this.emit({ type: "NATIVE_KERNEL_NETWORKING_READY" })
 }
 ```
 
-#### 2.3.4 能力声明 (Capabilities)
+> **注意**：这只在 `getKernelMode() === "desktop"` 时执行，目的是在完整初始化前让认证流程能使用网络。
 
-每个拦截器声明其支持的能力，用于 UI 层判断哪些功能可用：
+**阶段2：模块完整初始化** (`modules/kernel-interceptors.ts:16-68`)
+```typescript
+function initKernelInterceptorService(): KernelInterceptorService {
+  const service = getService(KernelInterceptorService)
+  
+  registerInterceptors(service)      // 注册所有平台定义的拦截器
+  initializeDefaultInterceptor(service)  // 设置平台默认拦截器
+  
+  return service
+}
+
+function registerInterceptors(service: KernelInterceptorService): void {
+  platform.kernelInterceptors.interceptors.forEach((interceptorDef) => {
+    if (interceptorDef.type === "standalone") {
+      service.register(interceptorDef.interceptor)
+    } else {
+      const interceptorService = getService(interceptorDef.service)
+      service.register(interceptorService)
+    }
+  })
+}
+
+function initializeDefaultInterceptor(service: KernelInterceptorService): void {
+  service.setActive(platform.kernelInterceptors.default)
+}
+```
+
+**平台定义结构** (`platform/kernel-interceptors.ts`):
+```typescript
+export type KernelInterceptorsPlatformDef = {
+  default: string                     // 默认拦截器 ID
+  interceptors: KernelInterceptorDef[]  // 拦截器列表
+}
+```
+
+#### 2.3.4 设置项同步回写与回放
+
+拦截器选择与设置系统双向同步，确保用户选择持久化：
 
 ```typescript
-public readonly capabilities: RelayCapabilities = {
-  method: new Set(["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]),
-  header: new Set(["stringvalue", "arrayvalue", "multivalue"]),
-  content: new Set(["text", "json", "xml", "form", "binary", "multipart", "urlencoded"]),
-  auth: new Set(["basic", "bearer", "apikey", "digest", "aws", "hawk"]),
-  security: new Set(["clientcertificates", "cacertificates"]),
-  proxy: new Set(["http", "https", "authentication"]),
-  advanced: new Set(["redirects", "cookies", "localaccess"]),
+function setupInterceptorSync(service: KernelInterceptorService): void {
+  syncServiceToSettings(service)  // 服务状态 → 设置
+  syncSettingsToService(service)  // 设置 → 服务状态
+}
+
+// 服务变化时写入设置
+function syncServiceToSettings(service: KernelInterceptorService): void {
+  watch(
+    () => service.current.value?.id,
+    (id) => {
+      applySetting(
+        "CURRENT_KERNEL_INTERCEPTOR_ID",
+        id ?? platform.kernelInterceptors.default
+      )
+    }
+  )
+}
+
+// 设置变化时回放到服务（包含立即回放）
+function syncSettingsToService(service: KernelInterceptorService): void {
+  const [setting] = useSettingStatic("CURRENT_KERNEL_INTERCEPTOR_ID")
+
+  watch(
+    setting,
+    () => {
+      const fallback = setting.value ?? platform.kernelInterceptors.default
+      service.setActive(fallback)
+    },
+    { immediate: true }  // 立即执行一次，回放持久化的用户选择
+  )
+}
+```
+
+#### 2.3.5 当前拦截器的决定因素
+
+**不是简单的 "native 默认执行"**，而是由以下因素共同决定：
+
+| 决定因素 | 说明 | 优先级 |
+|---------|------|--------|
+| **平台默认值** | `platform.kernelInterceptors.default`，由具体运行环境（Web/Desktop）配置 | 低（兜底） |
+| **持久化设置** | `CURRENT_KERNEL_INTERCEPTOR_ID` 设置项，保存用户上次选择 | 中（用户偏好） |
+| **拦截器可选性** | `interceptor.selectable.type` 必须为 `"selectable"`，否则自动回退 | 高（可用性约束） |
+| **初始化时序** | Desktop 模式下 native 会先注册，但会被后续流程覆盖 | 特殊情况 |
+
+**决策流程**：
+```
+应用启动
+    │
+    ├─► Desktop 模式: initNativeKernelNetworking() 临时注册 native
+    │
+    └─► kernel-interceptors 模块初始化
+         │
+         ├─► registerInterceptors() 注册所有平台拦截器
+         │
+         ├─► initializeDefaultInterceptor() 设置平台默认值
+         │
+         └─► setupInterceptorSync()
+              │
+              ├─► syncSettingsToService({ immediate: true })
+              │    读取 CURRENT_KERNEL_INTERCEPTOR_ID 并设置
+              │    └─► 如果设置为空，使用 platform.kernelInterceptors.default
+              │
+              └─► syncServiceToSettings() 监听后续变化
+```
+
+#### 2.3.6 拦截器有效性验证
+
+当拦截器变为不可选择时（如扩展未安装、Agent 未启动），系统会自动回退：
+
+```typescript
+private setupInterceptorValidation(): void {
+  watchEffect(() => {
+    if (!this.state.currentId) return
+
+    const currentInterceptor = this.state.interceptors.get(this.state.currentId)
+
+    if (!this.validateCurrentInterceptor(currentInterceptor)) {
+      this.resetToSelectableInterceptor()  // 寻找第一个可选择的拦截器
+    }
+  })
+}
+
+private resetToSelectableInterceptor(): void {
+  const selectableInterceptor = this.available.value.find(
+    (int) => int.selectable.type === "selectable"
+  )
+  this.state.currentId = selectableInterceptor?.id ?? null
 }
 ```
 
 ---
 
-### 2.4 协议适配：RESTRequest / RESTResponse
+### 2.4 拦截器执行路径对比
+
+系统支持 5 种拦截器，执行路径和能力各不相同：
+
+#### 2.4.1 Native 拦截器（原生内核）
+
+**文件**: `src/platform/std/kernel-interceptors/native/index.ts`
+
+```typescript
+public async executeRequest(request: RelayRequest): Promise<E.Either<any, RelayResponse>> {
+  // 1. 预处理：补全请求配置（代理、证书、重定向等）
+  const effectiveRequest = this.store.completeRequest(
+    preProcessRelayRequest(request)
+  )
+
+  // 2. 注入 Cookie
+  const relevantCookies = this.cookieJar.getCookiesForURL(new URL(effectiveRequest.url!))
+  if (relevantCookies.length > 0) {
+    effectiveRequest.headers!["Cookie"] = relevantCookies.join(";")
+  }
+
+  // 3. 添加 User-Agent
+  const effectiveRequestWithUserAgent = {
+    ...effectiveRequest,
+    headers: { ...effectiveRequest.headers, "User-Agent": "HoppscotchKernel/0.2.0" },
+  }
+
+  // 4. 转换为内核原生格式
+  const nativeRequest = await relayRequestToNativeAdapter(effectiveRequestWithUserAgent)
+  const postProcessedRequest = postProcessRelayRequest(nativeRequest)
+  
+  // 5. 内核执行
+  const relayExecution = Relay.execute(postProcessedRequest)
+  return await relayExecution.response
+}
+```
+
+**特点**：
+- 能力最全：支持所有认证方式、代理、客户端证书、重定向控制等
+- 直接调用内核 Relay，性能最优
+- 需要内核支持（WASM 或原生模块）
+
+---
+
+#### 2.4.2 Browser 拦截器（浏览器 fetch）
+
+**文件**: `src/platform/std/kernel-interceptors/browser/index.ts`
+
+```typescript
+public execute(request: RelayRequest): ExecutionResult {
+  const processedRequest = preProcessRelayRequest(request)
+  const relayExecution = Relay.execute(processedRequest)  // 内核使用浏览器 fetch
+
+  return {
+    cancel: relayExecution.cancel,
+    response: pipe(relayExecution.response, ...)  // 错误转换
+  }
+}
+```
+
+**能力限制**：
+- 仅支持基本认证方式：basic, bearer, apikey
+- 不支持自定义代理、客户端证书
+- 受浏览器 CORS 策略限制
+- 不支持高级配置（重定向控制、Cookie 管理等）
+
+---
+
+#### 2.4.3 Proxy 拦截器（代理服务器）
+
+**文件**: `src/platform/std/kernel-interceptors/proxy/index.ts`
+
+```typescript
+public execute(request: RelayRequest): ExecutionResult {
+  const settings = this.store.getSettings()  // proxyUrl, accessToken
+  const processedRequest = preProcessRelayRequest(request)
+
+  // 构造发往代理服务器的请求
+  const proxyRequest = this.constructProxyRequest(processedRequest, accessToken)
+
+  // 将原始请求包装后 POST 到代理服务器
+  const proxyRelayRequest: RelayRequest = {
+    id: Date.now(),
+    url: proxyUrl,
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    content: { kind: "json", content: proxyRequest, mediaType: MediaType.APPLICATION_JSON },
+  }
+
+  const relayExecution = Relay.execute(proxyRelayRequest)
+
+  // 解析代理响应，转换为原始响应格式
+  const response = pipe(relayExecution.response,
+    E.map((res) => {
+      const proxyResponse = parseBytesToJSON<ProxyResponse>(res.body.body)
+      return E.right({
+        ...res,
+        status: proxyResponse.status,
+        statusText: proxyResponse.statusText,
+        headers: proxyResponse.headers,
+        body: { body: decodeProxyData(proxyResponse.data), ... },
+      })
+    })
+  )
+
+  return { cancel: relayExecution.cancel, response }
+}
+```
+
+**特点**：
+- 请求经过代理服务器转发，可绕过 CORS
+- 能力受限：仅支持 text 内容、basic 认证
+- 需要用户配置代理服务器地址和访问令牌
+- 额外的网络延迟（多一跳）
+
+---
+
+#### 2.4.4 Agent 拦截器（本地 Agent 服务）
+
+**文件**: `src/platform/std/kernel-interceptors/agent/index.ts`
+
+```typescript
+public execute(request: RelayRequest): ExecutionResult {
+  const reqID = Date.now()
+  const cancelToken = axios.CancelToken.source()
+
+  return {
+    cancel: async () => {
+      cancelToken.cancel()
+      await this.store.cancelRequest(reqID)
+    },
+    response: pipe(
+      this.executeRequest(request, reqID, cancelToken),  // 通过 axios 发送到 Agent
+      ...
+    )
+  }
+}
+```
+
+**特点**：
+- 通过 HTTP 与本地运行的 Hoppscotch Agent 通信
+- 能力接近 Native，支持完整功能
+- Agent 需单独安装运行
+- 适合需要本地网络访问的场景
+
+---
+
+#### 2.4.5 Extension 拦截器（浏览器扩展）
+
+**文件**: `src/platform/std/kernel-interceptors/extension/index.ts`
+
+```typescript
+public execute(request: RelayRequest): ExecutionResult {
+  const extensionHook = window.__POSTWOMAN_EXTENSION_HOOK__
+  
+  return {
+    cancel: () => extensionHook?.cancelRequest(),
+    response: new Promise((resolve) => {
+      extensionHook.sendRequest(processedRequest, (response) => {
+        resolve(E.right(transformExtensionResponse(response)))
+      })
+    })
+  }
+}
+```
+
+**特点**：
+- 依赖浏览器扩展提供的 `window.__POSTWOMAN_EXTENSION_HOOK__`
+- 能力由扩展实现决定
+- 可绕过浏览器 CORS 限制
+- 用户需安装浏览器扩展
+
+---
+
+#### 2.4.6 拦截器能力对比表
+
+| 能力 | Native | Browser | Proxy | Agent | Extension |
+|------|--------|---------|-------|-------|-----------|
+| HTTP 方法 | 全部 | 全部 | 全部 | 全部 | 全部 |
+| Header 支持 | 完整 | 基础 | 基础 | 完整 | 完整 |
+| 内容类型 | 全部 | 常用 | Text | 全部 | 全部 |
+| 认证方式 | 全部 | 3种 | Basic | 全部 | 3种 |
+| 客户端证书 | ✅ | ❌ | ❌ | ✅ | ❌ |
+| 自定义代理 | ✅ | ❌ | - | ✅ | ❌ |
+| 重定向控制 | ✅ | ❌ | ❌ | ✅ | ❌ |
+| Cookie 管理 | ✅ | ❌ | ❌ | ✅ | 取决于扩展 |
+| 绕过 CORS | ❌ | ❌ | ✅ | ✅ | ✅ |
+| 需要额外安装 | 内核 | 无 | 代理服务 | Agent | 浏览器扩展 |
+
+---
+
+### 2.5 协议适配：RESTRequest / RESTResponse
 
 **核心文件**: 
 - `packages/hoppscotch-common/src/helpers/kernel/rest/request.ts`
 - `packages/hoppscotch-common/src/helpers/kernel/rest/response.ts`
 
-#### 2.4.1 请求适配：HoppRESTRequest → RelayRequest
+#### 2.5.1 请求适配：HoppRESTRequest → RelayRequest
 
 ```typescript
 export const RESTRequest = {
@@ -238,7 +532,7 @@ export const RESTRequest = {
 }
 ```
 
-#### 2.4.2 响应适配：RelayResponse → HoppRESTResponse
+#### 2.5.2 响应适配：RelayResponse → HoppRESTResponse
 
 ```typescript
 export const RESTResponse = {
@@ -266,7 +560,7 @@ export const RESTResponse = {
 
 ---
 
-### 2.5 内核执行：Relay
+### 2.6 内核执行：Relay
 
 **核心文件**: `packages/hoppscotch-common/src/kernel/relay.ts`
 
@@ -289,9 +583,9 @@ export const Relay = (() => {
 
 ---
 
-### 2.6 历史记录流程
+### 2.7 历史记录流程
 
-#### 2.6.1 内存历史存储
+#### 2.7.1 内存历史存储
 
 **核心文件**: `packages/hoppscotch-common/src/newstore/history.ts`
 
@@ -327,7 +621,7 @@ export const restHistoryStore = new DispatchingStore(
 )
 ```
 
-#### 2.6.2 响应事件触发历史写入
+#### 2.7.2 响应事件触发历史写入
 
 ```typescript
 // 监听完成的响应以添加到历史记录
@@ -355,13 +649,13 @@ executedResponses$.subscribe((res) => {
 
 ---
 
-### 2.7 历史持久化：PersistenceService
+### 2.8 历史持久化：PersistenceService
 
 **核心文件**: 
 - `packages/hoppscotch-common/src/services/persistence/index.ts`
 - `packages/hoppscotch-common/src/kernel/store.ts`
 
-#### 2.7.1 持久化初始化
+#### 2.8.1 持久化初始化
 
 ```typescript
 export class PersistenceService extends Service {
@@ -390,7 +684,7 @@ export class PersistenceService extends Service {
 }
 ```
 
-#### 2.7.2 内核存储封装
+#### 2.8.2 内核存储封装
 
 Store 模块根据运行环境（Web/Desktop）选择不同的存储后端：
 
@@ -404,7 +698,7 @@ const HOST_SCOPED_STORE_PATH = orgParam
 export const Store = createScopedStore(HOST_SCOPED_STORE_PATH)
 ```
 
-#### 2.7.3 持久化流
+#### 2.8.3 持久化流
 
 ```
 内存 history store 变化 (restHistoryStore.subject$)
@@ -435,8 +729,9 @@ Store.set(STORE_NAMESPACE, "restHistory", state)
 ### 3.3 策略模式 (拦截器)
 
 - `KernelInterceptorService` 管理多个拦截器策略
-- 每个拦截器声明自己的能力 (capabilities)
-- 支持动态切换拦截器（如 Native、Agent、Extension）
+- 每个拦截器声明自己的能力 (capabilities) 和可选性 (selectable)
+- 支持动态切换拦截器（Native、Browser、Proxy、Agent、Extension）
+- 拦截器失效时自动回退到可用的拦截器
 
 ### 3.4 适配器模式
 
@@ -450,11 +745,32 @@ Store.set(STORE_NAMESPACE, "restHistory", state)
 - Web 环境使用 localStorage，Desktop 环境使用文件系统
 - 上层代码无需关心具体存储实现
 
+### 3.6 双向同步模式
+
+- 拦截器选择与设置系统双向同步
+- `immediate: true` 确保启动时回放入户选择
+- 服务状态变化自动持久化到设置
+
 ---
 
-## 四、数据流时序图
+## 四、完整数据流时序图
 
 ```
+应用启动初始化
+    │
+    ├─► [Desktop] initNativeKernelNetworking()
+    │    ├─► 注册 Native 拦截器
+    │    └─► 临时设置为 active
+    │
+    └─► kernel-interceptors 模块初始化
+         ├─► registerInterceptors() - 注册所有平台拦截器
+         ├─► initializeDefaultInterceptor() - 设置平台默认
+         └─► setupInterceptorSync()
+              ├─► syncSettingsToService({ immediate: true })
+              │    └─► 读取 CURRENT_KERNEL_INTERCEPTOR_ID 设置
+              │         └─► 有值则使用，否则使用平台默认
+              └─► syncServiceToSettings() - 监听后续变化
+
 用户点击发送
     │
     ▼
@@ -472,9 +788,13 @@ RequestRunner.runRESTRequest$
     │    │
     │    ├─► KernelInterceptorService.execute
     │    │    │
-    │    │    └─► NativeKernelInterceptor.execute
+    │    │    └─► [当前激活拦截器].execute
     │    │         │
-    │    │         └─► Relay.execute (内核发送)
+    │    │         ├─► Native: Relay.execute(处理后的请求)
+    │    │         ├─► Browser: Relay.execute(原始请求)
+    │    │         ├─► Proxy: Relay.execute(包装后的代理请求)
+    │    │         ├─► Agent: axios → 本地Agent服务
+    │    │         └─► Extension: window.__POSTWOMAN_EXTENSION_HOOK__
     │    │
     │    └─► 等待响应 → RESTResponse.toResponse
     │
@@ -500,27 +820,40 @@ RequestRunner.runRESTRequest$
 | 网络流 | `src/helpers/network.ts` | 创建网络请求 Observable |
 | 协议适配 | `src/helpers/kernel/rest/request.ts` | HoppRESTRequest → RelayRequest |
 | 协议适配 | `src/helpers/kernel/rest/response.ts` | RelayResponse → HoppRESTResponse |
-| 拦截器管理 | `src/services/kernel-interceptor.service.ts` | 拦截器注册、选择、执行 |
+| 拦截器管理 | `src/services/kernel-interceptor.service.ts` | 拦截器注册、选择、执行、回退 |
+| 拦截器初始化 | `src/modules/kernel-interceptors.ts` | 拦截器注册、默认值设置、双向同步 |
+| 初始化服务 | `src/services/initialization.service.ts` | Desktop 模式预初始化 Native |
 | Native拦截器 | `src/platform/std/kernel-interceptors/native/index.ts` | 原生内核请求执行 |
+| Browser拦截器 | `src/platform/std/kernel-interceptors/browser/index.ts` | 浏览器 fetch 执行 |
+| Proxy拦截器 | `src/platform/std/kernel-interceptors/proxy/index.ts` | 代理服务器转发 |
+| Agent拦截器 | `src/platform/std/kernel-interceptors/agent/index.ts` | 本地 Agent 服务 |
+| Extension拦截器 | `src/platform/std/kernel-interceptors/extension/index.ts` | 浏览器扩展 |
 | 历史内存存储 | `src/newstore/history.ts` | 历史记录内存状态管理 |
 | 持久化服务 | `src/services/persistence/index.ts` | 状态持久化到存储 |
 | 内核存储 | `src/kernel/store.ts` | 存储后端抽象 |
 | 内核Relay | `src/kernel/relay.ts` | 内核请求执行封装 |
+| 平台定义 | `src/platform/kernel-interceptors.ts` | 拦截器平台配置类型 |
 
 ---
 
 ## 六、扩展点与可维护性考虑
 
-1. **添加新的请求类型** (如 GraphQL, WebSocket):
-   - 实现类似的 `runGQLRequest$` 编排函数
-   - 创建对应的协议适配器 (`GQLRequest.toRequest`, `GQLResponse.toResponse`)
-   - 添加对应的历史记录 store 和持久化配置
+### 6.1 添加新的请求类型 (如 GraphQL, WebSocket)
+- 实现类似的 `runGQLRequest$` 编排函数
+- 创建对应的协议适配器 (`GQLRequest.toRequest`, `GQLResponse.toResponse`)
+- 添加对应的历史记录 store 和持久化配置
 
-2. **添加新的拦截器**:
-   - 实现 `KernelInterceptor` 接口
-   - 声明支持的 `capabilities`
-   - 调用 `kernelInterceptorService.register()` 注册
+### 6.2 添加新的拦截器
+- 实现 `KernelInterceptor` 接口
+- 声明支持的 `capabilities` 和 `selectable` 状态
+- 在平台定义中注册拦截器
+- 如有需要，提供设置面板组件 (`settingsEntry`)
 
-3. **修改持久化策略**:
-   - 在 `PersistenceService` 中调整订阅逻辑
-   - 可以添加防抖、批量写入等优化
+### 6.3 修改持久化策略
+- 在 `PersistenceService` 中调整订阅逻辑
+- 可以添加防抖、批量写入等优化
+
+### 6.4 拦截器回退机制扩展
+- 当前仅在 `selectable` 变化时触发回退
+- 可扩展为在执行失败时自动尝试下一个可用拦截器
+- 需要考虑用户体验（透明重试 vs 明确告知）
