@@ -916,56 +916,148 @@ export const parseBodyEnvVariables = (body: string, env: Environment["variables"
 
 **CLI getEffectiveRESTRequest** (`packages/hoppscotch-cli/src/utils/pre-request.ts:144-500`)：
 
-| 字段 | 解析函数 | 错误回退 |
-|------|----------|----------|
-| URL | `parseTemplateStringE` | 返回 `Left(PARSING_ERROR)` 导致请求失败 |
-| Header Key/Value | `getEffectiveFinalMetaData` 内调 `parseTemplateStringE` | 返回 `Left(PARSING_ERROR)` 导致请求失败 |
-| Param Key/Value | `getEffectiveFinalMetaData` 内调 `parseTemplateStringE` | 返回 `Left(PARSING_ERROR)` 导致请求失败 |
-| Body JSON | `parseBodyEnvVariablesE` | 返回 `Left(PARSING_ERROR)` 导致请求失败 |
-| Body form-urlencoded | 每个 key/value 调 `parseTemplateStringE` | 过滤掉解析失败的项 |
-| Body multipart | 文本字段调 `parseTemplateString` | 解析失败返回空字符串 |
+| 字段 | 解析函数 | 错误回退 | PARSING_ERROR 触发条件 |
+|------|----------|----------|------------------------|
+| URL | `parseTemplateStringE` | 返回 `Left(PARSING_ERROR)` | 只有递归达到上限（ENV_EXPAND_LOOP）|
+| Header Key/Value | `getEffectiveFinalMetaData` 内调 `parseTemplateStringE` | 返回 `Left(PARSING_ERROR)` | 只要有任何一项解析返回 Left |
+| Param Key/Value | `getEffectiveFinalMetaData` 内调 `parseTemplateStringE` | 返回 `Left(PARSING_ERROR)` | 只要有任何一项解析返回 Left |
+| Body JSON | `parseBodyEnvVariablesE` | 返回 `Left(PARSING_ERROR)` | 只有递归达到上限（ENV_EXPAND_LOOP）|
+| Body form-urlencoded | 每个 key/value 调 `parseTemplateStringE` | 过滤掉解析失败的项 | 只有 `parseRawKeyValueEntriesE` 失败时，而非单个项解析失败 |
+| Body multipart | 文本字段调 `parseTemplateString` | 解析失败返回空字符串 | 永远不会报错 |
 
-**代码证据**：
+**代码证据 1 - URL 解析** (`pre-request.ts:454-465`)：
 ```typescript
-// CLI URL 解析（pre-request.ts:454-458）
 const _effectiveFinalURL = parseTemplateStringE(endpoint, resolvedVariables);
 if (E.isLeft(_effectiveFinalURL)) {
-  return E.left({
-    code: "PARSING_ERROR",   // 🔴 直接返回错误，请求终止
-    message: "Unable to parse ENV variables in the request URL",
-  });
+  return E.left(
+    error({
+      code: "PARSING_ERROR",
+      data: `${request.endpoint} (${_effectiveFinalURL.left})`,
+    })
+  );
 }
-
-// CLI Header 解析（pre-request.ts:163-169）
-const _effectiveFinalHeaders = getEffectiveFinalMetaData(request.headers, resolvedVariables);
-if (E.isLeft(_effectiveFinalHeaders)) {
-  return _effectiveFinalHeaders;  // 🔴 直接返回错误
-}
+// 🔴 注意：parseTemplateStringE 只有 ENV_EXPAND_LOOP 会返回 Left
+// 变量未命中只会返回空字符串，不会触发 PARSING_ERROR
 ```
 
-#### 9.4.4 错误回退差异总结
-
-| 场景 | 前端（parseTemplateString） | CLI（parseTemplateStringE） |
-|------|----------------------------|-----------------------------|
-| 循环引用达到上限 | 静默返回原始字符串 | 返回错误，请求终止 |
-| 变量不存在 | 返回空字符串（或 `<<key>>` 仅 URL） | 返回错误，请求终止 |
-| Body JSON 解析失败 | 返回原始 JSON 字符串 | 返回错误，请求终止 |
-
-**关键证据**：`parseTemplateString` 是 `parseTemplateStringE` 的包装（`environment/index.ts:192-208`）：
+**代码证据 2 - Header/Param 解析** (`getters.ts:84-91`)：
 ```typescript
+E.fromPredicate(
+  A.every(({ key, value }) => E.isRight(key) && E.isRight(value)),
+  (reason) => error({ code: "PARSING_ERROR", data: reason })
+)
+// 🔴 A.every 检查所有项，只要有一个 Left 就整体返回 Left
+// 但 parseTemplateStringE 只有 ENV_EXPAND_LOOP 会返回 Left
+// 所以实际上只有递归上限才会触发 PARSING_ERROR
+```
+
+**代码证据 3 - form-urlencoded 解析** (`pre-request.ts:529-541`)：
+```typescript
+A.map(({ key, value }) => [
+  parseTemplateStringE(key, resolvedVariables),
+  parseTemplateStringE(value, resolvedVariables),
+]),
+A.filterMap(([key, value]) =>
+  E.isRight(key) && E.isRight(value)
+    ? O.some([key.right, value.right] as [string, string])
+    : O.none
+)
+// 🔴 单个项解析失败只是被过滤掉，不会返回错误
+// 只有 parseRawKeyValueEntriesE 解析原始格式失败时才会报错
+```
+
+**重要修正**：之前的分析"变量不存在 CLI 返回错误"是绝对化的错误判断。实际上：
+1. **变量未命中不会返回 Left**，只会返回空字符串或保留占位符
+2. **只有 ENV_EXPAND_LOOP（递归达到上限）会返回 Left**
+3. **form-urlencoded 中单个项解析失败被过滤**，不会导致整体 PARSING_ERROR
+4. **Header/Param 的 PARSING_ERROR 只有在递归上限时才会触发**，因为 `A.every` 检查所有项的 Either 状态
+
+#### 9.4.4 parseTemplateStringE 变量未命中时的默认返回路径
+
+**完整的分支逻辑** (`environment/index.ts:135-163`)：
+
+```typescript
+const variable = variables.find((x) => x && x.key === p1)
+
+// 🔴 分支1：变量存在且有 currentValue
+if (variable && "currentValue" in variable) {
+  if (variable.secret && showKeyIfSecret) {
+    isSecret = true
+    return `<<${p1}>>`  // 返回原始占位符，标记为 secret
+  }
+  if (variable.secret && maskValue) {
+    return "*".repeat(variable.currentValue.length)  // 返回掩码
+  }
+  return variable.currentValue  // 返回实际值
+}
+
+// 🔴 分支2：变量未找到
+if (showKeyIfNotFound) {
+  return `<<${p1}>>`  // 保留原始占位符
+}
+
+// 🔴 分支3：默认路径 - 变量未找到且不保留占位符
+return ""  // 返回空字符串
+```
+
+**变量查找的边缘情况**：
+- `variable && "currentValue" in variable`：要求变量不仅存在，还必须有 `currentValue` 属性
+- `variables.find((x) => x && x.key === p1)`：`x &&` 跳过 falsy 元素（null/undefined）
+- 如果变量存在但没有 `currentValue`，会落入"未找到"分支，返回空字符串或保留占位符
+
+**反例 - 变量存在但无 currentValue**：
+```typescript
+// 变量列表中有这个 key，但结构不符合预期
+const variables = [{ key: "foo", initialValue: "bar" }] // 没有 currentValue!
+parseTemplateStringE("<<foo>>", variables)
+// 🔴 返回空字符串 ""，因为 "currentValue" in variable 为 false
+```
+
+#### 9.4.6 前端 parseTemplateString 与 CLI parseTemplateStringE 错误暴露方式的真实差异
+
+**前端 parseTemplateString 行为**：
+```typescript
+// environment/index.ts:192-208
 export const parseTemplateString = (str, variables, maskValue, showKeyIfSecret, showKeyIfNotFound) =>
   pipe(
     parseTemplateStringE(str, variables, maskValue, showKeyIfSecret, showKeyIfNotFound),
-    E.getOrElse(() => str)  // 🔴 吞掉错误，返回原始字符串
+    E.getOrElse(() => str)  // 🔴 唯一的错误处理：返回原始字符串
   )
 ```
 
-#### 9.4.5 常见坑点
+**CLI parseTemplateStringE 行为**：
+```typescript
+// pre-request.ts:454-465
+const _effectiveFinalURL = parseTemplateStringE(endpoint, resolvedVariables);
+if (E.isLeft(_effectiveFinalURL)) {
+  return E.left(error({ code: "PARSING_ERROR", data: `${request.endpoint} (${_effectiveFinalURL.left})` }));
+}
+```
+
+**真实差异对比表**：
+
+| 场景 | 前端 parseTemplateString | CLI parseTemplateStringE |
+|------|--------------------------|---------------------------|
+| 变量不存在 | 返回空字符串（或 `<<key>>` 仅 URL） | 返回空字符串 |
+| 变量存在但无 currentValue | 返回空字符串 | 返回空字符串 |
+| 自引用 A→A | 返回 `<<A>>`（第2次 break） | 返回 `<<A>>`（第2次 break） |
+| 循环引用 A→B→A | 返回原始字符串（被 getOrElse 捕获） | 返回 `Left(ENV_EXPAND_LOOP)` → 终止请求 |
+| 12 层嵌套引用 | 返回原始字符串（被 getOrElse 捕获） | 返回 `Left(ENV_EXPAND_LOOP)` → 终止请求 |
+| str 为 null/undefined | 返回原值（函数入口判断） | 返回原值（函数入口判断） |
+| variables 为 null/undefined | 返回原值（函数入口判断） | 返回原值（函数入口判断） |
+
+**重要修正**：
+1. ❌ 之前的绝对化判断："CLI 变量不存在返回错误" → ✅ 变量不存在不会返回错误，只有递归上限会
+2. ❌ 之前的绝对化判断："前端循环引用静默返回原始字符串" → ✅ 自引用 A→A 不会触发错误，只有两两循环 A→B→A 会
+3. ❌ 之前的绝对化判断："前端和 CLI 行为完全不同" → ✅ 除了递归上限场景，其他场景行为一致
+
+#### 9.4.7 常见坑点
 
 1. **URL 预览 vs 实际发送**：前端预览时 `showKeyIfNotFound=true` 显示 `<<key>>`，实际发送时 `showKeyIfNotFound=false` 替换为空字符串
 2. **Header 空值**：变量未找到时 header 值为空字符串，该 header 仍会被发送
-3. **CLI 严格性**：CLI 中任何解析失败都会导致请求终止，前端则静默降级
-4. **Form Data 文件**：文件内容不解析，文件名会被解析
+3. **CLI 严格性**：CLI 中只有递归上限场景才会导致请求终止，变量不存在只是替换为空字符串，前端静默降级
+4. **变量结构检查**：变量存在但没有 `currentValue` 属性时，会落入"未找到"分支，返回空字符串
+5. **Form Data 文件**：文件内容不解析，文件名会被解析
 
 **关键代码位置**：`EffectiveURL.ts:362-446`, `pre-request.ts:144-500`, `environment/index.ts:55-208`
 
@@ -1175,29 +1267,63 @@ return pipe(
 
 ## 10. 总结：容易踩坑的要点清单
 
-### 10.1 updateEnvsAfterTestScript 关键点
+### 10.1 已纠正的绝对化判断
+
+| 之前的错误判断 | 修正后的正确结论 | 代码证据 |
+|----------------|------------------|----------|
+| CLI 变量不存在返回错误 | 变量不存在返回空字符串，只有递归上限返回错误 | `environment/index.ts:135-163` |
+| 前端所有循环引用静默返回原始值 | 自引用 A→A 第 2 次 break，正常返回；只有两两循环 A→B→A 会触发上限 | `environment/index.ts:167-169` |
+| parseTemplateStringE 有多种错误 | 只有 `ENV_EXPAND_LOOP` 一种错误类型 | `environment/index.ts:175-177` |
+| CLI form-urlencoded 单个项解析失败报错 | 单个项失败被过滤掉，只有原始格式解析失败才报错 | `pre-request.ts:529-541` |
+| 前端和 CLI 行为完全不同 | 除递归上限场景外，其他场景行为一致 | `environment/index.ts:192-208` |
+| 变量存在就会命中 | 变量必须有 `currentValue` 属性才会命中，否则返回空字符串 | `environment/index.ts:137` |
+
+### 10.2 updateEnvsAfterTestScript 关键点
 - **真实入参**：第1参是 `E.Right<SandboxTestResult>`（含 envs），不是单独的 finalEnvs
 - **更新路径**：全局走 `setGlobalEnvVariables`，个人环境走 `updateEnvironment`，团队环境走 `updateTeamEnvironment`
 - **深拷贝**：选中环境更新前会 `cloneDeep`，避免引用共享
 
-### 10.2 URL/Header/Params/Body 解析差异
+### 10.3 URL/Header/Params/Body 解析差异
 - **URL 独有**：唯一传入 `showKeyIfNotFound` 的位置，预览时显示 `<<key>>`
 - **前端容错**：`parseTemplateString` 用 `E.getOrElse(() => str)` 吞掉错误，返回原始字符串
-- **CLI 严格**：`parseTemplateStringE` 返回 `Left` 错误，直接终止请求
+- **CLI 严格**：只有递归上限时 `parseTemplateStringE` 返回 `Left` 错误，直接终止请求
 - **Body 多策略**：JSON 用 `parseBodyEnvVariablesE`，form 逐个解析，文件不解析
 
-### 10.3 循环引用真实行为
+### 10.4 parseTemplateStringE 变量未命中分支
+```typescript
+// 分支1：变量存在且有 currentValue → 返回 currentValue（或掩码/占位符）
+if (variable && "currentValue" in variable) { ... }
+
+// 分支2：变量未找到但 showKeyIfNotFound=true → 返回 "<<p1>>"
+if (showKeyIfNotFound) { return `<<${p1}>>` }
+
+// 分支3：默认路径 → 返回空字符串 ""
+return ""
+```
+
+### 10.5 CLI PARSING_ERROR 触发场景
+
+| 字段 | 触发 PARSING_ERROR | 过滤失败项 |
+|------|---------------------|------------|
+| URL | 递归达到上限 | ❌ |
+| Header | 任何一项递归达到上限 | ❌ |
+| Param | 任何一项递归达到上限 | ❌ |
+| Body JSON | 递归达到上限 | ❌ |
+| Body form-urlencoded | 原始格式解析失败 | ✅ 单个项失败被过滤 |
+| Body multipart | 永远不会 | ✅ 失败返回空字符串 |
+
+### 10.6 循环引用真实行为
 - **两两循环（A→B→A）**：不会被 early break 检测到，执行满 11 次替换后返回 `ENV_EXPAND_LOOP`
 - **自引用（A→A）**：`parseTemplateStringE` 第 2 次无变化 break，`parseBodyEnvVariablesE` 执行满 11 次报错
 - **前端表面正常**：`parseTemplateString` 包装器捕获错误返回原始值，用户看不到错误
-- **CLI 暴露错误**：CLI 直接返回 `PARSING_ERROR`，请求终止
+- **CLI 暴露错误**：CLI 递归上限时返回 `PARSING_ERROR`，请求终止
 
-### 10.4 CLI 与前端同键空值回退差异
+### 10.7 CLI 与前端同键空值回退差异
 - **前端**：高优先级变量 `currentValue === ""` 且 `initialValue` 也为空时，回退到低优先级非空值
 - **CLI**：高优先级只要存在 key（无论值是否为空），低优先级同 key 直接被过滤
 - **请求变量过滤**：CLI 先过滤掉 `active=false` 或 `value` 为空的请求变量，前端保留所有
 
-### 10.5 其他容易误判的细节
+### 10.8 其他容易误判的细节
 1. **空格非空**：`||` 运算符将空格 `" "` 视为 truthy，不会触发回退
 2. **并发安全**：每个请求都有独立的环境快照，脚本修改不会互相串写
 3. **增量更新**：只有与初始快照不同的变量才会被写回
