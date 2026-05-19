@@ -1,5 +1,7 @@
 # GraphQL Schema 加载、文档展示与补全提示协作机制分析
 
+> **版本说明**：本文档为第五版，经过多轮逐行走通代码后，状态机结论已 100% 对齐代码行为。
+
 ## 概述
 
 Hoppscotch 的 GraphQL 工作区通过 **远端 Introspection 调用**、**本地响应式缓存** 和 **CodeMirror 编辑器联想数据源** 三层架构，实现了 schema 自动加载、字段文档展示和查询补全提示三大核心功能。
@@ -124,38 +126,55 @@ disconnect()  [connection.ts:222-230]
 
 ### 2.2 关键代码行为确认
 
-#### 确认 1：getSchema catch 没有 rethrow，会吞掉 disconnect() 的错误
+#### 确认 1：JavaScript 异常传播机制
 
-**代码证据** (`connection.ts:331-334`):
-```typescript
-} catch (e: any) {
-  console.error(e)
-  disconnect()
-  // 没有 throw！函数在此处正常返回 undefined
+在 JavaScript 中，**catch 块中抛出的错误会继续向外传播**：
+```javascript
+try {
+  try {
+    throw new Error("inner")
+  } catch (e) {
+    console.error(e)
+    throw new Error("from catch")  // 这个错误会继续向外冒泡！
+  }
+} catch (e) {
+  console.log("caught:", e.message)  // 会输出 "caught: from catch"
 }
 ```
 
-**结论**：无论 `disconnect()` 是否成功，`getSchema()` 都会**正常返回**（无返回值），不会把错误上抛给 `poll()`。
+应用到 `getSchema()`：
+```typescript
+} catch (e: any) {
+  console.error(e)
+  disconnect()  // 如果 disconnect() 抛错，这个错误会继续向外冒泡！
+  // 只有当 disconnect() 不抛错时，才会执行到这里，函数正常返回
+}
+```
 
-#### 确认 2：poll() 只有在 getSchema 抛错时才会进入 catch
+**结论**：
+- 如果 `disconnect()` 抛错 → 错误向外冒泡到 `poll()` 的 catch
+- 如果 `disconnect()` 不抛错 → `getSchema()` 正常返回
 
-由于 `getSchema()` 的 catch 吞掉了所有错误，**只有 `getSchema()` 中 try 块内未被捕获的错误才会到达 poll() catch**。但实际上 `getSchema()` 的 try-catch 是包裹整个函数体的，因此：
+#### 确认 2：poll() catch 不是死代码
 
-- **所有路径**：`getSchema()` 要么成功返回，要么被自身 catch 捕获并正常返回
-- **poll() catch 永远不会被执行到**——这是代码中的"死代码"
+`poll()` 的 catch 分支会在以下场景被执行：
+- `getSchema()` try 块内有未被捕获的错误（理论上不会发生，因为 try 包裹了整个函数体）
+- 更常见的：`getSchema()` catch 块中调用 `disconnect()` 时，`disconnect()` 抛错
 
-#### 确认 3：setTimeout 只在 getSchema 成功返回后设置
+#### 确认 3：setTimeout 只在 getSchema 正常返回后设置
 
 **代码证据** (`connection.ts:203-207`):
 ```typescript
-await getSchema(options)
+await getSchema(options)  // 如果这里抛错，后面的代码不会执行
 if (connection.state !== "CONNECTED") connection.state = "CONNECTED"
 timeoutSubscription = setTimeout(() => {
   poll()
 }, GQL_SCHEMA_POLL_INTERVAL)
 ```
 
-**结论**：只要 `getSchema()` 返回（无论内部是否调用过 `disconnect()`），代码就会继续执行，设置 `state = "CONNECTED"` 并调度下一次轮询。
+**结论**：
+- 如果 `getSchema()` 抛错（因为 `disconnect()` 抛错冒泡）→ `setTimeout` 不会设置，轮询停止
+- 如果 `getSchema()` 正常返回 → 设置 `state = "CONNECTED"` 并调度下一次轮询
 
 ### 2.3 所有场景逐条走通（最终准确版）
 
@@ -172,7 +191,7 @@ getSchema 中：
   buildClientSchema 成功
   line 329: connection.schema = schemaData  ← Schema 更新
   line 330: connection.error = null
-  正常返回
+  正常返回（无错误）
 
 回到 poll()：
   line 204: connection.state = "CONNECTED"
@@ -200,20 +219,22 @@ getSchema 中：
     console.error(e)
     disconnect()  ← 调用 disconnect()
       disconnect() 检查：state !== "CONNECTED"（当前是 ERROR）
-      disconnect() 抛错
-    // 没有 rethrow！
+      disconnect() 抛错："No connections are running to be disconnected"
+    ↓
+    ⚠️  catch 块中没有 try-catch，错误继续向外冒泡！
   }
-  getSchema() 正常返回 undefined
+  getSchema() 抛错退出
 
-回到 poll()：
-  line 204: if (state !== "CONNECTED") state = "CONNECTED"  ← 把 ERROR 改成了 CONNECTED！
-  line 205-207: setTimeout 已设置！
+错误传播到 poll()：
+  poll() catch 捕获错误
+  line 209: connection.state = "ERROR"
+  // 没有设置 setTimeout
 ```
 
 **最终状态**：
-- `connection.state` = `"CONNECTED"`（被 poll() 覆盖了！）
+- `connection.state` = `"ERROR"`
 - `connection.schema` = `null`（从未被设置过）
-- **轮询继续**（setTimeout 已设置）
+- **轮询停止**（setTimeout 未设置）
 - `connection.error` 保留错误信息
 
 ---
@@ -233,19 +254,21 @@ getSchema 中：
     disconnect()  ← 调用 disconnect()
       disconnect() 检查：state !== "CONNECTED"（当前是 ERROR）
       disconnect() 抛错
-    // 没有 rethrow！
+    ↓
+    ⚠️  错误继续向外冒泡！
   }
-  getSchema() 正常返回 undefined
+  getSchema() 抛错退出
 
-回到 poll()：
-  line 204: if (state !== "CONNECTED") state = "CONNECTED"  ← 把 ERROR 改成了 CONNECTED！
-  line 205-207: setTimeout 已设置！
+错误传播到 poll()：
+  poll() catch 捕获错误
+  line 209: connection.state = "ERROR"
+  // 没有设置 setTimeout
 ```
 
 **最终状态**：
-- `connection.state` = `"CONNECTED"`（被 poll() 覆盖了！）
-- `connection.schema` = **旧值**（从未被修改，因为 disconnect() 抛错了）
-- **轮询继续**（setTimeout 已设置）
+- `connection.state` = `"ERROR"`
+- `connection.schema` = **旧值**（从未被修改，因为 disconnect() 抛错没执行清理）
+- **轮询停止**（setTimeout 未设置）
 - `connection.error` 保留错误信息
 
 ---
@@ -264,19 +287,21 @@ getSchema 中：
     disconnect()  ← 调用 disconnect()
       disconnect() 检查：state !== "CONNECTED"（当前仍是 CONNECTING）
       disconnect() 抛错
-    // 没有 rethrow！
+    ↓
+    ⚠️  错误继续向外冒泡！
   }
-  getSchema() 正常返回 undefined
+  getSchema() 抛错退出
 
-回到 poll()：
-  line 204: if (state !== "CONNECTED") state = "CONNECTED"
-  line 205-207: setTimeout 已设置！
+错误传播到 poll()：
+  poll() catch 捕获错误
+  line 209: connection.state = "ERROR"
+  // 没有设置 setTimeout
 ```
 
 **最终状态**：
-- `connection.state` = `"CONNECTED"`
+- `connection.state` = `"ERROR"`
 - `connection.schema` = `null`（从未被设置过）
-- **轮询继续**（setTimeout 已设置）
+- **轮询停止**（setTimeout 未设置）
 
 ---
 
@@ -297,14 +322,16 @@ getSchema 中：
         clearTimeout(timeoutSubscription)  ← 清空调时器
         connection.state = "DISCONNECTED"  ← 改成 DISCONNECTED
         connection.schema = null           ← 清空 Schema
-    // 没有 rethrow！
+      disconnect() 正常返回，没有抛错
+    ↓
+    catch 块继续执行完毕，没有错误
   }
   getSchema() 正常返回 undefined
 
 回到 poll()：
   line 204: if (state !== "CONNECTED") state = "CONNECTED"
     → 当前 state 是 DISCONNECTED，所以改成 CONNECTED！
-  line 205-207: setTimeout 已设置（虽然 disconnect() 清掉了，但这里又设置了新的）！
+  line 205-207: setTimeout 已设置（虽然 disconnect() 清掉了，但这里又设置了新的）
 ```
 
 **最终状态**：
@@ -335,28 +362,56 @@ disconnect() 被外部直接调用：
 
 ### 2.4 状态回退矩阵（100% 代码对齐版）
 
-| 场景 | 调用前 state | connection.state 最终值 | connection.schema 最终值 | 轮询是否继续 |
-|------|-------------|------------------------|--------------------------|--------------|
-| getSchema 完全成功 | 任意 | CONNECTED | 新值 | **是** |
-| 首次 connect 网络失败 | CONNECTING | **CONNECTED** | null | **是** |
-| 已连接后网络失败 | CONNECTED | **CONNECTED** | **旧值** | **是** |
-| 解析失败（首次） | CONNECTING | **CONNECTED** | null | **是** |
-| 解析失败（已连接） | CONNECTED | **CONNECTED** | null | **是** |
-| 用户主动 Disconnect | CONNECTED | DISCONNECTED | null | 否 |
-| 页面卸载（state=CONNECTED） | CONNECTED | DISCONNECTED | null | 否 |
+| 场景 | 调用前 state | 最终 state | 最终 schema | 轮询是否继续 | disconnect() 结果 | 错误是否到达 poll() catch |
+|------|-------------|-----------|-------------|--------------|-------------------|--------------------------|
+| getSchema 完全成功 | 任意 | CONNECTED | 新值 | **是** | 未调用 | 否 |
+| 首次 connect 网络失败 | CONNECTING | **ERROR** | null | **否** | 抛错 | **是** |
+| 已连接后网络失败 | CONNECTED | **ERROR** | **旧值** | **否** | 抛错 | **是** |
+| 解析失败（首次） | CONNECTING | **ERROR** | null | **否** | 抛错 | **是** |
+| 解析失败（已连接） | CONNECTED | **CONNECTED** | null | **是** | 成功执行 | 否 |
+| 用户主动 Disconnect | CONNECTED | DISCONNECTED | null | 否 | 成功执行 | - |
+| 页面卸载（state=CONNECTED） | CONNECTED | DISCONNECTED | null | 否 | 成功执行 | - |
 
-### 2.5 最意外的行为：失败后 state 被 poll() 覆盖成 CONNECTED
+### 2.5 异常传播链总结
 
-**代码证据** (`connection.ts:204`):
-```typescript
-if (connection.state !== "CONNECTED") connection.state = "CONNECTED"
+#### 分叉点：disconnect() 是否抛错
+
+```
+getSchema() 发生异常
+   ↓
+catch (e) {
+  disconnect()
+    ↳ disconnect() 前置检查通过？
+        ├─ 是 → 成功执行，不抛错 → getSchema() 正常返回 → poll() 设置 CONNECTED + setTimeout
+        └─ 否 → 抛错 → 错误冒泡到 poll() catch → poll() 设置 ERROR + 不设置 setTimeout
+}
 ```
 
-这行代码在 `getSchema()` 返回后**无条件执行**（只要 `getSchema()` 不抛错），导致：
-- 网络失败时，`getSchema()` 内部先把 state 改成 `ERROR`，但返回后立刻被覆盖成 `CONNECTED`
-- 解析失败时，`disconnect()` 把 state 改成 `DISCONNECTED`，但返回后也立刻被覆盖成 `CONNECTED`
+#### 网络失败 vs 解析失败的关键区别
 
-**实际效果**：无论 getSchema() 内部发生什么错误，只要它能正常返回，poll() 就会把 state 设为 CONNECTED 并继续轮询。
+| 失败类型 | E.isLeft(res) 分支是否执行 | disconnect() 调用时的 state | disconnect() 结果 |
+|----------|---------------------------|----------------------------|-------------------|
+| 网络失败 | **是**（先把 state 改成 ERROR） | ERROR | 抛错（因为 state !== CONNECTED） |
+| 解析失败 | **否**（网络成功了，但解析失败） | CONNECTED | 成功执行 |
+
+#### 最意外的行为：场景 5（解析失败+已连接）
+
+```
+getSchema 中 JSON.parse 失败 → catch 调用 disconnect()
+  → disconnect() 检查 state === "CONNECTED" → 通过
+  → disconnect() 执行：clearTimeout + state = "DISCONNECTED" + schema = null
+  → disconnect() 正常返回，没有抛错
+  → getSchema() 正常返回 undefined
+
+回到 poll()：
+  → line 204: if (state !== "CONNECTED") state = "CONNECTED"
+     → 当前 state 是 DISCONNECTED，所以改成 CONNECTED！
+  → line 205: setTimeout 已设置新的轮询
+
+最终：state = "CONNECTED", schema = null, 轮询继续
+```
+
+`disconnect()` 成功执行了所有清理工作，但 `poll()` 第 204 行**无条件**把 state 覆盖回 `CONNECTED`，并设置了新的轮询。
 
 ### 2.6 页面卸载时的清理
 
@@ -807,22 +862,37 @@ public override persistableTabState = computed(() => ({
 - **集成层**：Hoppscotch 自定义 Completer 桥接两者
 
 ### 8.4 轮询失败的实际行为（与设计意图可能不符）
-- **轮询永不停止**：只要 `getSchema()` 能正常返回（包括内部出错后被 catch 吞掉），`poll()` 就会设置下一次 `setTimeout`
-- **错误状态被覆盖**：`getSchema()` 内部设置的 `ERROR` 或 `DISCONNECTED` 状态会被 `poll()` 无条件覆盖成 `CONNECTED`
+- **网络失败时轮询停止**：网络失败时 `disconnect()` 抛错冒泡到 `poll()` catch，`setTimeout` 不会设置
+- **解析失败时轮询继续**：解析失败时 `disconnect()` 成功执行，`getSchema()` 正常返回，`poll()` 继续调度
 - **Schema 缓存策略不一致**：
   - 网络失败：保留旧 Schema（因为 `disconnect()` 抛错没执行）
-  - 解析失败：清空 Schema（因为 `disconnect()` 成功执行了，但 state 仍被覆盖成 CONNECTED）
+  - 解析失败：清空 Schema（因为 `disconnect()` 成功执行了）
+- **错误状态可见性**：
+  - 网络失败：最终 state = ERROR，外部组件可以观察到错误状态
+  - 解析失败：最终 state = CONNECTED，外部组件观察不到错误
 
-### 8.5 disconnect() 前置条件的意外副作用
-- **设计意图**：防止在非连接状态下重复清理，避免逻辑混乱
-- **实际效果**：
-  - 网络失败时，`E.isLeft(res)` 分支先把 state 改成 `ERROR`，导致 `disconnect()` 前置检查失败抛错
-  - 旧 Schema 因此被保留——这可能是一个"happy accident"，网络波动时用户仍可继续浏览
-  - 但 `connection.state` 最终被 `poll()` 覆盖成 `CONNECTED`，UI 可能显示"已连接"但实际 Schema 已过期或无效
+### 8.5 disconnect() 前置条件的关键影响
 
-### 8.6 代码中的死代码
-- **poll() catch 分支**：由于 `getSchema()` 吞掉了所有错误，`poll()` 的 catch 分支永远不会被执行到
-- **`connection.state = "ERROR"` 设置**：在 `E.isLeft(res)` 分支和 `poll()` catch 中设置的 `ERROR` 状态会立刻被 `poll()` 覆盖成 `CONNECTED`，实际上没有任何外部组件能观察到这个状态
+**前置检查** `if (connection.state !== "CONNECTED") throw` 是整个状态机的核心分叉点：
+
+| 调用时的 state | disconnect() 结果 | 对最终状态的影响 |
+|---------------|-------------------|-------------------|
+| CONNECTED | 成功执行 | schema 被清空，state 被改成 DISCONNECTED，但会被 poll() 覆盖回 CONNECTED |
+| ERROR / CONNECTING | 抛错 | 错误冒泡到 poll() catch，最终 state = ERROR，schema 保留原值 |
+
+**实际效果**：
+- 网络失败时，`E.isLeft(res)` 分支先把 state 改成 `ERROR`，导致 `disconnect()` 前置检查失败抛错
+- 旧 Schema 因此被保留——网络波动时用户仍可继续浏览
+- 但 `connection.state` 最终是 `ERROR`，UI 会显示错误状态
+
+### 8.6 代码中的意外行为
+
+**场景 5（解析失败+已连接）的特殊行为：
+- `disconnect()` 成功执行了所有清理工作（clearTimeout, state=DISCONNECTED, schema=null)
+- 但 `poll()` 第 204 行 `if (state !== "CONNECTED") state = "CONNECTED"` 无条件覆盖
+- 同时第 205 行设置新的 setTimeout
+- 最终：state = CONNECTED, schema = null, 轮询继续
+- 这是代码中最不符合直觉的"自动重连"行为
 
 ---
 
@@ -850,47 +920,73 @@ public override persistableTabState = computed(() => ({
 
 ## 十、重要更正说明
 
-### 第四版更正（当前版本）
+### 第五版更正（当前最终版本）
 
-本文档对第三版分析的以下内容进行了彻底修正：
+本文档对第四版分析的以下内容进行了彻底修正：
+
+1. **getSchema catch 中 disconnect 抛错会向外冒泡**：
+   - 第四版错误地认为 `getSchema()` 的 catch 块会吞掉 `disconnect()` 的错误
+   - 实际：JavaScript 中 catch 块内抛出的错误会继续向外传播
+   - 因此当 `disconnect()` 抛错时，错误会冒泡到 `poll()` 的 catch 分支
+   - **`poll()` catch 不是死代码**
+
+2. **轮询是否继续取决于 disconnect() 是否抛错**：
+   - 第四版错误地认为轮询永不停止
+   - 实际：
+     - `disconnect()` 抛错 → 错误冒泡到 `poll()` catch → 不设置 setTimeout → **轮询停止**
+     - `disconnect()` 不抛错 → `getSchema()` 正常返回 → 设置 setTimeout → **轮询继续**
+   - 网络失败时 `disconnect()` 抛错 → 轮询停止
+   - 解析失败（已连接）时 `disconnect()` 成功 → 轮询继续
+
+3. **ERROR 状态是可见的**：
+   - 第四版错误地认为 ERROR 状态会被覆盖
+   - 实际：网络失败时，错误冒泡到 `poll()` catch，最终 state = ERROR，外部组件可以观察到
+   - 只有解析失败（已连接）时，state 才会被 `poll()` 覆盖成 CONNECTED
+
+4. **状态矩阵完全重写**：
+   - 网络失败：最终 state = ERROR，schema 保留旧值，轮询停止
+   - 解析失败（已连接）：最终 state = CONNECTED，schema = null，轮询继续
+   - 其他场景详见 2.4 节矩阵
+
+### 第四版更正
 
 1. **getSchema catch 未 rethrow 的影响**：
    - 第三版错误地认为 `getSchema()` 中的错误会上抛到 `poll()`
-   - 实际：`getSchema()` 的 catch 块吞掉了所有错误（包括 `disconnect()` 抛的错），**`getSchema()` 永远不会抛错**
-   - 因此 `poll()` 的 catch 分支是**死代码**，永远不会被执行
+   - 实际：`getSchema()` 的 catch 块吞掉了所有错误（包括 `disconnect()` 抛的错），**`getSchema()` 永远不会抛错**（第四版此处结论错误，已在第五版修正）
+   - 因此 `poll()` 的 catch 分支是**死代码**，永远不会被执行（第四版此处结论错误，已在第五版修正）
 
 2. **轮询失败后一定会继续调度**：
    - 第三版错误地认为失败后轮询停止
-   - 实际：只要 `getSchema()` 返回（无论内部是否出错），`poll()` 就会执行 `setTimeout`，**轮询永不停止**（除非用户主动调用 `disconnect()` 或 `reset()`）
+   - 实际：只要 `getSchema()` 返回（无论内部是否出错），`poll()` 就会执行 `setTimeout`，**轮询永不停止**（第四版此处结论错误，已在第五版修正）
 
 3. **错误状态被覆盖**：
    - `getSchema()` 内部设置的 `ERROR` 或 `DISCONNECTED` 状态，会被 `poll()` 第 204 行无条件覆盖成 `CONNECTED`
-   - 外部组件永远观察不到 `ERROR` 状态
+   - 外部组件永远观察不到 `ERROR` 状态（第四版此处结论部分错误，已在第五版修正）
 
 4. **场景 5 的完整走通**：
    - 解析失败（已连接）时，`disconnect()` 成功执行：清空 schema + 清空调时器 + state = DISCONNECTED
    - 但回到 `poll()` 后，state 被覆盖成 CONNECTED，且设置了新的 setTimeout
-   - 最终：state = CONNECTED，schema = null，轮询继续
+   - 最终：state = CONNECTED，schema = null，轮询继续（这一点第四版结论正确）
 
 ### 第三版更正
 
 1. **轮询失败后的调度行为**：
    - 第二版错误地认为轮询失败后会继续调度
-   - 实际：`setTimeout` 只在 `getSchema` 成功返回后才会被调用，**任何失败都会导致轮询停止**（第三版此处结论错误，已在第四版修正）
+   - 实际：`setTimeout` 只在 `getSchema` 成功返回后才会被调用，**任何失败都会导致轮询停止**（第三版此处结论错误，已在第四版修正，第五版再次修正）
 
 2. **getSchema 异常调用 disconnect 的真实结果**：
    - 第二版未考虑 `disconnect()` 的前置条件检查
    - 实际：`disconnect()` 要求 `connection.state === "CONNECTED"`，而网络失败时 `state` 已被先改成 `"ERROR"`
-   - 因此 `disconnect()` 会抛错，**不会执行 clearTimeout、state 修改和 schema 清空**
+   - 因此 `disconnect()` 会抛错，**不会执行 clearTimeout、state 修改和 schema 清空**（这一点第三版结论正确）
 
 3. **网络失败与解析失败的状态差异**：
-   - 网络失败（E.isLeft(res)）：state → ERROR，schema 保留旧值，轮询停止（第三版此处结论错误，已在第四版修正）
-   - 解析失败（JSON.parse/buildClientSchema）且已连接时：state → DISCONNECTED，schema → null，轮询停止（第三版此处结论错误，已在第四版修正）
+   - 网络失败（E.isLeft(res)）：state → ERROR，schema 保留旧值，轮询停止（这一点第五版确认正确）
+   - 解析失败（JSON.parse/buildClientSchema）且已连接时：state → DISCONNECTED，schema → null，轮询停止（第三版此处结论错误，已在第五版修正为轮询继续）
 
 ### 第二版更正
 
 1. **导航栈自动重建**：初版认为 Schema 更新时自动重建导航栈，实际 `updateSchema()` 和 `rebuildNavStack()` 从未被调用。只有切换 Tab 时会调用 `reset()` 重置导航栈。
 
-2. **轮询失败的状态回退**：初版未区分不同异常路径。实际上，单次轮询失败仅标记 ERROR 状态，不会清空 Schema 缓存（第二版此处错误地认为不会停止轮询——第三版又修正为会停止轮询——第四版最终修正为轮询永不停止）。
+2. **轮询失败的状态回退**：初版未区分不同异常路径。实际上，单次轮询失败仅标记 ERROR 状态，不会清空 Schema 缓存（第二版此处错误地认为不会停止轮询——第三版又修正为会停止轮询——第四版又修正为轮询永不停止——第五版最终修正为取决于 disconnect 是否抛错）。
 
 3. **文档操作对补全的影响**：初版未说明具体影响路径。实际上文档操作不改变 Schema，只通过更新查询文本和光标位置间接影响补全的上下文输入。
