@@ -26,7 +26,7 @@ Hoppscotch 的 Mock 服务和 API 文档发布**最终都关联到同一个 Coll
                     └───────────────────────────────┘
 ```
 
-**关键修正**：Mock Server 和 Published Docs **并不共享同一个数据字段**。它们分别读取 `mockExamples` 和 `request.responses` 两个独立的字段。
+**关键结论**：Mock Server 和 Published Docs **并不共享同一个数据字段**。它们分别读取 `mockExamples` 和 `request.responses` 两个独立的字段。
 
 ---
 
@@ -70,6 +70,10 @@ model PublishedDocs {
 }
 ```
 
+**代码证据**：
+- `packages/hoppscotch-backend/prisma/schema.prisma:59-73`（TeamRequest）
+- `packages/hoppscotch-backend/prisma/schema.prisma:180-195`（UserRequest）
+
 ### 2.2 数据字段边界对比
 
 | 维度 | Mock Server | Published Docs |
@@ -79,6 +83,10 @@ model PublishedDocs {
 | **读取方式** | 直接查询 `mockExamples not null` | 通过 Collection Service 导出完整 Collection |
 | **数据范围** | 只包含响应示例 | 包含完整请求定义（方法、路径、参数、认证、响应等） |
 | **前端展示** | 不展示，直接返回 HTTP 响应 | 通过 `request.responses` 展示示例 |
+
+**代码证据**：
+- Mock 读取：`mock-server.service.ts:806-831` `fetchRequestsWithExamples()`
+- 文档读取：`team-collection.service.ts:111-165` `exportCollectionToJSONObject()`
 
 ---
 
@@ -114,6 +122,7 @@ HTTP 请求到达 Mock 端点
     └─ 常规路径（智能匹配）：
         ├─ fetchCandidateExamples() 过滤候选
         │  ├─ 方法匹配检查
+        │  ├─ parseExample() 解析格式
         │  └─ couldPathMatch() 预过滤（分段数检查）
         ├─ calculateMatchScore() 评分排序
         └─ 返回最高分（同分优先 200 状态码）
@@ -121,6 +130,11 @@ HTTP 请求到达 Mock 端点
     ▼
 5. 应用延迟（delayInMs），格式化并返回响应
 ```
+
+**代码证据**：
+- 快速路径：`mock-server.service.ts:725-740`
+- 候选过滤：`mock-server.service.ts:879-923` `fetchCandidateExamples()`
+- 评分排序：`mock-server.service.ts:766-795`
 
 ### 3.2 评分算法实现细节
 
@@ -284,25 +298,81 @@ const ACTIVE_CONTENT_TYPES = new Set([
 4. 返回 URL：/view/{slug}/{version}
 ```
 
-### 4.3 后端接口与前端路径的衔接
+**代码证据**：
+- URL 生成：`published-docs.service.ts:93`
+- 导出逻辑：`team-collection.service.ts:111-165`
 
-**后端 REST 接口**（`published-docs.controller.ts`）：
+---
+
+## 五、后端 REST 接口与前端路由的衔接
+
+### 5.1 后端 REST API 接口
+
+**控制器**：`packages/hoppscotch-backend/src/published-docs/published-docs.controller.ts`
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/v1/published-docs/:slug` | 无版本路径，自动选择默认版本 |
-| GET | `/api/v1/published-docs/:slug/:version` | 指定版本路径 |
+| GET | `/api/v1/published-docs/:slug` | 无版本接口，自动选择默认版本 |
+| GET | `/api/v1/published-docs/:slug/:version` | 指定版本接口 |
 
-**前端路由**（`pages/view/_id/_version.vue`）：
+**代码证据**：
+- 无版本接口：`published-docs.controller.ts:22-49` `getPublishedDocsBySlugLatest()`
+- 有版本接口：`published-docs.controller.ts:51-81` `getPublishedDocsBySlug()`
 
-| 前端路径 | 对应后端调用 |
-|----------|-------------|
-| `/view/{slug}` | `GET /api/v1/published-docs/{slug}`（无版本） |
-| `/view/{slug}/{version}` | `GET /api/v1/published-docs/{slug}/{version}`（指定版本） |
+### 5.2 前端页面路由
 
-**版本选择规则**（`published-docs.service.ts:295-303`）：
+**路由文件**：`packages/hoppscotch-common/src/pages/view/_id/_version.vue`
 
-当无版本访问时（`version=null`），后端按以下规则排序并选择第一个：
+基于 unplugin-vue-router 的文件路由规则：
+- 文件名 `_id/_version.vue` → 路由 `/view/:id/:version`
+- **只有带版本的路由**，没有无版本路由
+
+| 前端路径 | 说明 |
+|----------|------|
+| `/view/{slug}/{version}` | 唯一的文档访问路径，必须带 version 参数 |
+
+**代码证据**：
+- 目录结构：`LS pages/view/` 结果只有 `_id/_version.vue`
+- 参数获取：`view/_id/_version.vue:292-293` `route.params.version`
+
+### 5.3 衔接关系
+
+```
+前端页面访问
+    │
+    ▼
+用户访问 /view/{slug}/{version}
+    │
+    ├─ 前端路由匹配 pages/view/_id/_version.vue
+    │
+    ▼
+2. 页面组件加载
+    ├─ 从路由参数获取 id = slug, version
+    └─ 调用 getPublishedDocBySlugREST(slug, version)
+    │
+    ▼
+3. 前端 API 调用
+    └─ version 始终有值 → 调用有版本接口
+       GET /api/v1/published-docs/{slug}/{version}
+    │
+    ▼
+4. 后端处理
+    └─ 返回指定版本的文档数据
+```
+
+**关键澄清**：
+- **后端有两个 REST 接口**（无版本/有版本），主要是为了 API 完整性
+- **前端页面只有一个路由**（必须带版本），所以前端页面总是调用有版本接口
+- 无版本的后端接口主要用于 API 调用场景，不用于前端页面访问
+- **不要将 REST 接口路径等同于前端页面路径**，两者是不同的概念
+
+**代码证据**：
+- 前端调用：`PublishedDocs.ts:273-295` `getPublishedDocBySlugREST()`
+- 页面参数：`view/_id/_version.vue:292-294` `onMounted` 中始终传 version
+
+### 5.4 版本选择规则
+
+当通过无版本接口访问时（`version=null`），后端按以下规则排序并选择第一个版本：
 
 ```typescript
 orderBy: [{ autoSync: 'desc' }, { createdOn: 'desc' }]
@@ -312,23 +382,24 @@ orderBy: [{ autoSync: 'desc' }, { createdOn: 'desc' }]
 1. **第一优先级**：`autoSync=true` 的 Live 版本
 2. **第二优先级**：创建时间降序（最新创建的在前）
 
-**结论**：无版本路径时，**优先返回 Live 版本**；无 Live 版本时返回最新创建的版本。
+**代码证据**：
+- 排序逻辑：`published-docs.service.ts:295-303` `getPublishedDocsVersions()`
+- 版本选择：`published-docs.service.ts:341` `version: version ? version : allVersions.right[0].version`
 
-### 4.4 文档访问数据流
+### 5.5 文档访问完整数据流
 
 ```
-用户访问 /view/{slug} 或 /view/{slug}/{version}
+用户访问 /view/{slug}/{version}
     │
     ▼
 1. 前端路由到 view/_id/_version.vue
     │
     ▼
 2. 调用 getPublishedDocBySlugREST(slug, version)
+    │  version 始终有值 → 调用有版本 REST 接口
     │
     ▼
-3. 后端 getPublishedDocBySlugPublic()：
-    ├─ 查询该 slug 下的所有版本（按 autoSync desc, createdOn desc 排序）
-    ├─ version=null 时使用排序后的第一个版本
+3. 后端 getPublishedDocBySlugPublic(slug, version)：
     ├─ 根据 slug + version 查找 PublishedDocs 记录
     │
     ├─ autoSync = true 时：
@@ -353,11 +424,15 @@ orderBy: [{ autoSync: 'desc' }, { createdOn: 'desc' }]
     └─ RequestPreview：右侧请求详情（含 responses 展示）
 ```
 
+**代码证据**：
+- 前端处理：`view/_id/_version.vue:207-284` `fetchDocs()`
+- 响应展示：`RequestPreview.vue:78-80` `getResponseExamples()` 读取 `request.responses`
+
 ---
 
-## 五、两者的数据读取边界对比
+## 六、两者的数据读取边界对比
 
-### 5.1 完整读取链路对比
+### 6.1 完整读取链路对比
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -392,7 +467,7 @@ orderBy: [{ autoSync: 'desc' }, { createdOn: 'desc' }]
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 边界总结表
+### 6.2 边界总结表
 
 | 维度 | Mock Server | Published Docs |
 |------|-------------|----------------|
@@ -403,7 +478,7 @@ orderBy: [{ autoSync: 'desc' }, { createdOn: 'desc' }]
 | **时效性** | 总是最新 | Live 版本总是最新，Frozen 版本是发布快照 |
 | **是否为空** | 可为空（无 Mock 示例时不返回） | 必有（至少包含请求定义） |
 
-### 5.3 共同依赖与差异
+### 6.3 共同依赖与差异
 
 | 依赖项 | Mock Server | Published Docs |
 |--------|-------------|----------------|
@@ -416,7 +491,7 @@ orderBy: [{ autoSync: 'desc' }, { createdOn: 'desc' }]
 
 ---
 
-## 六、核心差异总结
+## 七、核心差异总结
 
 | 维度 | Mock Server | Published Docs |
 |------|-------------|----------------|
@@ -430,28 +505,28 @@ orderBy: [{ autoSync: 'desc' }, { createdOn: 'desc' }]
 
 ---
 
-## 七、代码溯源
+## 八、代码溯源
 
 | 功能 | 文件位置 | 关键方法/组件 |
 |------|----------|--------------|
-| Mock 服务核心 | `packages/hoppscotch-backend/src/mock-server/mock-server.service.ts` | `handleMockRequest`, `calculateMatchScore`, `couldPathMatch` |
+| Mock 服务核心 | `packages/hoppscotch-backend/src/mock-server/mock-server.service.ts` | `handleMockRequest`, `calculateMatchScore`, `couldPathMatch`, `parseExample` |
 | Mock 控制器 | `packages/hoppscotch-backend/src/mock-server/mock-server.controller.ts` | `handleMockRequest` |
-| 文档发布服务 | `packages/hoppscotch-backend/src/published-docs/published-docs.service.ts` | `createPublishedDoc`, `getPublishedDocBySlugPublic`, `getOrGenerateSlug` |
+| 文档发布服务 | `packages/hoppscotch-backend/src/published-docs/published-docs.service.ts` | `createPublishedDoc`, `getPublishedDocBySlugPublic`, `getOrGenerateSlug`, `getPublishedDocsVersions` |
 | 文档控制器 | `packages/hoppscotch-backend/src/published-docs/published-docs.controller.ts` | `getPublishedDocsBySlugLatest`, `getPublishedDocsBySlug` |
 | Collection 导出 | `packages/hoppscotch-backend/src/team-collection/team-collection.service.ts` | `exportCollectionToJSONObject` |
 | 文档发布前端 | `packages/hoppscotch-common/src/components/collections/documentation/index.vue` | `handlePublish` |
-| 文档浏览页面 | `packages/hoppscotch-common/src/src/pages/view/_id/_version.vue` | `fetchDocs`, `flattenCollection` |
+| 文档浏览页面 | `packages/hoppscotch-common/src/pages/view/_id/_version.vue` | `fetchDocs`, `flattenCollection` |
 | 请求预览组件 | `packages/hoppscotch-common/src/components/collections/documentation/RequestPreview.vue` | `getResponseExamples` |
 | 前端 API 调用 | `packages/hoppscotch-common/src/helpers/backend/queries/PublishedDocs.ts` | `getPublishedDocBySlugREST` |
 | 数据模型 | `packages/hoppscotch-backend/prisma/schema.prisma` | `TeamRequest`, `UserRequest`, `MockServer`, `PublishedDocs` |
 
 ---
 
-## 八、设计要点
+## 九、设计要点
 
 1. **字段分流设计**：Mock 和文档分别使用独立字段，互不干扰，但最终都关联同一个 Collection
 2. **灵活版本控制**：文档支持 Live（实时同步）和 Frozen（版本快照）两种模式
-3. **智能版本路由**：无版本路径时优先返回 Live 版本，符合直觉
+3. **路由与 API 分离**：后端 REST API 提供无版本/有版本两个接口，但前端页面路由只有带版本的路径，各司其职
 4. **安全分层防护**：Mock 服务有多层安全防护（头黑名单、MIME 降级）
 5. **性能优化**：Mock 服务通过 `couldPathMatch` 预过滤和数据库级 `IS NOT NULL` 过滤减少计算量
 6. **解耦架构**：Mock 和 Published Docs 没有直接代码依赖，通过数据库中的 Collection 数据解耦
