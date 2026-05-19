@@ -1,133 +1,130 @@
 # Mock 服务与 API 文档发布的咬合关系分析
 
-## 一、核心设计思想：单一数据源，多场景复用
+## 一、核心设计思想：同根同源，字段分流
 
-Hoppscotch 的 Mock 服务和 API 文档发布共享同一个核心数据模型 —— **Collection（API 集合）**。这种设计实现了"一次定义，多处使用"的目标。
+Hoppscotch 的 Mock 服务和 API 文档发布**最终都关联到同一个 Collection**，但它们在数据库层面读取的是 **不同的字段**。这种设计既保证了数据来源的一致性（都属于同一个 API 集合），又允许两者独立演化。
 
 ```
-                    ┌─────────────────────┐
-                    │   Collection (API   │
-                    │   请求定义集合)     │
-                    │  - 请求方法/路径    │
-                    │  - 请求头/参数      │
-                    │  - 响应示例         │
-                    └─────────┬───────────┘
-                              │
-           ┌──────────────────┼──────────────────┐
-           │                  │                  │
-┌──────────▼─────────┐  ┌─────▼──────────┐  ┌──▼──────────────┐
-│  Mock Server       │  │  Published Docs│  │  API Testing    │
-│  (运行时模拟)      │  │  (静态文档)    │  │  (接口测试)     │
-└────────────────────┘  └────────────────┘  └─────────────────┘
+                    ┌───────────────────────────────┐
+                    │   TeamCollection /            │
+                    │   UserCollection              │
+                    │   (API 请求集合容器)          │
+                    └───────────────┬───────────────┘
+                                    │
+                                    ▼
+                    ┌───────────────────────────────┐
+                    │   TeamRequest / UserRequest   │
+                    │  ┌─────────────────────────┐  │
+                    │  │ request (JSON)          │  │
+                    │  │  - 方法、路径、参数     │  │
+                    │  │  - responses (响应示例) │──┼───► Published Docs 读取
+                    │  └─────────────────────────┘  │
+                    │  ┌─────────────────────────┐  │
+                    │  │ mockExamples (JSON?)    │  │
+                    │  │  - Mock 专用响应示例    │──┼───► Mock Server 读取
+                    │  └─────────────────────────┘  │
+                    └───────────────────────────────┘
 ```
+
+**关键修正**：Mock Server 和 Published Docs **并不共享同一个数据字段**。它们分别读取 `mockExamples` 和 `request.responses` 两个独立的字段。
 
 ---
 
-## 二、接口定义复用：Collection 作为唯一真相源
+## 二、数据模型与关联关系
 
-### 2.1 Collection 数据结构
-
-Collection 是所有 API 相关功能的基础，包含：
-- 请求定义（方法、路径、头信息、参数）
-- 认证配置
-- 响应示例（`mockExamples`，这是 Mock 服务的核心数据源）
-
-数据库层面的关联关系（Prisma Schema）：
+### 2.1 数据库表结构
 
 ```prisma
-// Collection 存储模型（以 Team 为例）
+// Collection 容器
 model TeamCollection {
-  id         String           @id @default(cuid())
-  title      String           // 集合名称
-  data       Json?            // 集合元数据
-  requests   TeamRequest[]    // 关联的请求列表
+  id         String         @id @default(cuid())
+  title      String
+  requests   TeamRequest[]
 }
 
+// 请求表 —— 包含两个独立的响应示例字段
 model TeamRequest {
   id           String         @id @default(cuid())
-  collectionID String         // 关联的 Collection ID
-  request      Json           // 请求定义（方法、路径等）
-  mockExamples Json?          // 响应示例 —— Mock 和文档共享
+  collectionID String         // 关联 Collection
+  title        String
+  request      Json           // HoppRESTRequest 对象，内含 responses 字段
+  mockExamples Json?          // Mock 专用响应示例，可为空
 }
-```
 
-### 2.2 Mock Server 与 Published Docs 如何关联 Collection
-
-两者都通过 `collectionID` 字段关联到同一个 Collection：
-
-```prisma
-// Mock Server 模型
+// Mock Server 配置
 model MockServer {
   id            String        @id @default(cuid())
-  name          String
-  subdomain     String        @unique  // Mock 服务访问域名
+  subdomain     String        @unique
   collectionID  String        // 关联 Collection
-  // ... 其他字段
+  delayInMs     Int           // 响应延迟
 }
 
-// Published Docs 模型
+// 已发布文档
 model PublishedDocs {
   id            String        @id @default(cuid())
-  slug          String        // 文档访问路径
+  slug          String        // 访问路径
+  version       String        // 版本号
   collectionID  String        // 关联 Collection
-  autoSync      Boolean       // 是否自动同步 Collection 变更
-  documentTree  Json?         // 快照数据（autoSync=false 时使用）
-  // ... 其他字段
+  autoSync      Boolean       // 是否实时同步
+  documentTree  Json?         // autoSync=false 时存储 Collection 快照
 }
 ```
 
-**关键复用点**：
-- `TeamRequest.mockExamples` / `UserRequest.mockExamples` 字段同时服务于 Mock 服务和文档展示
-- Mock 服务用它来生成响应，文档用它来展示示例响应
-- 两者共享完全相同的数据结构，无需重复定义
+### 2.2 数据字段边界对比
+
+| 维度 | Mock Server | Published Docs |
+|------|-------------|----------------|
+| **读取字段** | `TeamRequest.mockExamples` | `TeamRequest.request` (内含 `responses`) |
+| **字段类型** | `Json?`（可为空） | `Json`（必有） |
+| **读取方式** | 直接查询 `mockExamples not null` | 通过 Collection Service 导出完整 Collection |
+| **数据范围** | 只包含响应示例 | 包含完整请求定义（方法、路径、参数、认证、响应等） |
+| **前端展示** | 不展示，直接返回 HTTP 响应 | 通过 `request.responses` 展示示例 |
 
 ---
 
-## 三、Mock 行为生成：从 Collection 到 HTTP 响应
+## 三、Mock 服务行为生成链路
 
-### 3.1 Mock 请求处理流程
+### 3.1 Mock 请求处理全流程
 
-Mock Server 的核心逻辑在 `packages/hoppscotch-backend/src/mock-server/mock-server.service.ts:698-800`
+Mock Server 核心逻辑：`packages/hoppscotch-backend/src/mock-server/mock-server.service.ts:698-800`
 
 ```
-HTTP 请求到达
+HTTP 请求到达 Mock 端点
     │
     ▼
-1. 解析 Mock Server ID（从子域名或路径）
+1. 解析 Mock Server ID（从子域名或路径前缀）
     │
     ▼
 2. 获取关联的 Collection 及其所有子集合 ID
-    │  (getCollectionIds 方法，递归获取所有子集合)
+    │  (getCollectionIds 递归查询)
     │
     ▼
-3. 从数据库获取这些集合中所有带有 mockExamples 的请求
-    │  (fetchRequestsWithExamples 方法，只查询 mockExamples not null 的记录)
+3. 批量查询所有带 mockExamples 的请求
+    │  fetchRequestsWithExamples():
+    │  └─ WHERE mockExamples IS NOT NULL
+    │     SELECT id, mockExamples
     │
     ▼
-4. 匹配请求：
-    ├─ 快速路径：检查自定义请求头
-    │   ├─ x-mock-response-id：按 ID 精确匹配
-    │   ├─ x-mock-response-name：按名称匹配
-    │   └─ x-mock-response-code：按状态码筛选
+4. 匹配响应（两级路径）：
+    ├─ 快速路径（自定义请求头）：
+    │   ├─ x-mock-response-id → 按 ID 精确匹配
+    │   ├─ x-mock-response-name → 按名称匹配
+    │   └─ x-mock-response-code → 按状态码筛选
     │
-    └─ 常规路径：智能匹配
-        ├─ 快速过滤：couldPathMatch 预检查（分段数相同或含变量）
-        ├─ 过滤 HTTP 方法不匹配的
-        ├─ 路径匹配（支持 <<变量>> 语法）
-        ├─ 查询参数匹配
-        ├─ 评分排序（Postman 算法：基础分 100）
-        │   ├─ 路径精确匹配 = 100 分
-        │   ├─ 路径含变量 = 95 分
-        │   └─ 查询参数匹配度按比例折算
-        └─ 返回最高分的响应示例（同分优先 200 状态码）
+    └─ 常规路径（智能匹配）：
+        ├─ fetchCandidateExamples() 过滤候选
+        │  ├─ 方法匹配检查
+        │  └─ couldPathMatch() 预过滤（分段数检查）
+        ├─ calculateMatchScore() 评分排序
+        └─ 返回最高分（同分优先 200 状态码）
     │
     ▼
-5. 应用延迟（delayInMs），返回响应
+5. 应用延迟（delayInMs），格式化并返回响应
 ```
 
-### 3.2 核心匹配算法代码解析
+### 3.2 评分算法实现细节
 
-在 `mock-server.service.ts:1076-1160` 的 `calculateMatchScore` 方法：
+**`calculateMatchScore` 方法**（mock-server.service.ts:1076-1160）
 
 ```typescript
 private calculateMatchScore(
@@ -137,12 +134,12 @@ private calculateMatchScore(
 ): number {
   let score = 100;  // 基础分
 
-  // 路径匹配
+  // 阶段一：路径匹配
   if (example.path !== requestPath) {
     const examplePathParts = example.path.split('/').filter(Boolean);
     const requestPathParts = requestPath.split('/').filter(Boolean);
 
-    // 路径分段数不同直接返回 0 分
+    // 路径分段数不同 → 直接 0 分
     if (examplePathParts.length !== requestPathParts.length) {
       return 0;
     }
@@ -153,13 +150,13 @@ private calculateMatchScore(
       const examplePart = examplePathParts[i];
       const requestPart = requestPathParts[i];
 
-      // 变量匹配规则：完全相等 或 以<<开头 或 包含<<
+      // 匹配条件：完全相等 或 以<<开头 或 包含<<
       if (
         examplePart === requestPart ||
         examplePart.startsWith('<<') ||
         examplePart.includes('<<')
       ) {
-        continue; // 匹配
+        continue;
       } else {
         pathMatches = false;
         break;
@@ -167,37 +164,67 @@ private calculateMatchScore(
     }
 
     if (!pathMatches) {
-      return 0; // 路径不匹配返回 0 分
+      return 0; // 路径不匹配 → 0 分
     }
 
-    // 路径含变量，扣 5 分
+    // 路径含变量 → 扣 5 分（95 分）
     score -= 5;
   }
 
-  // 查询参数匹配：按匹配比例折算分数
-  // 例如：2 个参数匹配了 1 个 → 分数 × 50%
-  const totalParams = paramMatches + partialMatches + missingParams;
-  if (totalParams > 0) {
-    const matchPercentage = (paramMatches / totalParams) * 100;
-    score = score * (matchPercentage / 100);
+  // 阶段二：查询参数匹配
+  const exampleParams = example.queryParams || {};
+  const exampleParamKeys = Object.keys(exampleParams);
+  const requestParamKeys = Object.keys(requestQueryParams);
+
+  if (exampleParamKeys.length > 0 || requestParamKeys.length > 0) {
+    let paramMatches = 0;     // 完全匹配的参数
+    let partialMatches = 0;   // 存在但值不同
+    let missingParams = 0;    // 缺失的参数
+
+    exampleParamKeys.forEach((key) => {
+      if (requestQueryParams[key] !== undefined) {
+        if (requestQueryParams[key] === exampleParams[key]) {
+          paramMatches++;
+        } else {
+          partialMatches++;
+        }
+      } else {
+        missingParams++;
+      }
+    });
+
+    // 请求中额外的参数也算缺失
+    requestParamKeys.forEach((key) => {
+      if (exampleParams[key] === undefined) {
+        missingParams++;
+      }
+    });
+
+    // 按匹配比例折算分数
+    const totalParams = paramMatches + partialMatches + missingParams;
+    if (totalParams > 0) {
+      const matchPercentage = (paramMatches / totalParams) * 100;
+      score = score * (matchPercentage / 100);
+    }
   }
 
   return score;
 }
 ```
 
-**预过滤优化**：在 `couldPathMatch` 方法（mock-server.service.ts:929-948）中先做初步过滤，减少需要评分的示例数量：
+**预过滤优化**（`couldPathMatch` 方法，mock-server.service.ts:929-948）：
+在进入完整评分前先做快速检查，减少计算量：
 - 路径完全相同 → 匹配
 - 路径分段数不同 → 不匹配
 - 路径含 `<<` → 可能匹配，进入完整评分
 - 其他情况 → 不匹配
 
-### 3.3 Mock 响应的安全处理
+### 3.3 Mock 响应安全防护
 
-在 `mock-server.controller.ts:19-183`，系统做了严格的安全防护：
+在 `mock-server.controller.ts:19-183` 实现了多层安全防护：
 
 ```typescript
-// 安全头黑名单 —— 不允许 Mock 响应覆盖这些安全相关头
+// 安全头黑名单 —— 禁止 Mock 响应覆盖
 const SECURITY_HEADER_BLOCKLIST = new Set([
   'content-security-policy',
   'x-content-type-options',
@@ -206,249 +233,225 @@ const SECURITY_HEADER_BLOCKLIST = new Set([
   'set-cookie',
 ]);
 
-// 同域访问时（路径模式），自动降级危险的 MIME 类型为 text/plain
-// 防止 XSS 攻击
+// 同域访问时（路径模式），危险 MIME 类型自动降级为 text/plain
 const ACTIVE_CONTENT_TYPES = new Set([
   'application/javascript',
   'text/html',
   'image/svg+xml',
-  // ...
+  'application/xhtml+xml',
 ]);
 ```
 
 ---
 
-## 四、文档站点的拼装方式：从 Collection 到可浏览文档
+## 四、已发布文档的拼装链路
 
 ### 4.1 两种发布模式
 
-Published Docs 支持两种模式，由 `autoSync` 字段控制：
-
 | 模式 | autoSync | 数据存储 | 适用场景 |
 |------|----------|----------|----------|
-| 实时同步（Live 版本） | `true` | 不保存快照，访问时动态从 Collection 拉取 | 文档需要与 API 开发保持同步 |
-| 版本快照（Frozen 版本） | `false` | 发布时将 Collection 数据快照存入 `documentTree` | 冻结特定版本的文档 |
-
-**特别说明**：Live 版本（`autoSync=true`）是一个特殊的版本，通常使用 `CURRENT` 作为版本标识。
+| Live 版本 | `true` | `documentTree` 留空，访问时动态导出 Collection | 文档需与 API 开发实时同步 |
+| Frozen 版本 | `false` | 发布时将 Collection 快照存入 `documentTree` | 冻结特定版本的文档 |
 
 ### 4.2 文档发布流程
 
 前端组件：`packages/hoppscotch-common/src/components/collections/documentation/index.vue`
 
 ```
-用户点击"发布文档"按钮
+用户点击"发布文档"
     │
     ▼
 1. 打开 PublishDocModal 弹窗
+    ├─ 填写标题、版本号
+    ├─ 选择是否自动同步（autoSync）
+    └─ 选择关联环境（可选）
     │
     ▼
-2. 用户填写：
-    ├─ 标题（title）
-    ├─ 版本号（version）
-    ├─ 是否自动同步（autoSync）
-    └─ 关联环境（可选）
+2. 调用 createPublishedDoc mutation
     │
     ▼
-3. 调用 createPublishedDoc mutation
-    │
-    ▼
-4. 后端处理（published-docs.service.ts:529-641）：
-    ├─ 验证用户对 Collection 的访问权限
-    ├─ 生成或复用 slug（同一 Collection 的不同版本共享 slug）
-    │   └─ 规则：查询该 collectionID 最早创建的 publishedDoc，复用其 slug
-    ├─ autoSync=false 时：导出 Collection 快照到 documentTree
-    ├─ autoSync=true 时：documentTree 留空，访问时动态拉取
+3. 后端处理（published-docs.service.ts:529-641）：
+    ├─ 验证 Collection 访问权限
+    ├─ getOrGenerateSlug()：同一 Collection 的版本共享 slug
+    │  └─ 查询该 collectionID 最早的 publishedDoc，复用其 slug
+    ├─ autoSync=false：
+    │  └─ 调用 exportCollectionToJSONObject() 导出快照
+    ├─ autoSync=true：
+    │  └─ documentTree 留空
     └─ 保存到 PublishedDocs 表
     │
     ▼
-5. 返回访问 URL：`/view/{slug}/{version}`
+4. 返回 URL：/view/{slug}/{version}
 ```
 
-### 4.3 文档访问路径与版本优先规则
+### 4.3 后端接口与前端路径的衔接
 
-**后端控制器**：`packages/hoppscotch-backend/src/published-docs/published-docs.controller.ts`
+**后端 REST 接口**（`published-docs.controller.ts`）：
 
-支持两种访问方式：
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/published-docs/:slug` | 无版本路径，自动选择默认版本 |
+| GET | `/api/v1/published-docs/:slug/:version` | 指定版本路径 |
 
-| 路径 | 说明 |
-|------|------|
-| `GET /api/v1/published-docs/{slug}` | 无版本路径，自动选择默认版本 |
-| `GET /api/v1/published-docs/{slug}/{version}` | 指定版本路径 |
+**前端路由**（`pages/view/_id/_version.vue`）：
 
-**前端路由**：`packages/hoppscotch-common/src/pages/view/_id/_version.vue`
+| 前端路径 | 对应后端调用 |
+|----------|-------------|
+| `/view/{slug}` | `GET /api/v1/published-docs/{slug}`（无版本） |
+| `/view/{slug}/{version}` | `GET /api/v1/published-docs/{slug}/{version}`（指定版本） |
 
-| 前端路径 | 说明 |
-|----------|------|
-| `/view/{slug}` | 无版本路径，由后端选择默认版本 |
-| `/view/{slug}/{version}` | 显示指定版本 |
+**版本选择规则**（`published-docs.service.ts:295-303`）：
 
-**版本优先规则（核心修正）**：
+当无版本访问时（`version=null`），后端按以下规则排序并选择第一个：
 
-在 `published-docs.service.ts:295-303` 中，版本排序规则为：
 ```typescript
 orderBy: [{ autoSync: 'desc' }, { createdOn: 'desc' }]
 ```
 
-这意味着：
-1. **第一优先级**：`autoSync=true` 的 Live 版本排在最前面
-2. **第二优先级**：按创建时间降序（最新创建的排在前面）
+优先级：
+1. **第一优先级**：`autoSync=true` 的 Live 版本
+2. **第二优先级**：创建时间降序（最新创建的在前）
 
-当无版本访问时（`version=null`），后端自动选择排序后的第一个版本：
-```typescript
-version: version ? version : allVersions.right[0].version
-```
+**结论**：无版本路径时，**优先返回 Live 版本**；无 Live 版本时返回最新创建的版本。
 
-**结论**：无版本路径时，**优先返回 Live 版本**；如果没有 Live 版本，才返回最新创建的版本。
-
-### 4.4 文档访问时的数据流
-
-访问已发布文档时的完整流程（`published-docs.service.ts:330-413`）：
+### 4.4 文档访问数据流
 
 ```
-GET /view/{slug} 或 /view/{slug}/{version}
+用户访问 /view/{slug} 或 /view/{slug}/{version}
     │
     ▼
-1. 前端路由到文档页面（view/_id/_version.vue）
+1. 前端路由到 view/_id/_version.vue
     │
     ▼
-2. 调用 API：GET /api/v1/published-docs/{slug}/{version?}
+2. 调用 getPublishedDocBySlugREST(slug, version)
     │
     ▼
-3. 后端 getPublishedDocBySlugPublic 方法：
-    ├─ 根据 slug 查询该 slug 下的所有版本（按 autoSync desc, createdOn desc 排序）
-    ├─ 如果 version=null，使用排序后的第一个版本（Live 优先）
+3. 后端 getPublishedDocBySlugPublic()：
+    ├─ 查询该 slug 下的所有版本（按 autoSync desc, createdOn desc 排序）
+    ├─ version=null 时使用排序后的第一个版本
     ├─ 根据 slug + version 查找 PublishedDocs 记录
     │
-    ├─ 如果 autoSync = true：
-    │   └─ 实时从 Collection 导出最新数据（通过 collectionService）
-    │       └─ 同时重新拉取关联环境的最新变量
+    ├─ autoSync = true 时：
+    │  └─ 实时调用 exportCollectionToJSONObject()
+    │     └─ 重新拉取关联环境变量
     │
-    ├─ 如果 autoSync = false：
-    │   └─ 直接返回 documentTree 中保存的快照
+    ├─ autoSync = false 时：
+    │  └─ 直接返回 documentTree 快照
     │
-    └─ 附带环境变量信息（如果关联了环境）
+    └─ 返回 JSON 响应（含 documentTree 字符串）
     │
     ▼
-4. 前端渲染文档页面：
-    ├─ 解析 documentTree 为 HoppCollection 结构
-    ├─ 左侧导航：Collection 的文件夹/请求树（flattenCollection 递归展开）
-    ├─ 右侧内容：请求详情、参数说明、响应示例
-    └─ "在 Hoppscotch 中打开" 按钮
+4. 前端处理：
+    ├─ JSON.parse(documentTree) → CollectionFolder
+    ├─ collectionFolderToHoppCollection() → HoppCollection
+    └─ flattenCollection() 递归展开为左侧导航树
+    │
+    ▼
+5. 渲染页面：
+    ├─ DocumentationHeader：标题、版本选择器
+    ├─ CollectionStructure：左侧导航
+    └─ RequestPreview：右侧请求详情（含 responses 展示）
 ```
 
 ---
 
-## 五、Mock 与 Published Docs 的数据来源边界
+## 五、两者的数据读取边界对比
 
-### 5.1 数据来源对比
+### 5.1 完整读取链路对比
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    TeamRequest 数据库记录                        │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │ id: "req_123"                                             │  │
+│  │ collectionID: "coll_456"                                  │  │
+│  │ title: "Get User"                                         │  │
+│  │                                                           │  │
+│  │ request: {                   ◄────────── Published Docs  │  │
+│  │   v: "17",                                            读  │  │
+│  │   name: "Get User",                                     取  │  │
+│  │   method: "GET",                                         │  │
+│  │   endpoint: "/api/users/<<id>>",                         │  │
+│  │   responses: {                  ◄─────────── 文档显示    │  │
+│  │     "200 OK": { ... }             响应示例              │  │
+│  │   }                                                      │  │
+│  │ }                                                         │  │
+│  │                                                           │  │
+│  │ mockExamples: {                ◄────────── Mock Server   │  │
+│  │   examples: [                                          读 │  │
+│  │     {                     ◄─────────── Mock 服务         │  │
+│  │       name: "200 OK",                  使用              │  │
+│  │       method: "GET",                                      │  │
+│  │       path: "/api/users/1",                               │  │
+│  │       statusCode: 200,                                    │  │
+│  │       responseBody: "{\"id\":1}"                         │  │
+│  │     }                                                     │  │
+│  │   ]                                                       │  │
+│  │ }                                                         │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 边界总结表
 
 | 维度 | Mock Server | Published Docs |
 |------|-------------|----------------|
-| **直接数据源** | `UserRequest.mockExamples`<br>`TeamRequest.mockExamples` | autoSync=true: Collection 导出<br>autoSync=false: `documentTree` 快照 |
-| **读取方式** | 直接查询 Request 表，过滤 `mockExamples not null` | autoSync=true: 调用 collectionService.exportXXX<br>autoSync=false: 读取 PublishedDocs 表 |
-| **数据范围** | 只读取响应示例（mockExamples） | 读取整个 Collection 结构（文件夹、请求、认证、变量等） |
-| **时效性** | 总是最新 | autoSync=true: 总是最新<br>autoSync=false: 发布时的快照 |
+| **数据源字段** | `mockExamples` | `request.responses` |
+| **查询方法** | `fetchRequestsWithExamples()` 直接查 Request 表 | `exportCollectionToJSONObject()` 通过 Collection Service 导出 |
+| **数据过滤** | `WHERE mockExamples IS NOT NULL` | 无过滤，导出所有请求 |
+| **数据格式** | 自定义格式（`{ examples: [...] }`） | HoppRESTRequest 标准格式 |
+| **时效性** | 总是最新 | Live 版本总是最新，Frozen 版本是发布快照 |
+| **是否为空** | 可为空（无 Mock 示例时不返回） | 必有（至少包含请求定义） |
 
-### 5.2 数据流转路径
+### 5.3 共同依赖与差异
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Collection 数据库表                       │
-│  ┌────────────────┐    ┌─────────────────────────────────┐  │
-│  │ TeamCollection │    │ TeamRequest                     │  │
-│  │  - id           │    │  - id                           │  │
-│  │  - title        │    │  - collectionID                 │  │
-│  │  - ...          │    │  - request (JSON: 方法/路径等)  │  │
-│  └────────┬───────┘    │  - mockExamples (JSON)         │  │
-│           │            └───────────────┬─────────────────┘  │
-│           │                            │                    │
-└───────────┼────────────────────────────┼────────────────────┘
-            │                            │
-            │                            │
-            ▼                            ▼
-┌──────────────────────────┐   ┌───────────────────────────┐
-│    Mock Server           │   │   Published Docs          │
-│                          │   │                           │
-│  ┌─ fetchRequestsWith    │   │  autoSync=true:           │
-│  │  Examples()           │   │    ┌─ exportCollectionTo  │
-│  │  只查询 mockExamples  │   │    │  JSONObject()        │
-│  │  不为空的记录         │   │    └─ 导出完整 Collection │
-│  │                        │   │                           │
-│  └─ calculateMatchScore()│   │  autoSync=false:          │
-│     匹配并返回响应       │   │    └─ 读取 documentTree    │
-└──────────────────────────┘   └───────────────────────────┘
-```
-
-**关键边界说明**：
-- 虽然两者最终都依赖同一个 Collection，但它们从数据库读取的表和字段不同
-- Mock Server 直接访问 Request 表的 `mockExamples` 字段
-- Published Docs 通过 Collection Service 导出整个 Collection 结构
-- 两者没有直接的代码调用关系，完全通过数据库中的 Collection 数据解耦
-
-### 5.3 共同依赖
-
-| 依赖项 | Mock Server | Published Docs | 说明 |
-|--------|-------------|----------------|------|
-| Collection ID | ✅ | ✅ | 都通过 collectionID 关联 |
-| 请求定义（方法、路径） | ✅ | ✅ | 都需要知道 API 的基本信息 |
-| 响应示例（mockExamples） | ✅ | ✅ | 核心共享数据，用于生成 Mock 响应和文档示例 |
-| 工作空间权限 | ✅ | ✅ | 都遵循 USER/TEAM 权限模型 |
-| 环境变量 | ❌ | ✅ | 文档可关联环境变量，Mock 直接用示例数据 |
+| 依赖项 | Mock Server | Published Docs |
+|--------|-------------|----------------|
+| Collection ID 关联 | ✅ | ✅ |
+| 请求方法/路径信息 | ✅ | ✅ |
+| 响应示例数据 | ✅（mockExamples） | ✅（request.responses） |
+| 工作空间权限检查 | ✅ | ✅ |
+| 环境变量支持 | ❌ | ✅ |
+| 版本管理 | ❌（始终最新） | ✅（多版本、Live/Frozen） |
 
 ---
 
-## 六、两者的核心差异
+## 六、核心差异总结
 
 | 维度 | Mock Server | Published Docs |
 |------|-------------|----------------|
-| 用途 | 运行时 API 模拟，返回 HTTP 响应 | 静态文档展示，供开发者阅读 |
-| 访问方式 | HTTP 请求到 `/mock/{subdomain}/path` | 浏览器访问 `/view/{slug}/{version}` |
-| 数据时效性 | 总是使用 Collection 最新数据 | 可选择实时同步（Live）或版本快照（Frozen） |
-| 安全要求 | 严格的 XSS 防护、头信息过滤、MIME 类型降级 | 主要是访问控制 |
-| 性能要求 | 低延迟、高并发 | 静态内容、可缓存 |
-| 版本概念 | 无版本概念，始终最新 | 多版本管理，支持 Live 和 Frozen 版本 |
+| **用途** | 运行时 API 模拟，返回 HTTP 响应 | 静态文档展示，供开发者阅读 |
+| **访问方式** | `GET /mock/{subdomain}/{path}` | 浏览器访问 `/view/{slug}/{version}` |
+| **数据字段** | 独立的 `mockExamples` 字段 | `request` 字段中的 `responses` |
+| **版本概念** | 无版本，始终最新 | 多版本管理，支持 Live/Frozen |
+| **安全要求** | XSS 防护、头过滤、MIME 降级 | 主要是访问控制 |
+| **性能要求** | 低延迟、高并发 | 静态内容、可缓存 |
+| **匹配逻辑** | 复杂的评分算法 | 按 ID 直接展示 |
 
 ---
 
-## 七、典型使用场景
-
-一个完整的 API 开发工作流：
-
-1. **开发阶段**：在 Collection 中定义 API 请求和响应示例
-2. **前端对接**：为 Collection 创建 Mock Server，前端直接调用 Mock API
-   - Mock Server 自动使用最新的响应示例
-3. **文档交付**：为 Collection 发布文档，分享给团队成员
-   - 选择 `autoSync=true`（Live 版本）：文档自动反映 API 变更
-   - 选择 `autoSync=false`（快照版本）：冻结特定版本的文档
-4. **版本迭代**：
-   - Mock Server 始终使用最新的响应示例
-   - Live 版本文档自动更新
-   - 快照版本保持不变，可通过 `/view/{slug}/v1.0` 永久访问
-
----
-
-## 八、代码溯源
+## 七、代码溯源
 
 | 功能 | 文件位置 | 关键方法/组件 |
 |------|----------|--------------|
-| Mock 服务核心逻辑 | `packages/hoppscotch-backend/src/mock-server/mock-server.service.ts` | `handleMockRequest`, `calculateMatchScore`, `couldPathMatch` |
+| Mock 服务核心 | `packages/hoppscotch-backend/src/mock-server/mock-server.service.ts` | `handleMockRequest`, `calculateMatchScore`, `couldPathMatch` |
 | Mock 控制器 | `packages/hoppscotch-backend/src/mock-server/mock-server.controller.ts` | `handleMockRequest` |
-| 文档发布服务 | `packages/hoppscotch-backend/src/published-docs/published-docs.service.ts` | `createPublishedDoc`, `getPublishedDocBySlugPublic`, `getPublishedDocsVersions` |
+| 文档发布服务 | `packages/hoppscotch-backend/src/published-docs/published-docs.service.ts` | `createPublishedDoc`, `getPublishedDocBySlugPublic`, `getOrGenerateSlug` |
 | 文档控制器 | `packages/hoppscotch-backend/src/published-docs/published-docs.controller.ts` | `getPublishedDocsBySlugLatest`, `getPublishedDocsBySlug` |
-| 文档发布前端 | `packages/hoppscotch-common/src/components/collections/documentation/index.vue` | `handlePublish`, `handleUpdate` |
-| 文档浏览页面 | `packages/hoppscotch-common/src/pages/view/_id/_version.vue` | `fetchDocs`, `flattenCollection` |
-| 文档服务（前端） | `packages/hoppscotch-common/src/services/documentation.service.ts` | `DocumentationService`, `CURRENT_VERSION_TAG`, `isLiveVersion` |
-| 数据模型 | `packages/hoppscotch-backend/prisma/schema.prisma` | `MockServer`, `PublishedDocs`, `TeamRequest`, `UserRequest` |
+| Collection 导出 | `packages/hoppscotch-backend/src/team-collection/team-collection.service.ts` | `exportCollectionToJSONObject` |
+| 文档发布前端 | `packages/hoppscotch-common/src/components/collections/documentation/index.vue` | `handlePublish` |
+| 文档浏览页面 | `packages/hoppscotch-common/src/src/pages/view/_id/_version.vue` | `fetchDocs`, `flattenCollection` |
+| 请求预览组件 | `packages/hoppscotch-common/src/components/collections/documentation/RequestPreview.vue` | `getResponseExamples` |
+| 前端 API 调用 | `packages/hoppscotch-common/src/helpers/backend/queries/PublishedDocs.ts` | `getPublishedDocBySlugREST` |
+| 数据模型 | `packages/hoppscotch-backend/prisma/schema.prisma` | `TeamRequest`, `UserRequest`, `MockServer`, `PublishedDocs` |
 
 ---
 
-## 九、设计亮点
+## 八、设计要点
 
-1. **单一数据源**：API 定义只写一次，Mock 和文档自动复用，避免不一致
-2. **灵活的版本控制**：文档支持 Live（实时同步）和 Frozen（版本快照）两种模式，满足不同场景
+1. **字段分流设计**：Mock 和文档分别使用独立字段，互不干扰，但最终都关联同一个 Collection
+2. **灵活版本控制**：文档支持 Live（实时同步）和 Frozen（版本快照）两种模式
 3. **智能版本路由**：无版本路径时优先返回 Live 版本，符合直觉
-4. **安全优先**：Mock 服务有多层安全防护（头黑名单、MIME 降级、CSP），防止恶意利用
-5. **性能优化**：Mock 服务通过 `couldPathMatch` 预过滤和数据库级 `mockExamples not null` 过滤减少计算量
-6. **智能匹配算法**：Mock 服务的路径匹配支持 `<<变量>>` 语法和评分机制，接近真实 API 行为
-7. **权限复用**：两者都复用现有的工作空间权限模型，无需单独设计权限系统
-8. **解耦设计**：Mock 和 Published Docs 没有直接代码依赖，通过数据库中的 Collection 数据解耦
+4. **安全分层防护**：Mock 服务有多层安全防护（头黑名单、MIME 降级）
+5. **性能优化**：Mock 服务通过 `couldPathMatch` 预过滤和数据库级 `IS NOT NULL` 过滤减少计算量
+6. **解耦架构**：Mock 和 Published Docs 没有直接代码依赖，通过数据库中的 Collection 数据解耦
