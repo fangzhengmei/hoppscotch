@@ -576,33 +576,81 @@ captureInitialEnvironmentState  captureInitialEnvironmentState
 仅更新 A 中变化的变量          仅更新 B 中变化的变量
 ```
 
-#### 9.2.3 更新时的冲突检测
+#### 9.2.3 实际入参与更新路径
 
-**updateEnvsAfterTestScript** (`RequestRunner.ts:748-837`)：
+**真实函数签名** (`RequestRunner.ts:698-743`)：
 
 ```typescript
-const updateEnvsAfterTestScript = (
-  finalEnvs: TestResult["envs"],
-  initialEnvs: TestResult["envs"],
-  envIndex: SelectedEnvironmentIndex,
-  initialEnvID: { selected: string; global: string },
-  updateGlobal: boolean,
-  updateSelected: boolean
-) => {
-  // 🔴 只有与初始快照不同的变量才会被更新
-  const globalVarsToUpdate = finalEnvs.global.filter(
-    (env) => !A.elem(isEqual(env))(initialEnvs.global)
+function updateEnvsAfterTestScript(
+  runResult: E.Right<SandboxTestResult>,      // 🔴 实际第1参：脚本运行结果（含 envs）
+  initialEnvironmentIndex: SelectedEnvironmentIndex,  // 🔴 第2参：选中环境索引快照
+  initialEnvName: string,                     // 🔴 第3参：环境名称（用于团队环境）
+  initialEnvID?: string                       // 🔴 第4参：环境ID
+) {
+  // 1. 更新全局环境
+  const globalEnvVariables = updateEnvironments(
+    runResult.right.envs.global,  // 从运行结果中提取 envs.global
+    "global"
+  )
+  setGlobalEnvVariables({
+    v: 2,
+    variables: globalEnvVariables,
+  })
+
+  // 2. 更新选中环境
+  const selectedEnvVariables = updateEnvironments(
+    cloneDeep(runResult.right.envs.selected),  // 深拷贝避免引用问题
+    "selected",
+    initialEnvID
   )
 
-  const selectedVarsToUpdate = finalEnvs.selected.filter(
-    (env) => !A.elem(isEqual(env))(initialEnvs.selected)
-  )
-
-  // 执行增量更新
-  globalVarsToUpdate.forEach((env) => updateEnvironments(...))
-  selectedVarsToUpdate.forEach((env) => updateEnvironments(...))
+  // 3. 根据环境类型分发更新
+  if (initialEnvironmentIndex.type === "MY_ENV") {
+    updateEnvironment(initialEnvironmentIndex.index, {
+      name: env.name,
+      v: 2,
+      id: "id" in env ? env.id : "",
+      variables: selectedEnvVariables,
+    })
+  } else if (initialEnvironmentIndex.type === "TEAM_ENV") {
+    const envName = initialEnvName ?? getCurrentEnvironment().name
+    updateTeamEnvironment(
+      JSON.stringify(selectedEnvVariables),
+      initialEnvironmentIndex.teamEnvID,
+      envName
+    )()
+  }
 }
 ```
+
+**调用位置 1 - 单请求执行** (`RequestRunner.ts:636-641`)：
+```typescript
+if (hasEnvironmentChanges(initialEnvsForComparison, postRequestScriptResult.right.envs)) {
+  updateEnvsAfterTestScript(
+    combinedResult,           // 脚本运行结果（含 envs）
+    initialEnvironmentIndex,  // 请求开始时捕获的索引
+    initialEnvName,           // 请求开始时的环境名
+    initialEnvID              // 请求开始时的环境ID
+  )
+}
+```
+
+**调用位置 2 - 测试运行器** (`RequestRunner.ts:939-944`)：
+```typescript
+if (hasEnvironmentChanges(initialEnvsForComparison, postRequestScriptResult.right.envs)) {
+  updateEnvsAfterTestScript(
+    postRequestScriptResult,  // 脚本运行结果
+    initialEnvironmentIndex,
+    initialEnvName,
+    initialEnvID
+  )
+}
+```
+
+**关键证据**：
+- 函数内部直接从 `runResult.right.envs` 提取环境变量，而非单独传入
+- 更新路径：全局环境走 `setGlobalEnvVariables`，个人环境走 `updateEnvironment`，团队环境走 `updateTeamEnvironment`
+- `initialEnvID` 只用于选中环境，用于 `updateEnvironments` 中定位 secret/current value 服务的存储键
 
 #### 9.2.4 边界情况
 
@@ -726,9 +774,86 @@ export const getResolvedVariables = (
 }
 ```
 
-**关键差异**：CLI 中使用 `filter` 直接移除低优先级同名变量，而前端使用 `filterNonEmptyEnvironmentVariables` 的回退逻辑。
+#### 9.3.4 CLI getResolvedVariables 与前端 filterNonEmptyEnvironmentVariables 差异
 
-**关键代码位置**：`inheritedCollectionVarTransformer.ts:38-64`, `getters.ts:276-335`
+**CLI 逻辑** (`getters.ts:276-335`)：
+```typescript
+export const getResolvedVariables = (
+  requestVariables: HoppRESTRequestVariables,
+  environmentVariables: EnvironmentVariable[],
+  collectionVariables: HoppCollectionVariable[] = []
+): EnvironmentVariable[] => {
+  // 🔴 只保留 active=true 且 value 非空的请求变量
+  const activeRequestVariables = requestVariables
+    .filter(({ active, value }) => active && value)
+    .map(...)
+
+  const requestVariableKeys = activeRequestVariables.map(({ key }) => key)
+
+  // 🔴 直接过滤掉与请求变量同名的集合变量（不管值是否为空）
+  const filteredCollectionVariables = collectionVariables.filter(
+    ({ key }) => !requestVariableKeys.includes(key)
+  )
+
+  const collectionVariableKeys = filteredCollectionVariables.map(({ key }) => key)
+
+  // 🔴 直接过滤掉与请求/集合变量同名的环境变量（不管值是否为空）
+  const filteredEnvironmentVariables = environmentVariables.filter(
+    ({ key }) => ![...requestVariableKeys, ...collectionVariableKeys].includes(key)
+  )
+
+  return [
+    ...activeRequestVariables,
+    ...processedCollectionVariables,
+    ...processedEnvironmentVariables,
+  ]
+}
+```
+
+**前端逻辑** (`RequestRunner.ts:337-361`)：
+```typescript
+export const filterNonEmptyEnvironmentVariables = (
+  envs: Environment["variables"]
+): Environment["variables"] => {
+  const envsMap = new Map<string, Environment["variables"][number]>()
+  envs.forEach((env) => {
+    const transformedEnv = getTransformedEnvs(env)  // currentValue || initialValue
+
+    if (envsMap.has(transformedEnv.key)) {
+      const existingEnv = envsMap.get(transformedEnv.key)
+      // 🔴 只有当高优先级变量 currentValue 为空，且低优先级非空时，才覆盖
+      if (
+        existingEnv &&
+        "currentValue" in existingEnv &&
+        existingEnv.currentValue === "" &&
+        transformedEnv.currentValue !== ""
+      ) {
+        envsMap.set(transformedEnv.key, transformedEnv)
+      }
+    } else {
+      envsMap.set(transformedEnv.key, transformedEnv)
+    }
+  })
+  return Array.from(envsMap.values())
+}
+```
+
+**同键空值回退差异对比表**：
+
+| 场景 | 前端 (filterNonEmpty) | CLI (getResolvedVariables) |
+|------|-----------------------|----------------------------|
+| 请求变量 key=""，环境变量 key="val" | ✅ 回退到环境变量 | ❌ 请求变量 active=true 但 value="" 会被过滤，环境变量保留 |
+| 请求变量 key=" "（空格），环境变量 key="val" | ❌ 使用空格（`||` 视为 truthy） | ❌ 请求变量 active=true 且 value=" " 保留，环境变量被过滤 |
+| 请求变量 key="val1"，环境变量 key="val2" | ❌ 使用 "val1"（高优先级） | ❌ 使用 "val1"（高优先级，环境变量被过滤） |
+| 集合变量 key=""，环境变量 key="val" | ✅ 回退到环境变量 | ✅ 集合变量保留 key=""，环境变量被过滤（行为不同！） |
+| 选中环境 key=""，全局 key="val" | ✅ 回退到全局 | ✅ 选中环境 key="" 保留，全局被过滤（行为不同！） |
+
+**关键差异本质**：
+1. **CLI 是"存在即覆盖"**：只要高优先级作用域中存在该 key（无论值是否为空），低优先级同 key 变量直接被过滤
+2. **前端是"空值回退"**：高优先级变量为空（`currentValue === ""` 且 `initialValue` 也为空）时，才会尝试用低优先级非空值覆盖
+3. **请求变量过滤**：CLI 在第一步就过滤掉 `active=false` 或 `value` 为空的请求变量，前端则保留所有请求变量交由后续回退逻辑处理
+
+**关键代码位置**：`inheritedCollectionVarTransformer.ts:38-64`, `getters.ts:276-335`, `RequestRunner.ts:322-361`
 
 ---
 
@@ -738,72 +863,111 @@ export const getResolvedVariables = (
 
 **答案**：**不一致，存在多处细微差异**
 
-#### 9.4.1 解析行为对比表
+#### 9.4.1 前端请求构造阶段解析函数调用表
 
-| 特性 | URL | Headers | Params | Body |
-|------|-----|---------|--------|------|
-| 解析函数 | `parseTemplateStringE` | `parseTemplateString` | `parseTemplateString` | 因类型而异 |
-| 支持 `showKeyIfNotFound` | ✅ 支持 | ❌ 不支持 | ❌ 不支持 | ❌ 不支持 |
-| 未找到变量时 | 返回 `<<key>>` 或空 | 返回空字符串 | 返回空字符串 | 因类型而异 |
-| 递归解析 | ✅ 支持 | ✅ 支持 | ✅ 支持 | ✅ 支持（JSON/form） |
-| 掩码支持 | ✅ 支持 | ✅ 支持 | ✅ 支持 | ❌ 不支持 |
-| 循环检测 | ✅ 有 | ✅ 有 | ✅ 有 | ✅ 有 |
-| 循环时行为 | 返回 `Left` 错误 | 静默保留原样 | 静默保留原样 | 返回 `Left` 或静默 |
+**getEffectiveRESTRequest** (`packages/hoppscotch-common/src/helpers/utils/EffectiveURL.ts:362-446`)：
 
-#### 9.4.2 URL 解析特殊处理
+| 字段 | 解析函数 | maskValue | showKeyIfSecret | showKeyIfNotFound | 错误回退 |
+|------|----------|-----------|-----------------|-------------------|----------|
+| URL | `parseTemplateString` | `false` | 函数入参 `showKeyIfSecret` | 函数入参 `showKeyIfNotFound` | `E.getOrElse(() => str)` 返回原始值 |
+| Header Key | `parseTemplateString` | `false` | 函数入参 `showKeyIfSecret` | `undefined`（默认 false） | 返回原始值 |
+| Header Value | `parseTemplateString` | `false` | 函数入参 `showKeyIfSecret` | `undefined`（默认 false） | 返回原始值 |
+| Param Key | `parseTemplateString` | `false` | 函数入参 `showKeyIfSecret` | `undefined`（默认 false） | 返回原始值 |
+| Param Value | `parseTemplateString` | `false` | 函数入参 `showKeyIfSecret` | `undefined`（默认 false） | 返回原始值 |
+| Body | `getFinalBodyFromRequest` 内部调度 | - | 函数入参 `showKeyIfSecret` | - | 因类型而异 |
 
-**getEffectiveRESTRequest** (`packages/hoppscotch-common/src/helpers/utils/EffectiveURL.ts:432-445`)：
-
+**代码证据**：
 ```typescript
-const effectiveFinalURL = parseTemplateString(
+// URL 解析（EffectiveURL.ts:434-440）
+effectiveFinalURL: parseTemplateString(
   request.endpoint,
   environment.variables,
-  false,              // maskValue = false
-  showKeyIfSecret,    // 可配置
-  showKeyIfNotFound   // 🔴 独有参数：未找到时保留 <<key>>
+  false,
+  showKeyIfSecret,
+  showKeyIfNotFound   // 🔴 唯一传入 showKeyIfNotFound 的位置
 )
+
+// Header 解析（EffectiveURL.ts:376-387）
+key: parseTemplateString(x.key, environment.variables, false, showKeyIfSecret),
+value: parseTemplateString(x.value, environment.variables, false, showKeyIfSecret)
+// 🔴 未传 showKeyIfNotFound，使用默认值 false → 未找到时返回空字符串
 ```
 
-**用途**：预览 URL 时，为了让用户看到哪些变量未解析，会保留 `<<key>>` 格式。
+#### 9.4.2 前端 Body 解析调度（getFinalBodyFromRequest）
 
-#### 9.4.3 Body 解析特殊处理
+| Content-Type | 实际调用函数 | 错误回退 |
+|--------------|--------------|----------|
+| `application/json` | `parseBodyEnvVariables` | 解析失败返回原始 body |
+| `application/x-www-form-urlencoded` | 每个 key/value 调 `parseTemplateStringE` | 解析失败的项被过滤，返回剩余项的 query string |
+| `multipart/form-data` | 文本字段调 `parseTemplateString` | 解析失败返回空字符串 |
+| `application/octet-stream` | 不解析 | 直接返回 File/Blob |
+| 其他（text/plain 等） | `parseBodyEnvVariables` | 解析失败返回原始 body |
 
-**getFinalBodyFromRequest** (`EffectiveURL.ts:256-350`) 根据 content-type 有不同行为：
-
-| Content-Type | 解析方式 | 未找到变量 |
-|--------------|----------|------------|
-| `application/json` | `parseBodyEnvVariablesE` | 保留 `<<key>>` |
-| `application/x-www-form-urlencoded` | 解析为 key-value 后逐个 `parseTemplateStringE` | 过滤掉解析失败的 |
-| `multipart/form-data` | 文本字段用 `parseTemplateString`，文件跳过 | 文件内容不解析 |
-| `application/octet-stream` | 完全不解析 | 不解析 |
-| 其他（text/plain 等） | `parseBodyEnvVariablesE` | 保留 `<<key>>` |
-
-**关键差异**：`parseBodyEnvVariablesE` 与 `parseTemplateStringE` 的循环检测行为不同：
-
+**parseBodyEnvVariables 的错误回退** (`environment/index.ts:94-101`)：
 ```typescript
-// parseBodyEnvVariablesE：无 early break，会完整执行到上限
-while (result.match(REGEX_ENV_VAR) != null && depth <= ENV_MAX_EXPAND_LIMIT) {
-  result = result.replace(REGEX_ENV_VAR, ...)
-  depth++  // 🔴 不管有没有变化，depth 都会递增
+export const parseBodyEnvVariables = (body: string, env: Environment["variables"]) =>
+  pipe(
+    parseBodyEnvVariablesE(body, env),
+    E.getOrElse(() => body)  // 🔴 解析失败返回原始 body
+  )
+```
+
+#### 9.4.3 CLI 请求构造阶段解析函数调用表
+
+**CLI getEffectiveRESTRequest** (`packages/hoppscotch-cli/src/utils/pre-request.ts:144-500`)：
+
+| 字段 | 解析函数 | 错误回退 |
+|------|----------|----------|
+| URL | `parseTemplateStringE` | 返回 `Left(PARSING_ERROR)` 导致请求失败 |
+| Header Key/Value | `getEffectiveFinalMetaData` 内调 `parseTemplateStringE` | 返回 `Left(PARSING_ERROR)` 导致请求失败 |
+| Param Key/Value | `getEffectiveFinalMetaData` 内调 `parseTemplateStringE` | 返回 `Left(PARSING_ERROR)` 导致请求失败 |
+| Body JSON | `parseBodyEnvVariablesE` | 返回 `Left(PARSING_ERROR)` 导致请求失败 |
+| Body form-urlencoded | 每个 key/value 调 `parseTemplateStringE` | 过滤掉解析失败的项 |
+| Body multipart | 文本字段调 `parseTemplateString` | 解析失败返回空字符串 |
+
+**代码证据**：
+```typescript
+// CLI URL 解析（pre-request.ts:454-458）
+const _effectiveFinalURL = parseTemplateStringE(endpoint, resolvedVariables);
+if (E.isLeft(_effectiveFinalURL)) {
+  return E.left({
+    code: "PARSING_ERROR",   // 🔴 直接返回错误，请求终止
+    message: "Unable to parse ENV variables in the request URL",
+  });
 }
 
-// parseTemplateStringE：有 early break
-const currentResult = result.replace(...)
-if (currentResult === result) {
-  break  // 🔴 无变化则立即终止
+// CLI Header 解析（pre-request.ts:163-169）
+const _effectiveFinalHeaders = getEffectiveFinalMetaData(request.headers, resolvedVariables);
+if (E.isLeft(_effectiveFinalHeaders)) {
+  return _effectiveFinalHeaders;  // 🔴 直接返回错误
 }
 ```
 
-**影响**：Body 中的循环引用会更快达到递归上限（11 次替换 vs 可能更少的次数）。
+#### 9.4.4 错误回退差异总结
 
-#### 9.4.4 常见坑点
+| 场景 | 前端（parseTemplateString） | CLI（parseTemplateStringE） |
+|------|----------------------------|-----------------------------|
+| 循环引用达到上限 | 静默返回原始字符串 | 返回错误，请求终止 |
+| 变量不存在 | 返回空字符串（或 `<<key>>` 仅 URL） | 返回错误，请求终止 |
+| Body JSON 解析失败 | 返回原始 JSON 字符串 | 返回错误，请求终止 |
 
-1. **URL 中变量未找到**：预览时显示 `<<key>>`，实际发送时为空字符串
-2. **JSON Body 中的循环**：`{ "a": "<<b>>", "b": "<<a>>" }` 会触发 ENV_EXPAND_LOOP 错误
-3. **Form Data 中的文件**：文件内容不会被解析，文件名会被解析
-4. **Header 中的空值**：变量未找到时 header 值为空字符串，该 header 仍会被发送
+**关键证据**：`parseTemplateString` 是 `parseTemplateStringE` 的包装（`environment/index.ts:192-208`）：
+```typescript
+export const parseTemplateString = (str, variables, maskValue, showKeyIfSecret, showKeyIfNotFound) =>
+  pipe(
+    parseTemplateStringE(str, variables, maskValue, showKeyIfSecret, showKeyIfNotFound),
+    E.getOrElse(() => str)  // 🔴 吞掉错误，返回原始字符串
+  )
+```
 
-**关键代码位置**：`EffectiveURL.ts:362-446`, `environment/index.ts:55-89`, `environment/index.ts:103-178`
+#### 9.4.5 常见坑点
+
+1. **URL 预览 vs 实际发送**：前端预览时 `showKeyIfNotFound=true` 显示 `<<key>>`，实际发送时 `showKeyIfNotFound=false` 替换为空字符串
+2. **Header 空值**：变量未找到时 header 值为空字符串，该 header 仍会被发送
+3. **CLI 严格性**：CLI 中任何解析失败都会导致请求终止，前端则静默降级
+4. **Form Data 文件**：文件内容不解析，文件名会被解析
+
+**关键代码位置**：`EffectiveURL.ts:362-446`, `pre-request.ts:144-500`, `environment/index.ts:55-208`
 
 ---
 
@@ -849,9 +1013,10 @@ return depth > ENV_MAX_EXPAND_LIMIT  // 🔴 > 意味着 depth=11 时才触发�
 | 10 层以内解析完成 | ✅ 返回 `Right` | ✅ 返回 `Right` |
 | 11 次替换后仍有占位符 | ❌ 返回 `Left(ENV_EXPAND_LOOP)` | ❌ 返回 `Left(ENV_EXPAND_LOOP)` |
 | 中间某次无替换（如变量未找到） | ✅ 立即 break，返回 `Right` | ❌ 继续循环直到 depth=11 |
-| 循环引用（A→B→A） | ✅ 第 2 次后无变化，break，返回 `Right`（保留原样） | ❌ 执行 11 次后返回 `Left` |
+| 循环引用（A→B→A） | ❌ 执行 11 次后返回 `Left` | ❌ 执行 11 次后返回 `Left` |
+| 自引用（A→A） | ✅ 第 2 次后无变化，break，返回 `Right` | ❌ 执行 11 次后返回 `Left` |
 
-#### 9.5.3 循环引用行为详解
+#### 9.5.3 循环引用真实停止条件详解
 
 **测试用例** (`packages/hoppscotch-js-sandbox/src/__tests__/pw-namespace/env/resolve.spec.ts:119-154`)：
 
@@ -860,7 +1025,7 @@ test("if infinite loop in resolution, abandons resolutions altogether", () => {
   return expect(
     runTest(
       `const data = pw.env.resolve("<<hello>>")
-       pw.expect(data).toBe("<<hello>>")`,  // 🔴 期望保留原始值
+       pw.expect(data).toBe("<<hello>>")`,
       {
         selected: [
           { key: "hello", currentValue: "<<there>>", ... },
@@ -872,27 +1037,118 @@ test("if infinite loop in resolution, abandons resolutions altogether", () => {
 })
 ```
 
-**parseTemplateStringE 执行过程**：
+**parseTemplateStringE 真实执行过程** (`environment/index.ts:103-178`)：
+
 ```
-初始: "<<hello>>"
-depth=0: 替换为 "<<there>>"  → 有变化，depth=1
-depth=1: 替换为 "<<hello>>"  → 有变化，depth=2
-depth=2: 替换为 "<<there>>"  → 有变化，depth=3
-... 会在两个值之间来回替换吗？
+初始值: result = "<<hello>>", depth = 0
 
-🔴 实际上：
-depth=2: currentResult="<<hello>>", result 之前也是 "<<hello>>"
-→ currentResult === result → break 循环
-→ 返回 Right("<<hello>>")
+第 1 轮循环 (depth=0, 条件 0 <= 10: true):
+  currentResult = "<<hello>>".replace(...) → "<<there>>"
+  currentResult !== result → 继续
+  result = "<<there>>"
+  depth = 1
+
+第 2 轮循环 (depth=1, 条件 1 <= 10: true):
+  currentResult = "<<there>>".replace(...) → "<<hello>>"
+  currentResult !== result → 继续
+  result = "<<hello>>"
+  depth = 2
+
+第 3 轮循环 (depth=2, 条件 2 <= 10: true):
+  currentResult = "<<hello>>".replace(...) → "<<there>>"
+  currentResult !== result → 继续
+  result = "<<there>>"
+  depth = 3
+
+第 4 轮循环 (depth=3, 条件 3 <= 10: true):
+  currentResult = "<<there>>".replace(...) → "<<hello>>"
+  currentResult !== result → 继续
+  result = "<<hello>>"
+  depth = 4
+
+... 持续交替 ...
+
+第 11 轮循环 (depth=10, 条件 10 <= 10: true):
+  currentResult = 替换 → 另一个占位符
+  currentResult !== result → 继续
+  result = 另一个占位符
+  depth = 11
+
+循环终止: depth=11, 条件 11 <= 10: false
+
+返回: depth > 10 → E.left(ENV_EXPAND_LOOP)
+
+🔴 然后 parseTemplateString 包装器捕获错误并返回原始字符串 "<<hello>>"
 ```
 
-**为什么 depth=2 就终止了？**
+**关键证据**：`parseTemplateStringE` 中循环条件是 `depth <= ENV_MAX_EXPAND_LIMIT`（`index.ts:118-122`）：
+```typescript
+while (
+  result.match(REGEX_ENV_VAR) != null &&
+  depth <= ENV_MAX_EXPAND_LIMIT &&  // 🔴 <= 意味着 depth=10 时仍会执行
+  !isSecret
+) {
+  // 执行替换
+  // ...
+  if (currentResult === result) break  // 🔴 只有当字符串完全无变化时才 break
+  result = currentResult
+  depth++  // 🔴 depth 在替换后递增
+}
 
-因为 `depth=0` 时 `result="<<hello>>"`，替换后 `currentResult="<<there>>"`，不同，继续。
-`depth=1` 时 `result="<<there>>"`，替换后 `currentResult="<<hello>>"`，不同，继续。
-`depth=2` 时 `result="<<hello>>"`，替换后 `currentResult="<<hello>>"`，**相同**，break。
+return depth > ENV_MAX_EXPAND_LIMIT
+  ? E.left(ENV_EXPAND_LOOP)  // 🔴 depth=11 时返回错误
+  : E.right(result)
+```
 
-**结论**：对于两两循环，最多执行 **2 次替换** 就会被 early break 检测到。
+**为什么不会被 early break 终止？**
+
+对于 `A = <<B>>, B = <<A>>`：
+- 每次替换后字符串都会变化（`<<hello>>` ↔ `<<there>>`）
+- `currentResult === result` 永远为 false
+- 所以不会触发 early break
+- 会一直执行到 `depth = 11` 才退出
+
+**真实行为修正**：
+| 场景 | parseTemplateStringE | parseBodyEnvVariablesE |
+|------|------------------------|--------------------------|
+| `A = <<B>>, B = <<A>>` | 执行 11 次替换 → 返回 `Left(ENV_EXPAND_LOOP)` | 执行 11 次替换 → 返回 `Left(ENV_EXPAND_LOOP)` |
+| `A = <<A>>`（自引用） | 第 2 次替换后无变化 → break → 返回 `Right("<<A>>")` | 执行 11 次替换 → 返回 `Left(ENV_EXPAND_LOOP)` |
+
+**parseBodyEnvVariablesE 的差异** (`environment/index.ts:55-89`)：
+```typescript
+while (result.match(REGEX_ENV_VAR) != null && depth <= ENV_MAX_EXPAND_LIMIT) {
+  result = result.replace(REGEX_ENV_VAR, (key) => {
+    const variableName = key.replace(/[<>]/g, "")
+    const foundEnv = env.find((envVar) => envVar.key === variableName)
+    if (foundEnv && "currentValue" in foundEnv) {
+      return foundEnv.currentValue
+    }
+    return key  // 🔴 未找到时返回原始 <<key>>，而不是空字符串
+  })
+  depth++  // 🔴 无条件递增，没有 early break 检查
+}
+```
+
+**关键差异**：
+1. **变量未找到时**：`parseBodyEnvVariablesE` 返回原始 `<<key>>`，`parseTemplateStringE` 返回空字符串（或保留）
+2. **Early break**：`parseBodyEnvVariablesE` 没有 `currentResult === result` 检查
+3. **自引用处理**：`A = <<A>>` 在 `parseBodyEnvVariablesE` 中会执行 11 次替换后报错，而在 `parseTemplateStringE` 中第 2 次就 break
+
+**测试用例为什么能通过？**
+
+因为测试用例调用的是 `pw.env.resolve()`，它使用 `parseTemplateStringE` + `E.getOrElse(() => valueToUse)`（`shared.ts:298-302`）：
+```typescript
+return pipe(
+  parseTemplateStringE(valueToUse, envVars),
+  E.getOrElse(() => valueToUse)  // 🔴 捕获 ENV_EXPAND_LOOP 错误，返回原始值
+)
+```
+
+**结论修正**：
+- 两两循环引用（A→B→A）**不会被 early break 检测到**，因为每次替换后字符串都在变化
+- 会执行满 11 次替换后返回 `ENV_EXPAND_LOOP` 错误
+- 但在前端 UI 中，由于 `parseTemplateString` 的 `E.getOrElse(() => str)` 包装，用户会看到原始字符串
+- 只有自引用（A→A）或替换后字符串完全相同时才会触发 early break
 
 #### 9.5.4 边界场景测试
 
@@ -900,9 +1156,11 @@ depth=2: currentResult="<<hello>>", result 之前也是 "<<hello>>"
 |------|------|------|
 | `A = <<B>>, B = <<C>>, C = value` | ✅ 解析为 value | 3 次替换，在限制内 |
 | 嵌套 12 层变量引用 | ❌ ENV_EXPAND_LOOP | 超过 11 次限制 |
-| `A = <<A>>`（自引用） | ✅ 保留 `<<A>>` | 第 2 次无变化，break |
-| JSON Body 中 `A = <<B>>, B = <<A>>` | ❌ ENV_EXPAND_LOOP | parseBodyEnvVariablesE 无 early break |
-| URL 中 `A = <<B>>, B = <<A>>` | ✅ 保留 `<<A>>` | parseTemplateStringE 有 early break |
+| `A = <<A>>`（自引用）parseTemplateStringE | ✅ 保留 `<<A>>` | 第 2 次无变化，break |
+| `A = <<A>>`（自引用）parseBodyEnvVariablesE | ❌ ENV_EXPAND_LOOP | 无 early break，执行 11 次 |
+| JSON Body 中 `A = <<B>>, B = <<A>>` | ❌ ENV_EXPAND_LOOP | 每次都有变化，执行 11 次 |
+| URL 中 `A = <<B>>, B = <<A>>` | 前端显示 `<<A>>` | parseTemplateString 返回错误被 getOrElse 捕获 |
+| CLI URL 中 `A = <<B>>, B = <<A>>` | ❌ 请求失败 PARSING_ERROR | CLI 直接返回 Left 错误 |
 
 #### 9.5.5 错误处理差异
 
@@ -917,13 +1175,31 @@ depth=2: currentResult="<<hello>>", result 之前也是 "<<hello>>"
 
 ## 10. 总结：容易踩坑的要点清单
 
-1. **空值回退**：高优先级变量为空时，会先尝试自身 initialValue，再考虑低优先级
-2. **空格非空**：`||` 运算符将空格视为 truthy，不会触发回退
-3. **并发安全**：每个请求都有独立的环境快照，脚本修改不会互相串写
-4. **增量更新**：只有与初始快照不同的变量才会被写回
+### 10.1 updateEnvsAfterTestScript 关键点
+- **真实入参**：第1参是 `E.Right<SandboxTestResult>`（含 envs），不是单独的 finalEnvs
+- **更新路径**：全局走 `setGlobalEnvVariables`，个人环境走 `updateEnvironment`，团队环境走 `updateTeamEnvironment`
+- **深拷贝**：选中环境更新前会 `cloneDeep`，避免引用共享
+
+### 10.2 URL/Header/Params/Body 解析差异
+- **URL 独有**：唯一传入 `showKeyIfNotFound` 的位置，预览时显示 `<<key>>`
+- **前端容错**：`parseTemplateString` 用 `E.getOrElse(() => str)` 吞掉错误，返回原始字符串
+- **CLI 严格**：`parseTemplateStringE` 返回 `Left` 错误，直接终止请求
+- **Body 多策略**：JSON 用 `parseBodyEnvVariablesE`，form 逐个解析，文件不解析
+
+### 10.3 循环引用真实行为
+- **两两循环（A→B→A）**：不会被 early break 检测到，执行满 11 次替换后返回 `ENV_EXPAND_LOOP`
+- **自引用（A→A）**：`parseTemplateStringE` 第 2 次无变化 break，`parseBodyEnvVariablesE` 执行满 11 次报错
+- **前端表面正常**：`parseTemplateString` 包装器捕获错误返回原始值，用户看不到错误
+- **CLI 暴露错误**：CLI 直接返回 `PARSING_ERROR`，请求终止
+
+### 10.4 CLI 与前端同键空值回退差异
+- **前端**：高优先级变量 `currentValue === ""` 且 `initialValue` 也为空时，回退到低优先级非空值
+- **CLI**：高优先级只要存在 key（无论值是否为空），低优先级同 key 直接被过滤
+- **请求变量过滤**：CLI 先过滤掉 `active=false` 或 `value` 为空的请求变量，前端保留所有
+
+### 10.5 其他容易误判的细节
+1. **空格非空**：`||` 运算符将空格 `" "` 视为 truthy，不会触发回退
+2. **并发安全**：每个请求都有独立的环境快照，脚本修改不会互相串写
+3. **增量更新**：只有与初始快照不同的变量才会被写回
+4. **递归上限**：名义 10 层，实际最多 11 次替换（`depth <= 10` 循环 + `depth > 10` 判断）
 5. **集合继承**：子集合变量优先于父集合，扁平化后后遍历覆盖先遍历
-6. **CLI 差异**：CLI 使用 filter 直接移除低优先级同名变量，无回退逻辑
-7. **URL 预览**：URL 解析支持 `showKeyIfNotFound`，预览时显示 `<<key>>`
-8. **Body 解析**：不同 content-type 解析策略不同，文件不解析
-9. **循环检测**：`parseTemplateStringE` 有 early break，`parseBodyEnvVariablesE` 没有
-10. **递归上限**：名义 10 层，实际最多 11 次替换，两两循环在 2 次后被检测到
