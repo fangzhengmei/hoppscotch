@@ -1323,9 +1323,171 @@ return ""
 - **CLI**：高优先级只要存在 key（无论值是否为空），低优先级同 key 直接被过滤
 - **请求变量过滤**：CLI 先过滤掉 `active=false` 或 `value` 为空的请求变量，前端保留所有
 
-### 10.8 其他容易误判的细节
+### 10.8 Auth 派生 Header/Param 生成与汇合逻辑
+
+**完整链路**：
+
+```
+getEffectiveRESTRequest()
+    ├─ getComputedHeaders()
+    │    ├─ getComputedAuthHeaders()  ← 认证派生 header
+    │    │    └─ generateAuthHeaders()
+    │    │         └─ 各 authType 实现（bearer.ts 等）
+    │    │              └─ parseTemplateString(auth.token, envVars)  ← 🔴 内部解析
+    │    └─ getComputedBodyHeaders()  ← Content-Type 等自动生成
+    ├─ A.concat(request.headers)       ← 与用户定义 headers 汇合（auth 在前）
+    ├─ A.filter(active && key !== "")
+    └─ A.map(parseTemplateString)      ← 🔴 用户定义 header 在此解析
+```
+
+**关键代码证据**：
+
+1. **Auth Header 内部解析** (`bearer.ts:13`)：
+```typescript
+const token = parseTemplateString(auth.token, envVars, false, showKeyIfSecret)
+return [{ active: true, key: "Authorization", value: `Bearer ${token}`, ... }]
+// 🔴 auth 字段的模板解析在生成函数内部完成，使用 parseTemplateString（容错）
+```
+
+2. **汇合逻辑** (`EffectiveURL.ts:368-390`)：
+```typescript
+const effectiveFinalHeaders = pipe(
+  (await getComputedHeaders(request, environment.variables, showKeyIfSecret))
+    .map((h) => h.header),                          // 派生 header 在前
+  A.concat(request.headers),                         // 用户 header 在后
+  A.filter((x) => x.active && x.key !== ""),
+  A.map((x) => ({
+    active: true,
+    key: parseTemplateString(x.key, environment.variables, ...),   // 🔴 只解析用户 header
+    value: parseTemplateString(x.value, environment.variables, ...),
+    description: x.description,
+  }))
+)
+// 🔴 派生 header 已在内部解析，此处不再重复解析
+// 🔴 派生 header 在前，用户 header 在后，同 key 时用户 header 覆盖派生 header
+```
+
+3. **Auth Param 同理** (`EffectiveURL.ts:392-414`)：
+```typescript
+const effectiveFinalParams = pipe(
+  (await getComputedParams(request, environment.variables)).map((p) => p.param),
+  A.concat(request.params),  // 派生 param 在前，用户 param 在后
+  ...
+)
+```
+
+**排障要点**：
+- **认证值不对**：检查 `generateXxxAuthHeaders` 内部的 `parseTemplateString` 调用，确认变量是否存在
+- **同 key 覆盖**：用户定义的 header/param 会覆盖派生的，因为 `A.concat` 顺序是派生在前、用户在后
+- **解析时机**：派生 header 在 `getComputedHeaders` 内部解析，用户 header 在汇合后的 `A.map` 中解析
+
+### 10.9 前端与 CLI form-urlencoded 解析失败回退差异
+
+**前端 getFinalBodyFromRequest** (`EffectiveURL.ts:263-297`)：
+```typescript
+if (request.body.contentType === "application/x-www-form-urlencoded") {
+  const parsedBodyRecord = pipe(
+    request.body.body ?? "",
+    parseRawKeyValueEntriesE,  // 🔴 第一步：解析原始格式
+    E.map(flow(
+      // ... 过滤、解析模板、过滤失败项 ...
+    ))
+  )
+  return E.isRight(parsedBodyRecord) ? parsedBodyRecord.right : null
+  // 🔴 parseRawKeyValueEntriesE 失败时返回 null
+}
+```
+
+**CLI getFinalBodyFromRequest** (`pre-request.ts:512-547`)：
+```typescript
+if (request.body.contentType === "application/x-www-form-urlencoded") {
+  return pipe(
+    request.body.body,
+    parseRawKeyValueEntriesE,  // 🔴 第一步：解析原始格式
+    E.map(flow(...)),
+    E.mapLeft((e) => error({ code: "PARSING_ERROR", data: e.message }))
+    // 🔴 parseRawKeyValueEntriesE 失败时返回 Left(PARSING_ERROR)
+  )
+}
+```
+
+**差异对比表**：
+
+| 场景 | 前端 | CLI |
+|------|------|-----|
+| `parseRawKeyValueEntriesE` 解析原始格式失败 | 返回 `null`，请求继续发送（无 body） | 返回 `Left(PARSING_ERROR)`，请求终止 |
+| 单个 key/value 模板解析失败（如递归上限） | 被 `filterMap` 过滤掉，其他项继续 | 被 `filterMap` 过滤掉，其他项继续 |
+| 所有项都解析失败 | 返回空字符串 `""`（`qs.stringify({})`） | 返回空字符串 `""` |
+
+**反例 - 原始格式解析失败**：
+```
+Body: "key1=value1&key2=value2&invalid_format"
+// parseRawKeyValueEntriesE 无法解析 "invalid_format"
+// 前端：返回 null，请求发送时无 body
+// CLI：返回 PARSING_ERROR，请求终止
+```
+
+**反例 - 单个项模板解析失败**：
+```
+Body: "key1=<<loop1>>&key2=value2"
+变量: loop1 = <<loop2>>, loop2 = <<loop1>>
+// key1 解析失败（ENV_EXPAND_LOOP），被 filterMap 过滤
+// 前端 & CLI：结果都是 "key2=value2"，请求继续
+```
+
+**关键代码位置**：
+- 前端：`EffectiveURL.ts:263-297`，`E.isRight(parsedBodyRecord) ? parsedBodyRecord.right : null`
+- CLI：`pre-request.ts:512-547`，`E.mapLeft((e) => error({ code: "PARSING_ERROR", ... }))`
+
+### 10.10 前端与 CLI 统一分支对照表
+
+| 分支场景 | 前端行为 | CLI 行为 | 源码位置 |
+|----------|----------|----------|----------|
+| **URL 解析** | | | |
+| 变量不存在 | 返回空字符串（或 `<<key>>` 仅预览） | 返回空字符串 | `EffectiveURL.ts:434-440`, `pre-request.ts:454-465` |
+| 递归达到上限 | `parseTemplateString` 捕获返回原始字符串 | 返回 `Left(PARSING_ERROR)` 终止请求 | `environment/index.ts:192-208`, `pre-request.ts:454-465` |
+| **Header 解析** | | | |
+| 变量不存在 | 返回空字符串 | 返回空字符串 | `EffectiveURL.ts:376-387`, `getters.ts:76-83` |
+| 递归达到上限 | 返回原始字符串（被 getOrElse 捕获） | 返回 `Left(PARSING_ERROR)` 终止请求 | `EffectiveURL.ts:376-387`, `getters.ts:84-91` |
+| **Param 解析** | | | |
+| 变量不存在 | 返回空字符串 | 返回空字符串 | `EffectiveURL.ts:400-411`, `getters.ts:76-83` |
+| 递归达到上限 | 返回原始字符串（被 getOrElse 捕获） | 返回 `Left(PARSING_ERROR)` 终止请求 | `EffectiveURL.ts:400-411`, `getters.ts:84-91` |
+| **Body JSON 解析** | | | |
+| 变量不存在 | 返回空字符串 | 返回空字符串 | `EffectiveURL.ts:339-350`, `pre-request.ts:614-627` |
+| 递归达到上限 | `parseBodyEnvVariables` 捕获返回原始字符串 | 返回 `Left(PARSING_ERROR)` 终止请求 | `environment/index.ts:94-101`, `pre-request.ts:614-627` |
+| **Body form-urlencoded 解析** | | | |
+| 原始格式解析失败 | 返回 `null`，请求继续 | 返回 `Left(PARSING_ERROR)` 终止请求 | `EffectiveURL.ts:263-297`, `pre-request.ts:512-547` |
+| 单个项解析失败（递归上限） | 过滤掉失败项，其他继续 | 过滤掉失败项，其他继续 | `EffectiveURL.ts:287-290`, `pre-request.ts:537-540` |
+| **Body multipart 解析** | | | |
+| 文本字段变量不存在 | 返回空字符串 | 返回空字符串 | `EffectiveURL.ts:329-330`, `pre-request.ts:573-574` |
+| 文本字段递归达到上限 | 返回原始字符串（被 getOrElse 捕获） | 返回原始字符串（被 getOrElse 捕获） | `EffectiveURL.ts:329-330`, `pre-request.ts:573-574` |
+| **Auth 派生字段解析** | | | |
+| 变量不存在 | 返回空字符串 | 因 auth 类型而异（通常返回空） | `bearer.ts:13`, `pre-request.ts:195-216` |
+| 递归达到上限 | 返回原始字符串（被 getOrElse 捕获） | 前端使用 `parseTemplateString` 容错；CLI 直接拼接 | `bearer.ts:13`, `pre-request.ts:214` |
+
+**快速排障决策树**：
+
+```
+请求失败？
+├─ 检查是否返回 PARSING_ERROR
+│   ├─ 是（仅 CLI）→ 查看哪个字段：URL? Header? Param? Body JSON?
+│   │   └─ 递归上限？检查是否有循环引用 A→B→A
+│   └─ 否 → 检查值是否为空字符串
+│        ├─ 变量不存在？检查变量 key 拼写和作用域
+│        ├─ 变量存在但无 currentValue？检查变量结构
+│        └─ 回退机制？高优先级变量是否为空
+├─ Body 为空？
+│   ├─ form-urlencoded？检查原始格式是否有效
+│   └─ 递归上限？检查是否有循环引用
+└─ Auth 不生效？
+     ├─ check generateXxxAuthHeaders 内部解析
+     └─ 同 key 被用户 header 覆盖？
+```
+
+### 10.11 其他容易误判的细节
 1. **空格非空**：`||` 运算符将空格 `" "` 视为 truthy，不会触发回退
 2. **并发安全**：每个请求都有独立的环境快照，脚本修改不会互相串写
 3. **增量更新**：只有与初始快照不同的变量才会被写回
 4. **递归上限**：名义 10 层，实际最多 11 次替换（`depth <= 10` 循环 + `depth > 10` 判断）
 5. **集合继承**：子集合变量优先于父集合，扁平化后后遍历覆盖先遍历
+6. **Auth 汇合顺序**：派生 header/param 在前，用户定义在后，同 key 时用户覆盖派生
