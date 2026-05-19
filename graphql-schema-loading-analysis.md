@@ -75,173 +75,290 @@ export const connection = reactive<Connection>({
 
 ## 二、断连与异常路径下的状态回退逻辑
 
-### 2.1 核心代码结构总览
+### 2.1 核心代码结构与调用栈
 
 连接状态机由三个关键函数组成，它们的嵌套调用关系如下：
 
 ```
-connect()
-   ↓
-poll()  [循环调度]
-   ↓ （try 块内）
-getSchema()
-   ├─ 成功：设置 connection.schema
-   └─ 失败：throw Error → poll() catch 捕获
+调用者（Connect 按钮或 Run 按钮）
+  ↓
+connect(options, isRunGQLOperation)  [connection.ts:186-220]
+  ├─ line 199: connection.state = "CONNECTING"
+  ├─ 定义内部 poll() 函数
+  └─ line 219: await poll()
+       ↓
+poll()  [connection.ts:201-217]
+  ├─ try {
+  │    await getSchema(options)
+  │    connection.state = "CONNECTED"
+  │    setTimeout(poll, 7000)  ← 仅成功时设置下一次轮询
+  │  } catch {
+  │    connection.state = "ERROR"  ← 任何异常都会到这里
+  │    // 无 setTimeout，轮询停止！
+  │  }
+       ↓
+getSchema(options)  [connection.ts:239-335]
+  ├─ try {
+  │    发送 Introspection 请求
+  │    await response
+  │    if (E.isLeft(res)) {
+  │      connection.state = "ERROR"  ← 先改成 ERROR
+  │      throw Error()               ← 然后抛错
+  │    }
+  │    JSON.parse(responseText)      ← 可能抛错
+  │    buildClientSchema(...)        ← 可能抛错
+  │    connection.schema = schemaData
+  │    connection.error = null
+  │  } catch (e) {
+  │    console.error(e)
+  │    disconnect()                  ← 调用 disconnect（可能抛错）
+  │    // ⚠️  没有 rethrow！函数正常返回
+  │  }
+       ↓
+disconnect()  [connection.ts:222-230]
+  ├─ if (connection.state !== "CONNECTED") throw Error()
+  ├─ clearTimeout(timeoutSubscription)
+  ├─ connection.state = "DISCONNECTED"
+  └─ connection.schema = null
 ```
 
-### 2.2 正常断连流程
+### 2.2 关键代码行为确认
 
-**用户主动点击 Disconnect** (`connection.ts:222-230`):
+#### 确认 1：getSchema catch 没有 rethrow，会吞掉 disconnect() 的错误
+
+**代码证据** (`connection.ts:331-334`):
 ```typescript
-export const disconnect = () => {
-  if (connection.state !== "CONNECTED") {
-    throw new Error("No connections are running to be disconnected")
-  }
-
-  clearTimeout(timeoutSubscription)   // 停止轮询
-  connection.state = "DISCONNECTED"   // 标记为断开
-  connection.schema = null            // 清空 Schema 缓存
-}
-```
-
-**前置条件**：`connection.state` 必须是 `"CONNECTED"`，否则直接抛错不执行任何清理。
-
-**状态变化**（成功时）：
-- 轮询定时器被清除
-- `connection.state` → `"DISCONNECTED"`
-- `connection.schema` → `null`（Schema 缓存被清空）
-- 所有依赖 `connection.schema` 的组件自动切换到空状态
-
-### 2.3 poll() 函数的调度逻辑（关键！）
-
-**poll() 完整逻辑** (`connection.ts:201-217`):
-```typescript
-const poll = async () => {
-  try {
-    await getSchema(options)
-    if (connection.state !== "CONNECTED") connection.state = "CONNECTED"
-    // ⚠️  只有 getSchema 成功返回后，才会设置下一次轮询
-    timeoutSubscription = setTimeout(() => {
-      poll()
-    }, GQL_SCHEMA_POLL_INTERVAL)
-  } catch (error) {
-    // getSchema 抛错会走到这里
-    connection.state = "ERROR"
-    // ⚠️  失败路径不会设置 setTimeout，轮询停止！
-    if (!isRunGQLOperation) {
-      toast.error(t("graphql.connection_error_http"))
-    }
-    console.error(error)
-  }
-}
-```
-
-**关键结论 1**：`setTimeout` 只在 `getSchema` 成功返回后才会被调用。**任何失败都会导致轮询停止**，不会继续调度下一次。
-
-### 2.4 getSchema() 内部异常的完整路径
-
-**getSchema() 的异常处理** (`connection.ts:296-334`):
-```typescript
-if (E.isLeft(res)) {
-  connection.state = "ERROR"       // ① 先标记 ERROR
-  // 设置 connection.error...
-  throw new Error(...)             // ② 抛出错误
-}
-// ... JSON.parse 和 buildClientSchema 可能抛错 ...
-
-} catch (e: any) {                   // ③ 外层 catch 捕获所有异常
+} catch (e: any) {
   console.error(e)
-  disconnect()                       // ④ 尝试调用 disconnect()
+  disconnect()
+  // 没有 throw！函数在此处正常返回 undefined
 }
 ```
 
-**关键结论 2**：`getSchema()` 中任何异常都会先被自身的 catch 捕获，然后尝试调用 `disconnect()`。但 `disconnect()` 有前置条件检查，因此结果取决于调用时的 `connection.state`。
+**结论**：无论 `disconnect()` 是否成功，`getSchema()` 都会**正常返回**（无返回值），不会把错误上抛给 `poll()`。
 
-### 2.5 所有异常场景的最终状态
+#### 确认 2：poll() 只有在 getSchema 抛错时才会进入 catch
 
-#### 场景 A：首次 connect，网络请求失败（E.isLeft(res)）
+由于 `getSchema()` 的 catch 吞掉了所有错误，**只有 `getSchema()` 中 try 块内未被捕获的错误才会到达 poll() catch**。但实际上 `getSchema()` 的 try-catch 是包裹整个函数体的，因此：
+
+- **所有路径**：`getSchema()` 要么成功返回，要么被自身 catch 捕获并正常返回
+- **poll() catch 永远不会被执行到**——这是代码中的"死代码"
+
+#### 确认 3：setTimeout 只在 getSchema 成功返回后设置
+
+**代码证据** (`connection.ts:203-207`):
+```typescript
+await getSchema(options)
+if (connection.state !== "CONNECTED") connection.state = "CONNECTED"
+timeoutSubscription = setTimeout(() => {
+  poll()
+}, GQL_SCHEMA_POLL_INTERVAL)
 ```
-调用前 state = "CONNECTING"
+
+**结论**：只要 `getSchema()` 返回（无论内部是否调用过 `disconnect()`），代码就会继续执行，设置 `state = "CONNECTED"` 并调度下一次轮询。
+
+### 2.3 所有场景逐条走通（最终准确版）
+
+---
+
+#### 场景 1：getSchema() 完全成功
+
+**调用前状态**：任意（CONNECTING 或 CONNECTED）
+
+```
+getSchema 中：
+  网络请求成功 → E.isLeft(res) = false
+  JSON.parse 成功
+  buildClientSchema 成功
+  line 329: connection.schema = schemaData  ← Schema 更新
+  line 330: connection.error = null
+  正常返回
+
+回到 poll()：
+  line 204: connection.state = "CONNECTED"
+  line 205-207: setTimeout 已设置，7秒后下次轮询
+```
+
+**最终状态**：
+- `connection.state` = `"CONNECTED"`
+- `connection.schema` = **新值**
+- **轮询继续**（setTimeout 已设置）
+
+---
+
+#### 场景 2：首次 connect，网络请求失败（E.isLeft(res)）
+
+**调用前状态**：`CONNECTING`
+
+```
+getSchema 中：
+  line 294: await response → E.isLeft(res) = true
+  line 297: connection.state = "ERROR"
+  line 315: throw new Error(...)
   ↓
-getSchema 中 E.isLeft(res) = true
-  → line 297: state = "ERROR"
-  → line 315: throw Error
+  catch (e) {
+    console.error(e)
+    disconnect()  ← 调用 disconnect()
+      disconnect() 检查：state !== "CONNECTED"（当前是 ERROR）
+      disconnect() 抛错
+    // 没有 rethrow！
+  }
+  getSchema() 正常返回 undefined
+
+回到 poll()：
+  line 204: if (state !== "CONNECTED") state = "CONNECTED"  ← 把 ERROR 改成了 CONNECTED！
+  line 205-207: setTimeout 已设置！
+```
+
+**最终状态**：
+- `connection.state` = `"CONNECTED"`（被 poll() 覆盖了！）
+- `connection.schema` = `null`（从未被设置过）
+- **轮询继续**（setTimeout 已设置）
+- `connection.error` 保留错误信息
+
+---
+
+#### 场景 3：已连接后，某次轮询网络请求失败（E.isLeft(res)）
+
+**调用前状态**：`CONNECTED`，`schema` = 旧值
+
+```
+getSchema 中：
+  line 294: await response → E.isLeft(res) = true
+  line 297: connection.state = "ERROR"
+  line 315: throw new Error(...)
   ↓
-getSchema catch 调用 disconnect()
-  → disconnect() 检查 state !== "CONNECTED" → true（当前是 ERROR）
-  → disconnect() 抛错："No connections are running to be disconnected"
+  catch (e) {
+    console.error(e)
+    disconnect()  ← 调用 disconnect()
+      disconnect() 检查：state !== "CONNECTED"（当前是 ERROR）
+      disconnect() 抛错
+    // 没有 rethrow！
+  }
+  getSchema() 正常返回 undefined
+
+回到 poll()：
+  line 204: if (state !== "CONNECTED") state = "CONNECTED"  ← 把 ERROR 改成了 CONNECTED！
+  line 205-207: setTimeout 已设置！
+```
+
+**最终状态**：
+- `connection.state` = `"CONNECTED"`（被 poll() 覆盖了！）
+- `connection.schema` = **旧值**（从未被修改，因为 disconnect() 抛错了）
+- **轮询继续**（setTimeout 已设置）
+- `connection.error` 保留错误信息
+
+---
+
+#### 场景 4：getSchema() 中 JSON.parse / buildClientSchema 失败，首次调用
+
+**调用前状态**：`CONNECTING`
+
+```
+getSchema 中：
+  网络请求成功 → E.isLeft(res) = false
+  JSON.parse 失败 → throw SyntaxError
   ↓
-错误上抛到 poll() catch
-  → poll() catch: state = "ERROR"
+  catch (e) {
+    console.error(e)
+    disconnect()  ← 调用 disconnect()
+      disconnect() 检查：state !== "CONNECTED"（当前仍是 CONNECTING）
+      disconnect() 抛错
+    // 没有 rethrow！
+  }
+  getSchema() 正常返回 undefined
+
+回到 poll()：
+  line 204: if (state !== "CONNECTED") state = "CONNECTED"
+  line 205-207: setTimeout 已设置！
+```
+
+**最终状态**：
+- `connection.state` = `"CONNECTED"`
+- `connection.schema` = `null`（从未被设置过）
+- **轮询继续**（setTimeout 已设置）
+
+---
+
+#### 场景 5：getSchema() 中 JSON.parse / buildClientSchema 失败，已连接后
+
+**调用前状态**：`CONNECTED`，`schema` = 旧值
+
+```
+getSchema 中：
+  网络请求成功 → E.isLeft(res) = false
+  JSON.parse 失败 → throw SyntaxError
   ↓
-最终状态：state = "ERROR", schema = null, 轮询停止
+  catch (e) {
+    console.error(e)
+    disconnect()  ← 调用 disconnect()
+      disconnect() 检查：state === "CONNECTED"（当前仍是 CONNECTED，E.isLeft 分支没执行）
+      disconnect() 成功执行：
+        clearTimeout(timeoutSubscription)  ← 清空调时器
+        connection.state = "DISCONNECTED"  ← 改成 DISCONNECTED
+        connection.schema = null           ← 清空 Schema
+    // 没有 rethrow！
+  }
+  getSchema() 正常返回 undefined
+
+回到 poll()：
+  line 204: if (state !== "CONNECTED") state = "CONNECTED"
+    → 当前 state 是 DISCONNECTED，所以改成 CONNECTED！
+  line 205-207: setTimeout 已设置（虽然 disconnect() 清掉了，但这里又设置了新的）！
 ```
 
-#### 场景 B：已连接后，某次轮询网络请求失败（E.isLeft(res)）
-```
-调用前 state = "CONNECTED"
-  ↓
-getSchema 中 E.isLeft(res) = true
-  → line 297: state = "ERROR"  ← 先被改成 ERROR 了！
-  → line 315: throw Error
-  ↓
-getSchema catch 调用 disconnect()
-  → disconnect() 检查 state !== "CONNECTED" → true（当前是 ERROR）
-  → disconnect() 抛错
-  ↓
-错误上抛到 poll() catch
-  → poll() catch: state = "ERROR"
-  ↓
-最终状态：state = "ERROR", schema = 旧值（保留上一次成功的 Schema）, 轮询停止
-```
+**最终状态**：
+- `connection.state` = `"CONNECTED"`（被 poll() 覆盖了！）
+- `connection.schema` = `null`（被 disconnect() 清空了）
+- **轮询继续**（setTimeout 已设置新的）
 
-#### 场景 C：getSchema() 中 JSON.parse / buildClientSchema 失败（非网络错误）
-```
-子场景 C1：首次调用（调用前 state = "CONNECTING"）
-  → getSchema catch 调用 disconnect()
-  → disconnect() 检查 state !== "CONNECTED" → true
-  → disconnect() 抛错
-  → 最终状态：state = "ERROR", schema = null, 轮询停止
+---
 
-子场景 C2：后续轮询（调用前 state = "CONNECTED"）
-  → getSchema catch 调用 disconnect()
-  → disconnect() 检查 state === "CONNECTED" → true
-  → disconnect() 成功执行：clearTimeout + state = "DISCONNECTED" + schema = null
-  → 最终状态：state = "DISCONNECTED", schema = null, 轮询停止
+#### 场景 6：用户主动点击 Disconnect（state = "CONNECTED"）
+
+**调用前状态**：`CONNECTED`
+
+```
+disconnect() 被外部直接调用：
+  line 223: if (state !== "CONNECTED") throw → 通过检查
+  line 227: clearTimeout(timeoutSubscription)  ← 停止轮询
+  line 228: connection.state = "DISCONNECTED"
+  line 229: connection.schema = null
 ```
 
-#### 场景 D：getSchema() 成功
+**最终状态**：
+- `connection.state` = `"DISCONNECTED"`
+- `connection.schema` = `null`
+- **轮询停止**
+
+---
+
+### 2.4 状态回退矩阵（100% 代码对齐版）
+
+| 场景 | 调用前 state | connection.state 最终值 | connection.schema 最终值 | 轮询是否继续 |
+|------|-------------|------------------------|--------------------------|--------------|
+| getSchema 完全成功 | 任意 | CONNECTED | 新值 | **是** |
+| 首次 connect 网络失败 | CONNECTING | **CONNECTED** | null | **是** |
+| 已连接后网络失败 | CONNECTED | **CONNECTED** | **旧值** | **是** |
+| 解析失败（首次） | CONNECTING | **CONNECTED** | null | **是** |
+| 解析失败（已连接） | CONNECTED | **CONNECTED** | null | **是** |
+| 用户主动 Disconnect | CONNECTED | DISCONNECTED | null | 否 |
+| 页面卸载（state=CONNECTED） | CONNECTED | DISCONNECTED | null | 否 |
+
+### 2.5 最意外的行为：失败后 state 被 poll() 覆盖成 CONNECTED
+
+**代码证据** (`connection.ts:204`):
+```typescript
+if (connection.state !== "CONNECTED") connection.state = "CONNECTED"
 ```
-最终状态：state = "CONNECTED", schema = 新值, 轮询继续（setTimeout 已设置）
-```
 
-#### 场景 E：用户主动点击 Disconnect（state = "CONNECTED"）
-```
-最终状态：state = "DISCONNECTED", schema = null, 轮询停止
-```
+这行代码在 `getSchema()` 返回后**无条件执行**（只要 `getSchema()` 不抛错），导致：
+- 网络失败时，`getSchema()` 内部先把 state 改成 `ERROR`，但返回后立刻被覆盖成 `CONNECTED`
+- 解析失败时，`disconnect()` 把 state 改成 `DISCONNECTED`，但返回后也立刻被覆盖成 `CONNECTED`
 
-### 2.6 状态回退矩阵（最终准确版）
+**实际效果**：无论 getSchema() 内部发生什么错误，只要它能正常返回，poll() 就会把 state 设为 CONNECTED 并继续轮询。
 
-| 场景 | connection.state | connection.schema | 轮询是否继续 |
-|------|------------------|-------------------|--------------|
-| 正常断连（state=CONNECTED 时调用 disconnect） | DISCONNECTED | null | 否 |
-| 首次 connect 网络失败 | ERROR | null | 否 |
-| 已连接后网络请求失败 | ERROR | **保留旧值** | 否 |
-| getSchema 解析失败（首次） | ERROR | null | 否 |
-| getSchema 解析失败（已连接） | DISCONNECTED | null | 否 |
-| 切换 Tab | 无变化 | 无变化 | 是（如果之前在运行） |
-| 页面卸载（state=CONNECTED） | DISCONNECTED | null | 否 |
-
-### 2.7 disconnect() 前置条件检查的影响
-
-**disconnect() 的前置检查** 导致了一个重要的行为差异：
-- 网络请求失败时，`E.isLeft(res)` 分支会**先把 state 改成 ERROR**，然后才调用 `disconnect()`
-- 此时 `disconnect()` 因为前置条件不满足而抛错，**不会清空 schema**
-- 因此，已连接后的网络失败会保留旧的 Schema 缓存
-
-**设计意图**：网络波动时保留上次成功的 Schema，让用户可以继续浏览文档和编写查询。
-
-### 2.8 页面卸载时的清理
+### 2.6 页面卸载时的清理
 
 **graphql.vue onBeforeUnmount** (`graphql.vue:186-190`):
 ```typescript
@@ -253,6 +370,22 @@ onBeforeUnmount(() => {
 ```
 
 只有在 `CONNECTED` 状态下才会调用 `disconnect()`，避免因前置检查抛错。
+
+### 2.7 reset() 函数的兜底清理
+
+**reset() 实现** (`connection.ts:232-237`):
+```typescript
+export const reset = () => {
+  if (connection.state === "CONNECTED") disconnect()
+
+  connection.state = "DISCONNECTED"
+  connection.schema = null
+}
+```
+
+- 先尝试调用 `disconnect()`（如果已连接）
+- 然后**无条件**设置 `state = "DISCONNECTED"` 和 `schema = null`
+- 这是唯一能保证最终状态一致的清理函数
 
 ---
 
@@ -673,15 +806,23 @@ public override persistableTabState = computed(() => ({
 - **语义层**：graphql-language-service-interface 负责基于 Schema 的补全
 - **集成层**：Hoppscotch 自定义 Completer 桥接两者
 
-### 8.4 轮询失败的保守策略
-- **保留旧 Schema**：网络请求失败时，`disconnect()` 因前置条件不满足而抛错，不会清空 Schema 缓存
-- **仅标记错误状态**：UI 显示错误，但旧 Schema 仍可用，用户可继续浏览文档和编写查询
-- **轮询停止**：任何失败都会导致轮询停止，需要用户手动重新连接
+### 8.4 轮询失败的实际行为（与设计意图可能不符）
+- **轮询永不停止**：只要 `getSchema()` 能正常返回（包括内部出错后被 catch 吞掉），`poll()` 就会设置下一次 `setTimeout`
+- **错误状态被覆盖**：`getSchema()` 内部设置的 `ERROR` 或 `DISCONNECTED` 状态会被 `poll()` 无条件覆盖成 `CONNECTED`
+- **Schema 缓存策略不一致**：
+  - 网络失败：保留旧 Schema（因为 `disconnect()` 抛错没执行）
+  - 解析失败：清空 Schema（因为 `disconnect()` 成功执行了，但 state 仍被覆盖成 CONNECTED）
 
-### 8.5 disconnect() 前置条件的设计权衡
-- **优点**：防止在非连接状态下重复清理，避免逻辑混乱
-- **副作用**：网络失败时无法正常执行清理流程，导致 Schema 意外保留
-- **实际效果**：这种"bug"反而成为了一个有用的特性——网络波动时保留上次的 Schema
+### 8.5 disconnect() 前置条件的意外副作用
+- **设计意图**：防止在非连接状态下重复清理，避免逻辑混乱
+- **实际效果**：
+  - 网络失败时，`E.isLeft(res)` 分支先把 state 改成 `ERROR`，导致 `disconnect()` 前置检查失败抛错
+  - 旧 Schema 因此被保留——这可能是一个"happy accident"，网络波动时用户仍可继续浏览
+  - 但 `connection.state` 最终被 `poll()` 覆盖成 `CONNECTED`，UI 可能显示"已连接"但实际 Schema 已过期或无效
+
+### 8.6 代码中的死代码
+- **poll() catch 分支**：由于 `getSchema()` 吞掉了所有错误，`poll()` 的 catch 分支永远不会被执行到
+- **`connection.state = "ERROR"` 设置**：在 `E.isLeft(res)` 分支和 `poll()` catch 中设置的 `ERROR` 状态会立刻被 `poll()` 覆盖成 `CONNECTED`，实际上没有任何外部组件能观察到这个状态
 
 ---
 
@@ -709,13 +850,33 @@ public override persistableTabState = computed(() => ({
 
 ## 十、重要更正说明
 
-### 第三版更正（当前版本）
+### 第四版更正（当前版本）
 
-本文档对第二版分析的以下内容进行了修正：
+本文档对第三版分析的以下内容进行了彻底修正：
+
+1. **getSchema catch 未 rethrow 的影响**：
+   - 第三版错误地认为 `getSchema()` 中的错误会上抛到 `poll()`
+   - 实际：`getSchema()` 的 catch 块吞掉了所有错误（包括 `disconnect()` 抛的错），**`getSchema()` 永远不会抛错**
+   - 因此 `poll()` 的 catch 分支是**死代码**，永远不会被执行
+
+2. **轮询失败后一定会继续调度**：
+   - 第三版错误地认为失败后轮询停止
+   - 实际：只要 `getSchema()` 返回（无论内部是否出错），`poll()` 就会执行 `setTimeout`，**轮询永不停止**（除非用户主动调用 `disconnect()` 或 `reset()`）
+
+3. **错误状态被覆盖**：
+   - `getSchema()` 内部设置的 `ERROR` 或 `DISCONNECTED` 状态，会被 `poll()` 第 204 行无条件覆盖成 `CONNECTED`
+   - 外部组件永远观察不到 `ERROR` 状态
+
+4. **场景 5 的完整走通**：
+   - 解析失败（已连接）时，`disconnect()` 成功执行：清空 schema + 清空调时器 + state = DISCONNECTED
+   - 但回到 `poll()` 后，state 被覆盖成 CONNECTED，且设置了新的 setTimeout
+   - 最终：state = CONNECTED，schema = null，轮询继续
+
+### 第三版更正
 
 1. **轮询失败后的调度行为**：
    - 第二版错误地认为轮询失败后会继续调度
-   - 实际：`setTimeout` 只在 `getSchema` 成功返回后才会被调用，**任何失败都会导致轮询停止**
+   - 实际：`setTimeout` 只在 `getSchema` 成功返回后才会被调用，**任何失败都会导致轮询停止**（第三版此处结论错误，已在第四版修正）
 
 2. **getSchema 异常调用 disconnect 的真实结果**：
    - 第二版未考虑 `disconnect()` 的前置条件检查
@@ -723,13 +884,13 @@ public override persistableTabState = computed(() => ({
    - 因此 `disconnect()` 会抛错，**不会执行 clearTimeout、state 修改和 schema 清空**
 
 3. **网络失败与解析失败的状态差异**：
-   - 网络失败（E.isLeft(res)）：state → ERROR，schema 保留旧值，轮询停止
-   - 解析失败（JSON.parse/buildClientSchema）且已连接时：state → DISCONNECTED，schema → null，轮询停止
+   - 网络失败（E.isLeft(res)）：state → ERROR，schema 保留旧值，轮询停止（第三版此处结论错误，已在第四版修正）
+   - 解析失败（JSON.parse/buildClientSchema）且已连接时：state → DISCONNECTED，schema → null，轮询停止（第三版此处结论错误，已在第四版修正）
 
 ### 第二版更正
 
 1. **导航栈自动重建**：初版认为 Schema 更新时自动重建导航栈，实际 `updateSchema()` 和 `rebuildNavStack()` 从未被调用。只有切换 Tab 时会调用 `reset()` 重置导航栈。
 
-2. **轮询失败的状态回退**：初版未区分不同异常路径。实际上，单次轮询失败仅标记 ERROR 状态，不会清空 Schema 缓存（第二版此处错误地认为不会停止轮询——实际任何失败都会停止轮询）。
+2. **轮询失败的状态回退**：初版未区分不同异常路径。实际上，单次轮询失败仅标记 ERROR 状态，不会清空 Schema 缓存（第二版此处错误地认为不会停止轮询——第三版又修正为会停止轮询——第四版最终修正为轮询永不停止）。
 
 3. **文档操作对补全的影响**：初版未说明具体影响路径。实际上文档操作不改变 Schema，只通过更新查询文本和光标位置间接影响补全的上下文输入。
