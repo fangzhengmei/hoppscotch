@@ -545,9 +545,426 @@ window.__KERNEL__ = {
 
 ---
 
-## 四、路径对比与核心差异
+## 四、Fetch 辅助链路 vs 常规 REST 请求链路：入口、响应适配与 Set-Cookie 处理
 
-### 4.1 Proxy vs Agent 执行路径对比
+### 4.1 两条独立链路总览
+
+系统中存在两条完全独立的请求执行链路，共享底层的 `KernelInterceptorService`，但入口、响应适配和 Set-Cookie 处理完全不同：
+
+| 链路 | 触发场景 | 入口函数 | 响应适配函数 | 输出格式 |
+|-----|---------|---------|-------------|---------|
+| **REST 请求链路** | 用户点击 UI "发送"按钮、测试运行器 | `runRESTRequest$`、`runTestRunnerRequest` | `RESTResponse.toResponse()` | `HoppRESTSuccessResponse` |
+| **Fetch 辅助链路** | 脚本中 `hopp.fetch()` 调用（Pre-request/Post-request 脚本） | `createHoppFetchHook()` | `convertRelayResponseToSerializableResponse()` | `Response` 接口 |
+
+**共享层**：两条链路最终都调用 `kernelInterceptorService.execute(relayRequest)` 进入拦截器层（browser/proxy/agent/native/extension）。
+
+---
+
+### 4.2 入口差异对比
+
+#### 4.2.1 REST 请求链路入口（用户点击"发送"）
+
+**完整调用链**：
+```
+UI 点击"发送"按钮
+    ↓
+RequestRunner.ts:460 runRESTRequest$(tab)
+    ↓
+RequestRunner.ts:520 delegatePreRequestScriptRunner()
+    ↓  （执行 Pre-request 脚本）
+RequestRunner.ts:576 getEffectiveRESTRequest()
+    ↓  （环境变量替换）
+helpers/network.ts:15 createRESTNetworkRequestStream(effectiveRequest)
+    ↓
+helpers/kernel/rest/request.ts RESTRequest.toRequest(effectiveRequest)
+    ↓  （转换为 RelayRequest）
+kernelInterceptorService.execute(relayRequest)
+    ↓  （进入拦截器层）
+```
+
+**关键代码位置**：
+- 主入口：`helpers/RequestRunner.ts:460-696` `runRESTRequest$()`
+- 网络流创建：`helpers/network.ts:15-80` `createRESTNetworkRequestStream()`
+- REST 请求转换：`helpers/kernel/rest/request.ts` `RESTRequest.toRequest()`
+
+**RelayRequest 构造特点**：
+- 完整解析用户在 UI 中配置的所有字段（method、url、headers、body、auth、params 等）
+- 包含完整的认证配置（Basic Auth、Bearer Token、API Key、OAuth 等）
+- 继承集合层级的 headers、auth、scripts
+
+#### 4.2.2 Fetch 辅助链路入口（脚本 `hopp.fetch()`）
+
+**完整调用链**：
+```
+Pre-request / Post-request 脚本中调用 hopp.fetch(url, init)
+    ↓
+helpers/hopp-fetch.ts:15 createHoppFetchHook(kernelInterceptor, onFetchCall)
+    ↓
+helpers/hopp-fetch.ts:19-61 内部匿名函数
+    ↓
+helpers/hopp-fetch.ts:67 convertFetchToRelayRequest(input, init)
+    ↓  （Fetch API → RelayRequest 转换）
+kernelInterceptorService.execute(relayRequest)
+    ↓  （进入拦截器层）
+```
+
+**关键代码位置**：
+- 入口创建：`helpers/hopp-fetch.ts:15-62` `createHoppFetchHook()`
+- Fetch → RelayRequest 转换：`helpers/hopp-fetch.ts:67-206` `convertFetchToRelayRequest()`
+
+**RelayRequest 构造特点**（`hopp-fetch.ts:193-205`）：
+```typescript
+const relayRequest = {
+  id: Math.floor(Math.random() * 1000000), // 随机 ID
+  url: urlStr,
+  method,
+  version: "HTTP/1.1",
+  headers,
+  params: undefined,          // 🔴 不处理 query params（交由 preProcessRelayRequest）
+  auth: { kind: "none" },    // 🔴 无认证（脚本需手动在 headers 中添加）
+  content,
+  // proxy, security 继承自拦截器配置
+}
+```
+
+**入口差异总结表**：
+
+| 对比项 | REST 请求链路 | Fetch 辅助链路 |
+|-------|-------------|---------------|
+| 触发方式 | UI 按钮点击 / 测试运行器 | 脚本中 `hopp.fetch()` 调用 |
+| 入口函数 | `runRESTRequest$()` / `runTestRunnerRequest()` | `createHoppFetchHook()` 返回的匿名函数 |
+| 请求转换 | `RESTRequest.toRequest()` | `convertFetchToRelayRequest()` |
+| Query Params | 完整解析，自动编码 | 设置为 `undefined`，交由拦截器预处理 |
+| Auth 配置 | 完整支持所有认证类型 | 固定 `{ kind: "none" }` |
+| 环境变量替换 | 完整替换（`getEffectiveRESTRequest`） | 无（脚本中自行处理） |
+| 前置脚本执行 | 有（`delegatePreRequestScriptRunner`） | 无（已经在脚本环境中） |
+
+---
+
+### 4.3 响应适配过程差异
+
+#### 4.3.1 REST 链路响应适配：`RESTResponse.toResponse()`
+
+**代码位置**：`helpers/kernel/rest/response.ts:72-99`
+
+```typescript
+export const RESTResponse = {
+  async toResponse(
+    response: RelayResponse,
+    originalRequest: HoppRESTRequest
+  ): Promise<HoppRESTSuccessResponse | HoppRESTTransformError> {
+    // 校验 body 格式
+    if (!response.body.body || !(response.body.body instanceof Uint8Array)) {
+      return { type: "fail", error: { type: "transform_error", message: "..." } }
+    }
+
+    return {
+      type: "success",
+      headers: processHeaders(response.headers),  // 🔴 只传 headers，不传 multiHeaders
+      body: response.body.body.buffer,           // ArrayBuffer
+      statusCode: response.status,
+      statusText: response.statusText ?? "",
+      meta: {
+        responseSize: extractSize(response),
+        responseDuration: extractTiming(response),
+      },
+      req: originalRequest,
+    }
+  },
+}
+```
+
+**输出格式**：`HoppRESTSuccessResponse`
+```typescript
+{
+  type: "success",
+  headers: HoppRESTResponseHeader[],  // 数组格式 [{key, value}, ...]
+  body: ArrayBuffer,
+  statusCode: number,
+  statusText: string,
+  meta: {
+    responseSize: number,
+    responseDuration: number,
+  },
+  req: HoppRESTRequest,
+}
+```
+
+**适配特点**：
+- 只处理 `response.headers`（Record<string, string>），**完全忽略 `multiHeaders`**
+- Body 直接取 `ArrayBuffer`，不做额外转换
+- 提取元数据（响应大小、响应时间）
+- 绑定原始请求对象
+
+#### 4.3.2 Fetch 链路响应适配：`convertRelayResponseToSerializableResponse()`
+
+**代码位置**：`helpers/hopp-fetch.ts:214-360`
+
+```typescript
+function convertRelayResponseToSerializableResponse(
+  relayResponse: any
+): Response {
+  const status = relayResponse.status || 200
+  const statusText = relayResponse.statusText || ""
+  const ok = status >= 200 && status < 300
+
+  const headersObj: Record<string, string> = {}
+  const setCookieHeaders: string[] = []
+
+  // 🔴 优先使用 multiHeaders！
+  if (relayResponse.multiHeaders && Array.isArray(relayResponse.multiHeaders)) {
+    for (const header of relayResponse.multiHeaders) {
+      if (header.key.toLowerCase() === "set-cookie") {
+        setCookieHeaders.push(header.value)  // 每个 Set-Cookie 单独保留
+      } else {
+        headersObj[header.key] = header.value
+      }
+    }
+  } else if (relayResponse.headers) {
+    // Fallback：从 headers 中提取
+    Object.entries(relayResponse.headers).forEach(([key, value]) => {
+      if (key.toLowerCase() === "set-cookie") {
+        if (Array.isArray(value)) {
+          setCookieHeaders.push(...value)
+        } else {
+          setCookieHeaders.push(String(value))
+        }
+        headersObj[key] = Array.isArray(value) ? value[0] : String(value)
+      } else {
+        headersObj[key] = String(value)
+      }
+    })
+  }
+
+  // Body 转换为普通数组（可跨 VM 边界序列化）
+  let bodyBytes: number[] = []
+  const actualBody = relayResponse.body?.body || relayResponse.body
+  // 处理各种类型：Array、ArrayBuffer、Uint8Array、Buffer-like 对象等
+
+  // 构造 Response-like 对象，实现所有标准方法
+  const serializableResponse = {
+    status,
+    statusText,
+    ok,
+    _headersData: headersObj,
+    headers: {
+      get(name: string): string | null { ... },
+      has(name: string): boolean { ... },
+      entries(): IterableIterator<[string, string]> { ... },
+      keys(): IterableIterator<string> { ... },
+      values(): IterableIterator<string> { ... },
+      forEach(callback) { ... },
+      getSetCookie(): string[] { return setCookieHeaders },  // 🔴 标准 API
+    },
+    _bodyBytes: bodyBytes,
+    async text(): Promise<string> { ... },
+    async json(): Promise<any> { ... },
+    async arrayBuffer(): Promise<ArrayBuffer> { ... },
+    async blob(): Promise<Blob> { ... },
+    type: "basic" as ResponseType,
+    url: "",
+    redirected: false,
+    bodyUsed: false,
+  }
+
+  return serializableResponse as unknown as Response
+}
+```
+
+**输出格式**：标准 `Response` 接口，可在脚本中使用 `await response.json()`、`response.headers.getSetCookie()` 等。
+
+**适配特点**：
+- 🔴 **优先使用 `multiHeaders`**，只有没有时才从 `headers` 提取
+- 完整实现 Fetch API `Response` 接口的所有方法
+- Body 转换为普通 `number[]` 数组（可跨 QuickJS VM 边界序列化）
+- 保留完整的 `getSetCookie()` API（标准 Fetch API）
+
+**响应适配差异总结表**：
+
+| 对比项 | REST 链路 `RESTResponse.toResponse()` | Fetch 链路 `convertRelayResponseToSerializableResponse()` |
+|-------|------------------------------------|-----------------------------------------------------|
+| 代码位置 | `helpers/kernel/rest/response.ts:72-99` | `helpers/hopp-fetch.ts:214-360` |
+| 输出格式 | `HoppRESTSuccessResponse` | 标准 `Response` 接口 |
+| multiHeaders 处理 | ❌ 完全忽略，只使用 `headers` | ✅ **优先使用**，降级到 `headers` |
+| Body 格式 | `ArrayBuffer` | `number[]`（可跨 VM 序列化） |
+| Headers 格式 | 数组 `{key, value}[]` | 对象 `Record<string, string>` + `getSetCookie()` |
+| 元数据 | 提取 `responseSize`、`responseDuration` | 无 |
+| 原始请求绑定 | 绑定 `req: HoppRESTRequest` | 无 |
+| 使用场景 | UI 渲染响应、测试断言 | 脚本中 `response.json()`、`response.headers` |
+| 跨 VM 边界 | ❌ 不能（ArrayBuffer 不行） | ✅ 可以（纯数据对象） |
+
+---
+
+### 4.4 Set-Cookie 处理差异
+
+这是两条链路最关键的差异之一，直接影响多 Cookie 场景的正确性。
+
+#### 4.4.1 Set-Cookie 背景知识
+
+HTTP 协议中，多个 `Set-Cookie` 响应头必须分别发送，不能用逗号合并（因为 Cookie 值中可能包含逗号，如 `Expires=Wed, 21 May 2026 07:28:00 GMT`）。
+
+**问题场景**：如果用逗号合并多个 Set-Cookie：
+```http
+Set-Cookie: a=1; Expires=Wed, 21 May 2026 07:28:00 GMT, b=2; Expires=Thu, 22 May 2026 07:28:00 GMT
+```
+按逗号分割会错误地切成 4 段，而不是 2 个 Cookie。
+
+#### 4.4.2 Agent 拦截器中的 Set-Cookie 处理
+
+**代码位置**：`agent/index.ts:191-207`
+
+Agent 拦截器在解密响应后，专门处理 Set-Cookie：
+```typescript
+for (const [key, value] of Object.entries(decryptedResponse.headers)) {
+  if (key.toLowerCase() === "set-cookie") {
+    // 🔴 按 \n 分割，每个作为独立 Set-Cookie 条目
+    const cookieStrings = value
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean)
+    for (const cookieString of cookieStrings) {
+      multiHeaders.push({ key: "Set-Cookie", value: cookieString })
+    }
+  } else {
+    multiHeaders.push({ key, value })
+  }
+}
+```
+
+**输出**：同时设置 `headers`（向后兼容）和 `multiHeaders`（保留完整性）
+```typescript
+return E.right({
+  ...response,
+  headers: decryptedResponse.headers,  // Record<string, string>，可能有逗号问题
+  multiHeaders,                        // 🔴 Array<{key, value}>，每个 Set-Cookie 独立
+  body: response.body,
+})
+```
+
+**Agent 服务端拼接逻辑**（`transfer.rs`）：多个 Set-Cookie 用 `\n` 拼接成单个字符串。
+
+#### 4.4.3 REST 链路的 Set-Cookie 处理
+
+**代码位置**：`helpers/kernel/rest/response.ts:47-70` `processHeaders()`
+
+```typescript
+const processHeaders = (
+  headers?: Record<string, string> | null
+): HoppRESTResponseHeader[] => {
+  const processedHeaders: HoppRESTResponseHeader[] = []
+
+  for (const [key, value] of Object.entries(headers ?? {})) {
+    if (key.toLowerCase() === "set-cookie") {
+      // 🔴 从 headers（Record）中按 \n 分割
+      const cookieStrings = value
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean)
+      for (const cookieString of cookieStrings) {
+        processedHeaders.push({ key: "Set-Cookie", value: cookieString })
+      }
+    } else {
+      processedHeaders.push({ key, value })
+    }
+  }
+
+  return processedHeaders
+}
+```
+
+**关键点**：
+- 只从 `response.headers`（Record<string, string>）读取，**完全忽略 `multiHeaders`**
+- 按 `\n` 分割 Set-Cookie 值（Agent 用 `\n` 拼接）
+- 输出为数组格式 `HoppRESTResponseHeader[]`
+
+**风险**：对于 Proxy/Browser 拦截器（不提供 `multiHeaders`，也不用 `\n` 拼接），如果 Set-Cookie 值本身包含逗号（如 Expires 日期），按 `\n` 分割没问题，但如果拦截器用逗号拼接了多个 Set-Cookie，就会出问题。
+
+#### 4.4.4 Fetch 链路的 Set-Cookie 处理
+
+**代码位置**：`helpers/hopp-fetch.ts:226-252`
+
+```typescript
+// 🔴 优先使用 multiHeaders！
+if (relayResponse.multiHeaders && Array.isArray(relayResponse.multiHeaders)) {
+  for (const header of relayResponse.multiHeaders) {
+    if (header.key.toLowerCase() === "set-cookie") {
+      setCookieHeaders.push(header.value)  // 🔴 已经是独立条目，直接 push
+    } else {
+      headersObj[header.key] = header.value
+    }
+  }
+} else if (relayResponse.headers) {
+  // Fallback：从 headers 中提取
+  Object.entries(relayResponse.headers).forEach(([key, value]) => {
+    if (key.toLowerCase() === "set-cookie") {
+      if (Array.isArray(value)) {
+        setCookieHeaders.push(...value)
+      } else {
+        setCookieHeaders.push(String(value))
+      }
+      // 向后兼容：只存第一个到 headersObj
+      headersObj[key] = Array.isArray(value) ? value[0] : String(value)
+    } else {
+      headersObj[key] = String(value)
+    }
+  })
+}
+```
+
+**关键点**：
+- 🔴 **优先使用 `multiHeaders`**（Agent 提供的数组），每个 Set-Cookie 已经是独立条目，无需分割
+- 降级时从 `headers` 提取，支持 `Array` 和 `string` 两种格式
+- 完整保留所有 Set-Cookie 到 `setCookieHeaders` 数组，通过 `getSetCookie()` API 暴露
+- 向后兼容：第一个 Set-Cookie 同时存入 `headersObj`
+
+**Set-Cookie 处理差异总结表**：
+
+| 对比项 | REST 链路 `processHeaders()` | Fetch 链路 `convertRelayResponseToSerializableResponse()` |
+|-------|----------------------------|-----------------------------------------------------|
+| 代码位置 | `helpers/kernel/rest/response.ts:47-70` | `helpers/hopp-fetch.ts:226-252` |
+| 数据源 | ❌ 只使用 `response.headers`（Record） | ✅ **优先使用 `multiHeaders`**，降级到 `headers` |
+| Agent 场景 | 从 `headers` 按 `\n` 分割 | 直接使用 `multiHeaders` 中已分割的条目 |
+| Proxy/Browser 场景 | 按 `\n` 分割（但 Proxy 不用 `\n` 拼接，可能有逗号问题） | 从 `headers` 提取，支持 Array/string |
+| 输出方式 | 数组 `{key: "Set-Cookie", value}[]` | 独立数组 `setCookieHeaders`，通过 `getSetCookie()` API 暴露 |
+| 多 Cookie 完整性 | 依赖拦截器是否用 `\n` 拼接 | ✅ 完整（Agent 提供 multiHeaders） |
+| 标准 API 支持 | 无（自定义格式） | ✅ `headers.getSetCookie()`（标准 Fetch API） |
+| 向后兼容 | 无 | ✅ 第一个 Set-Cookie 存入 headersObj |
+
+**完整 Set-Cookie 接力链（Agent 场景）**：
+```
+目标服务器响应：
+  Set-Cookie: a=1; Expires=Wed, 21 May 2026 07:28:00 GMT
+  Set-Cookie: b=2; Expires=Thu, 22 May 2026 07:28:00 GMT
+    ↓
+Agent Rust relay crate 接收，按 \n 拼接：
+  "a=1; Expires=Wed, 21 May 2026 07:28:00 GMT\nb=2; Expires=Thu, 22 May 2026 07:28:00 GMT"
+    ↓
+Agent 拦截器解密（agent/index.ts:191-207）：
+  headers["set-cookie"] = <above string>
+  multiHeaders = [
+    {key: "Set-Cookie", value: "a=1; Expires=Wed, 21 May 2026 07:28:00 GMT"},
+    {key: "Set-Cookie", value: "b=2; Expires=Thu, 22 May 2026 07:28:00 GMT"}
+  ]
+    ↓
+┌───────────────────────────────────────────────────────────────────┐
+│ 分支 1：REST 链路                                                │
+│   processHeaders(response.headers)                               │
+│   按 \n 分割 → 正确输出 2 个 Cookie                               │
+└───────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│ 分支 2：Fetch 链路                                               │
+│   convertRelayResponseToSerializableResponse()                    │
+│   优先使用 multiHeaders → 直接取出 2 个独立条目                   │
+│   setCookieHeaders = [cookie1, cookie2]                           │
+│   headers.getSetCookie() → 返回完整数组                           │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 五、路径对比与核心差异
+
+### 5.1 Proxy vs Agent 执行路径对比
 
 | 维度 | Proxy 拦截器（远端中继） | Agent 拦截器（本地执行） |
 |-----|-------------------------|-------------------------|
@@ -563,7 +980,7 @@ window.__KERNEL__ = {
 | 延迟 | 较高（公网往返） | 极低（本地回环） |
 | CORS 限制 | 无 | 无 |
 
-### 4.2 关键代码位置索引
+### 5.2 关键代码位置索引
 
 | 模块 | 文件路径 | 行号 |
 |------|---------|------|
@@ -581,20 +998,27 @@ window.__KERNEL__ = {
 | Agent 服务端解密执行 | `controller.rs` | 204-255 |
 | Agent 服务端加密响应 | `util.rs` | 64-93 |
 | Web 内核 axios 实现 | `hoppscotch-kernel/src/relay/impl/web/v/1.ts` | 113-288 |
-| 响应适配（优先 multiHeaders） | `rest.ts` | 427-469 |
+| REST 请求主入口 | `helpers/RequestRunner.ts` | 460-696 |
+| REST 网络流创建 | `helpers/network.ts` | 15-80 |
+| REST 响应适配（忽略 multiHeaders） | `helpers/kernel/rest/response.ts` | 72-99 |
+| REST Set-Cookie 处理（按 \n 分割） | `helpers/kernel/rest/response.ts` | 47-70 |
+| Fetch 链路入口创建 | `helpers/hopp-fetch.ts` | 15-62 |
+| Fetch → RelayRequest 转换 | `helpers/hopp-fetch.ts` | 67-206 |
+| Fetch 响应适配（优先 multiHeaders） | `helpers/hopp-fetch.ts` | 214-360 |
+| Fetch Set-Cookie 处理（优先 multiHeaders） | `helpers/hopp-fetch.ts` | 226-252 |
 
 ---
 
-## 五、核心发现总结
+## 六、核心发现总结
 
-### 5.1 OTP 接力的真相
+### 6.1 OTP 接力的真相
 
 1. **前端生成的 OTP 完全被忽略**：Agent `receive_registration()` 不读取请求体，自己重新生成 OTP
 2. **用户输入的是 Agent 生成的 OTP**：Agent 通过 Tauri 事件弹窗显示自己生成的 OTP，用户手动输入
 3. **OTP 是单因素校验**：只比较值是否相等，不校验谁生成的
 4. **安全设计**：OTP 由 Agent 生成确保不可预测性，防止前端篡改
 
-### 5.2 明文/加密边界的真相
+### 6.2 明文/加密边界的真相
 
 1. **`auth_key` 永远明文传输**：在 `Authorization` 请求头中明文传递
 2. **注册阶段完全明文**：包括 `auth_key` 的返回都是明文 JSON
@@ -602,7 +1026,7 @@ window.__KERNEL__ = {
 4. **`nonce` 永远明文**：在 `X-Hopp-Nonce` 头中明文传递，用于 AES-GCM 解密
 5. **管理接口大多明文**：`/cancel`、`/registrations` 删除、`/log-sink` 响应都是明文
 
-### 5.3 回传路径的真相
+### 6.3 回传路径的真相
 
 1. **Proxy 是双层嵌套调用**：Proxy interceptor → Relay.execute → 代理服务器 → 目标
 2. **Proxy 需要双层状态码解析**：外层是到代理服务器的状态码，内层 ProxyResponse 才是目标的真实状态码
@@ -610,7 +1034,15 @@ window.__KERNEL__ = {
 4. **Set-Cookie 完整性**：Agent 通过 `multiHeaders` 按 `\n` 分割保留多个 Set-Cookie，避免逗号分割导致的 Cookie 值损坏
 5. **适配层优先级**：`convertRelayResponseToSerializableResponse()` 优先使用 `multiHeaders`，只有没有时才用 `headers`
 
-### 5.4 加密通信协议的真相
+### 6.4 两条请求链路的真相
+
+1. **两条独立链路共享底层**：REST 链路（UI 发送）和 Fetch 链路（脚本 `hopp.fetch()`）最终都调用 `kernelInterceptorService.execute()`，但入口、响应适配、Set-Cookie 处理完全不同
+2. **入口差异**：REST 链路完整解析认证、环境变量；Fetch 链路固定 `auth: { kind: "none" }`，`params: undefined`
+3. **响应适配差异**：REST 链路用 `RESTResponse.toResponse()`（忽略 `multiHeaders`）；Fetch 链路用 `convertRelayResponseToSerializableResponse()`（优先 `multiHeaders`）
+4. **Set-Cookie 处理差异**：REST 链路从 `headers` 按 `\n` 分割；Fetch 链路优先使用 `multiHeaders` 中已分割的条目
+5. **跨 VM 边界**：Fetch 链路将 Body 转换为 `number[]` 可跨 QuickJS VM 序列化；REST 链路用 `ArrayBuffer` 不能跨 VM
+
+### 6.5 加密通信协议的真相
 
 1. **密钥交换**：x25519 椭圆曲线 Diffie-Hellman，明文交换公钥
 2. **对称加密**：AES-256-GCM，12 字节随机 nonce，每次请求独立
