@@ -191,7 +191,7 @@ AuthGuard ('jwt') ──> JwtAuthGuard ──> GqlAuthGuard (GraphQL专用)
 
 AuthGuard ('jwt-refresh') ──> RTJwtAuthGuard (刷新专用)
          │
-         └─ 仅支持 Cookie 提取 ❌ （Desktop 不兼容）
+         └─ 仅支持 Cookie 提取 ⚠️ （Desktop 正常使用不兼容，边缘场景条件成功）
 ```
 
 ### 3.2 JwtAuthGuard - 主认证守卫（Web + Desktop 通用）
@@ -301,7 +301,9 @@ export class RTJwtStrategy extends PassportStrategy(Strategy, 'jwt-refresh') {
 1. `RTJwtStrategy` **只从 `request.cookies?.['refresh_token']` 提取**，不支持 `Authorization Header` 方式
 2. 没有 `extractFromAuthHeaders` 回退逻辑（与 `JwtStrategy` 形成鲜明对比）
 3. 后端没有任何中间件将 Header 中的 token 转换为 Cookie
-4. **直接后果**：Desktop 端 refresh 请求必然失败，详见第四章完整证据链
+4. **直接后果**：
+   - Desktop 端 refresh 请求在**正常使用场景下必然失败**（详见第四章场景 2）
+   - 仅在**用户手动添加 Cookie 到 Cookie Manager**的边缘场景下可能成功（详见第四章场景 3）
 
 ---
 
@@ -483,123 +485,134 @@ async refresh(
    │                              │
 ```
 
-#### Desktop 端 Refresh 流程（❌ 必然失败 - 代码级 Bug）
+#### Desktop 端 Refresh 流程分析（三类场景完整证据链）
 
-**代码证据链**：以下所有证据均来自实际代码，无推断成分。
+**Cookie 进入请求的入口分析**：
 
----
+在深入三类场景之前，首先明确 **Cookie 可能进入请求的所有入口：
 
-##### 证据 1：Desktop 端 refresh 请求只发送 Authorization Header
-
-**代码位置**：`packages/hoppscotch-selfhost-web/src/platform/auth/desktop/index.ts:221-260`
-
-```typescript
-async function refreshToken() {
-  const refreshToken = await persistenceService.getLocalConfig("refresh_token");
-  if (!refreshToken) return false;
-
-  const { response } = interceptorService.execute({
-    id: Date.now(),
-    url: `${import.meta.env.VITE_BACKEND_API_URL}/auth/refresh`,
-    method: "GET",
-    version: "HTTP/1.1",
-    headers: {
-      // ✅ 已验证：仅设置 Authorization Header
-      Authorization: `Bearer ${refreshToken}`,
-      // ❌ 未设置任何 Cookie
-    },
-  });
-
-  const res = await response;
-  if (E.isLeft(res)) return false;
-
-  await setAuthCookies(res.right.headers);  // 从 Set-Cookie 解析新令牌
-  return res.right.status === 200;
-}
-```
-
-**验证点**：请求 headers 中只有 `Authorization`，没有 `Cookie`。
+| 入口 | 触发条件 | 代码证据 |
+|--------|----------|----------|
+| 浏览器自动携带 | Web 端 + `withCredentials: true` | `web/index.ts:162` |
+| interceptorService cookieJar | Desktop 端 + Cookie Manager 中有匹配域名的 Cookie | `native/index.ts:188-196` |
+| 代码手动设置 | 直接在 headers 中设置 Cookie 头 | 当前代码中无此实现 |
 
 ---
 
-##### 证据 2：RTJwtStrategy 仅从 Cookie 提取 refresh_token
+### 场景 1：✅ 可正常工作 - Web 端 refresh 流程
 
-**代码位置**：`packages/hoppscotch-backend/src/auth/strategies/rt-jwt.strategy.ts:26-35`
+**触发条件**：Web 浏览器环境，用户已登录（浏览器中存在 HttpOnly Cookie）。
 
-```typescript
-jwtFromRequest: ExtractJwt.fromExtractors([
-  (request: Request) => {
-    // ✅ 已验证：仅从 request.cookies 提取
-    const RTCookie = request.cookies?.['refresh_token'];
-    if (!RTCookie) {
-      console.error('`refresh_token` not found');
-      throw new ForbiddenException(COOKIES_NOT_FOUND);
-    }
-    return RTCookie;
-  },
-]),
-```
+**完整证据链**：
 
-**验证点**：
-- 没有 `extractFromAuthHeaders` 调用
-- 没有 `O.alt(() => extractFromAuthHeaders(request))` 回退逻辑
-- 与 `JwtStrategy`（支持双提取）形成鲜明对比
+1. **Web 端发起请求**
+   **代码位置**：`packages/hoppscotch-selfhost-web/src/platform/auth/web/index.ts:152-173`
+   ```typescript
+   async function refreshToken() {
+     const res = await axios.get(
+       `${import.meta.env.VITE_BACKEND_API_URL}/auth/refresh`,
+       {
+         withCredentials: true,  // ✅ 浏览器自动携带 Cookie
+       }
+     );
+     return res.status === 200;
+   }
+   ```
 
----
+2. **RTJwtStrategy 提取成功
+   **代码位置**：`packages/hoppscotch-backend/src/auth/strategies/rt-jwt.strategy.ts:26-35`
+   ```typescript
+   const RTCookie = request.cookies?.['refresh_token'];
+   // ✅ 浏览器自动携带的 Cookie 被成功提取
+   ```
 
-##### 证据 3：后端无任何中间件将 Authorization Header 转换为 Cookie
+3. **验证通过，返回新令牌
+   **代码位置**：`packages/hoppscotch-backend/src/auth/auth.controller.ts:87-100`
+   ```typescript
+   authCookieHandler(res, newTokenPair.right, false, null, this.configService);
+   ```
 
-**代码位置**：`packages/hoppscotch-backend/src/main.ts`
-
-```typescript
-// ✅ 已验证：后端注册的中间件只有
-app.use(json({ limit: '100mb' }));       // JSON 解析
-app.use(cookieParser());                  // Cookie 解析
-app.use(morgan(...));                     // 日志
-app.useGlobalPipes(new ValidationPipe()); // 参数验证
-// ❌ 没有任何中间件将 Authorization Header 写入 request.cookies
-```
-
-**代码位置**：`packages/hoppscotch-backend/src/app.module.ts`
-
-```typescript
-// ✅ 已验证：后端全局提供者只有
-providers: [
-  { provide: 'APP_INTERCEPTOR', useClass: UserLastActiveOnInterceptor },
-  // ❌ 没有 APP_GUARD 或其他中间件处理 Header 到 Cookie 的转换
-]
-```
-
-**验证点**：没有任何代码将 `Authorization: Bearer <token>` 中的 token 写入 `request.cookies.refresh_token`。
+**验证结论**：✅ 可正常工作
 
 ---
 
-##### 证据 4：RTCookie 装饰器也仅从 Cookie 提取
+### 场景 2：❌ 必然失败 - Desktop 端 refresh 流程（正常使用场景）
 
-**代码位置**：`packages/hoppscotch-backend/src/decorators/rt-cookie.decorator.ts:7-11`
+**触发条件**：Desktop 应用环境，用户已登录（令牌存储在本地持久化存储中），**用户未在 Cookie Manager 中手动添加 refresh_token Cookie。
 
-```typescript
-export const RTCookie = createParamDecorator(
-  (data: unknown, context: ExecutionContext) => {
-    const ctx = GqlExecutionContext.create(context);
-    // ✅ 已验证：仅从 cookies 提取
-    return ctx.getContext().req.cookies['refresh_token'];
-  },
-);
-```
+**完整证据链**：
 
----
+1. **Desktop 端 refresh 请求只发送 Authorization Header
+   **代码位置**：`packages/hoppscotch-selfhost-web/src/platform/auth/desktop/index.ts:221-260`
+   ```typescript
+   async function refreshToken() {
+     const refreshToken = await persistenceService.getLocalConfig("refresh_token");
+     const { response } = interceptorService.execute({
+       url: `${import.meta.env.VITE_BACKEND_API_URL}/auth/refresh`,
+       headers: {
+         Authorization: `Bearer ${refreshToken}`,  // ✅ 仅设置 Authorization Header
+         // ❌ 未设置 Cookie
+       },
+     });
+   }
+   ```
+   **验证点**：请求 headers 中只有 `Authorization`，没有 `Cookie`。
 
-##### 结论：Desktop 端 refresh 必然失败
+2. **RTJwtStrategy 仅从 Cookie 提取 refresh_token
+   **代码位置**：`packages/hoppscotch-backend/src/auth/strategies/rt-jwt.strategy.ts:26-35`
+   ```typescript
+   jwtFromRequest: ExtractJwt.fromExtractors([
+     (request: Request) => {
+       // ✅ 仅从 request.cookies 提取
+       const RTCookie = request.cookies?.['refresh_token'];
+       if (!RTCookie) {
+         console.error('`refresh_token` not found');
+         throw new ForbiddenException(COOKIES_NOT_FOUND);
+       }
+       return RTCookie;
+     },
+   ]),
+   ```
+   **验证点**：没有 `extractFromAuthHeaders` 调用，没有回退逻辑。
 
-基于以上 4 条代码证据，Desktop 端 refresh 请求的完整路径：
+3. **后端无任何中间件将 Authorization Header 转换为 Cookie**
+   **代码位置**：`packages/hoppscotch-backend/src/main.ts`
+   ```typescript
+   app.use(json({ limit: '100mb' }));
+   app.use(cookieParser());
+   app.use(morgan(...));
+   app.useGlobalPipes(new ValidationPipe());
+   // ❌ 没有任何中间件将 Authorization Header 写入 request.cookies
+   ```
+   **代码位置**：`packages/hoppscotch-backend/src/app.module.ts`
+   ```typescript
+   providers: [
+     { provide: 'APP_INTERCEPTOR', useClass: UserLastActiveOnInterceptor },
+     // ❌ 没有 APP_GUARD 或其他中间件处理 Header 到 Cookie 的转换
+   ]
+   ```
 
+4. **认证令牌不会自动添加到 cookieJar**
+   **代码位置**：`packages/hoppscotch-common\src\services\cookie-jar.service.ts`
+   ```typescript
+   // cookieJar 是用户手动管理的测试用 Cookie 容器
+   // 正常登录流程不会将 refresh_token 添加到 cookieJar
+   ```
+   **验证点**：搜索代码库中没有 `cookieJar.addCookie` 或 `cookieJar\bulkApplyCookiesToDomain` 与 refresh_token 相关的调用。
+
+5. **RTCookie 装饰器也仅从 Cookie 提取
+   **代码位置**：`packages/hoppscotch-backend/src/decorators/rt-cookie.decorator.ts:7-11`
+   ```typescript
+   return ctx.getContext().req.cookies['refresh_token'];
+   ```
+
+**失败路径时序**：
 ```
 Desktop 端发起请求                        后端处理
    │                                        │
    │ GET /auth/refresh                      │
-   │ Authorization: Bearer <refresh_token>  │
-   │ (没有 Cookie)                          │
+   │ Authorization: Bearer <refresh_token>        │
+   │ (没有 Cookie，cookieJar 中也没有)    │
    │───────────────────────────────────────>│
    │                                        │
    │                                        │ 1. cookieParser() 解析 Cookie
@@ -619,17 +632,81 @@ Desktop 端发起请求                        后端处理
    │                                        │
 ```
 
-**失败原因**：
-1. Desktop 端只在 Authorization Header 中发送 refresh_token（证据 1）
-2. RTJwtStrategy 只从 Cookie 提取 refresh_token（证据 2）
-3. 没有任何中间件将 Authorization Header 转换为 Cookie（证据 3）
-4. RTCookie 装饰器也只从 Cookie 提取（证据 4）
+**失败原因总结**：
+1. Desktop 端只在 Authorization Header 中发送 refresh_token
+2. RTJwtStrategy 只从 Cookie 提取 refresh_token
+3. 没有任何中间件将 Authorization Header 转换为 Cookie
+4. 正常登录流程不会将 refresh_token 添加到 cookieJar
+5. RTCookie 装饰器也只从 Cookie 提取
 
-**无可用临时兼容方案**：当前代码架构中不存在任何可以使 Desktop refresh 正常工作的配置或开关。这是一个需要修改源代码才能修复的代码级 Bug。
+---
 
-**修复方向**：
-- 修改 `RTJwtStrategy`，增加 `extractFromAuthHeaders` 作为回退（参考 `JwtStrategy` 的实现）
-- 或添加中间件将 `Authorization: Bearer <refresh_token>` 中的 token 写入 `request.cookies.refresh_token`
+### 场景 3：⚠️ 条件成功 - Desktop 端 refresh 流程（用户手动添加 Cookie 到 Cookie Manager）
+
+**触发条件**（所有条件必须同时满足）：
+1. Desktop 应用环境，用户已登录
+2. 用户在 Cookie Manager 中**手动添加**了 `refresh_token` Cookie
+3. Cookie 的 **domain** 与后端 API 域名匹配
+4. Cookie 的 **path** 匹配 `/auth/refresh` 路径
+5. Cookie 未过期，secure 属性与协议匹配（http/https）
+
+**完整证据链**：
+
+1. **用户手动添加 Cookie 到 Cookie Manager**
+   用户操作：在 Hoppscotch Desktop 的 Cookie Manager 中手动添加：
+   - 名：`refresh_token`
+   - 值：`<从持久化存储中读取的 refresh_token>`
+   - 域：`<后端 API 域名>`
+   - 路径：`/` 或 `/auth`
+
+2. **interceptorService 自动从 cookieJar 添加 Cookie 到请求
+   **代码位置**：`packages/hoppscotch-common/src/platform/std/kernel-interceptors/native/index.ts:188-196`
+   ```typescript
+   const relevantCookies = this.cookieJar.getCookiesForURL(
+     new URL(effectiveRequest.url!)
+   )
+   if (relevantCookies.length > 0) {
+     effectiveRequest.headers!["Cookie"] = relevantCookies
+       .map((cookie) => `${cookie.name!}=${cookie.value!}`)
+       .join(";")
+   }
+   ```
+   ✅ 如果 cookieJar 中有匹配的 Cookie，会被自动添加到请求头。
+
+3. **RTJwtStrategy 提取成功**
+   **代码位置**：`packages/hoppscotch-backend/src/auth/strategies/rt-jwt.strategy.ts:28`
+   ```typescript
+   const RTCookie = request.cookies?.['refresh_token'];
+   // ✅ 从 cookieJar 添加的 Cookie 被成功提取
+   ```
+
+4. **验证通过，返回新令牌**
+   ✅ 刷新成功。
+
+**⚠️ 重要说明**：
+- 这是一个**非常边缘**的场景，不是设计的使用方式。
+- 用户需要知道 refresh_token 的值（需要从开发者工具或本地存储中读取）。
+- 用户需要手动配置 Cookie 的域、路径等参数。
+- 每次 refresh_token 轮换后，用户需要手动更新 Cookie Manager 中的值。
+- 实际使用中几乎不会出现这种场景。
+
+---
+
+### 三类场景对比表
+
+| 场景 | 触发条件 | 结果 | 代码证据 |
+|------|----------|------|----------|
+| ✅ 可正常工作 | Web 浏览器 + 已登录 | 成功 | `web/index.ts:162` + `rt-jwt.strategy.ts:28` |
+| ❌ 必然失败 | Desktop + 正常使用（未手动添加 Cookie | 失败 | `desktop/index.ts:232-233` + `rt-jwt.strategy.ts:28` + `main.ts:75` |
+| ⚠️ 条件成功 | Desktop + 用户手动在 Cookie Manager 中添加正确配置 refresh_token Cookie | 成功 | `native/index.ts:188-196` + `rt-jwt.strategy.ts:28` |
+
+---
+
+### 修复方向（针对场景 2 的必然失败）：
+
+1. **方案一**：修改 `RTJwtStrategy`，增加 `extractFromAuthHeaders` 作为回退（参考 `JwtStrategy` 的实现）
+2. **方案二**：添加中间件将 `Authorization: Bearer <refresh_token>` 中的 token 写入 `request.cookies.refresh_token`
+3. **方案三**：Desktop 端 refresh 时同时发送 Authorization Header 和 Cookie 头
 
 ### 4.5 后端刷新核心验证逻辑
 
@@ -850,7 +927,7 @@ async signOutUser() {
    │<─────────────────────────────│
 ```
 
-### 6.2 Desktop 端完整流程（❌ Refresh 必然失败）
+### 6.2 Desktop 端完整流程（❌ Refresh 正常使用必然失败）
 
 ```
 Desktop 应用                    后端
@@ -873,7 +950,7 @@ Desktop 应用                    后端
    │                              │
    │ 5. GET /auth/refresh         │
    │    Authorization: Bearer RT  │
-   │    (无 Cookie)                │
+   │    (无 Cookie，cookieJar 为空) │
    │─────────────────────────────>│
    │                              │
    │                              │ 6. RTJwtAuthGuard 拦截 ❌
@@ -884,16 +961,19 @@ Desktop 应用                    后端
    │                              │ 7. 返回 403 Forbidden
    │<─────────────────────────────│
    │                              │
-   │ 8. refresh 失败，触发重试保护     │
+   │ 8. refresh 失败，触发重试保护 │
    │    连续失败 3 次后登出         │
    │                              │
 ```
 
-**关键失败点说明**：
+**关键失败点说明**（正常使用场景）：
 - 步骤 6 中，RTJwtStrategy 只从 `request.cookies['refresh_token']` 提取
-- 但 Desktop 端的请求中没有 Cookie，只有 Authorization Header
+- Desktop 端的请求中只有 Authorization Header，没有 Cookie
+- cookieJar 中没有自动添加的 refresh_token
 - 没有任何中间件将 Header 中的 token 转移到 Cookie
 - 因此请求直接失败，无法进入后续的刷新流程
+
+**⚠️ 边缘例外**：如果用户手动在 Cookie Manager 中添加了正确配置的 refresh_token Cookie，且域/路径匹配，则 interceptorService 会自动将 Cookie 添加到请求头，刷新可能成功（详见 4.4 节场景 3）。
 
 ---
 
@@ -933,10 +1013,12 @@ Desktop 应用                    后端
 |------|-------------|----------------|
 | 会话载体 | HttpOnly Cookie | 本地持久化 + Auth Header |
 | Refresh 传递 | Cookie | Authorization Header |
-| Refresh 守卫兼容性 | ✅ 原生支持 | ❌ 完全不兼容（代码级 Bug） |
-| Refresh 失败原因 | 无 | RTJwtStrategy 只从 Cookie 提取，无中间件转换 |
+| Refresh 守卫兼容性（正常使用） | ✅ 原生支持 | ❌ 必然失败（正常使用） |
+| Refresh 守卫兼容性（特殊条件） | N/A | ⚠️ 条件成功（用户手动添加 Cookie 到 Cookie Manager） |
+| Refresh 失败原因（正常使用） | 无 | RTJwtStrategy 只从 Cookie 提取，无中间件转换，cookieJar 中无 token |
 | JS 令牌可见性 | ❌ 不可见 | ✅ 可见 |
 | 自动凭证携带 | ✅ 浏览器处理 | ❌ 代码手动注入 |
+| Cookie 进入请求的入口 | 浏览器自动携带 | 1. cookieJar 自动添加（用户手动管理）<br>2. 代码手动设置（当前未实现） |
 | Logout 后端行为 | 清除 Cookie | 清除 Cookie（无实际作用） |
 | Logout 前端行为 | 清除本地状态 | 清除本地 token + 状态 |
 
