@@ -416,32 +416,96 @@ const responseTime = Date.now() - startTime;  // 包含 delayInMs
 
 ## 七、Mock Examples 数据来源与写入流程（修正版）
 
-### 7.1 三个字段的关系（核心修正）
+### 7.1 字段关系与架构确认（核心修正）
 
-**重要结论：`mockExamples` 不是独立维护的字段，而是由数据库触发器自动从 `request.responses` 同步的派生字段。**
+**重要结论：`request` 和 `mockExamples` 是数据库中两个独立的列，`responses` 是 `request` JSON 列内部的内嵌结构。触发器将 `request.responses` 自动同步到 `mockExamples` 独立列。**
 
-| 字段 | 类型 | 用途 | 同步关系 | 被 mock 服务读取 |
-|-----|------|------|---------|----------------|
-| `request` | `Json` | 存储请求定义，内部嵌套 `responses` 字段保存响应历史 | **源字段** | ❌ |
-| `responses` | `Json?` | （已弃用）独立的响应保存字段 | - | ❌ |
-| `mockExamples` | `Json?` | Mock 服务专用的示例数据，格式 `{ examples: [...] }` | **目标字段，由触发器自动同步** | ✅ |
+#### 架构层级确认
 
-**数据库 schema 定义**（`schema.prisma:62-65, 183-186`）：
+```
+数据库表（UserRequest / TeamRequest）
+├─ 列1: `id`             (String)
+├─ 列2: `collectionID`   (String)
+├─ 列3: `request`        (Json)    ← 独立列，内部含 responses
+│  └─ {
+│       "method": "GET",
+│       "endpoint": "/v2/pet/<<petId>>",
+│       "responses": {              ← 内嵌结构，不是独立列
+│         "successful operation": {
+│           "code": 200,
+│           "body": "...",
+│           "originalRequest": {...}
+│         }
+│       }
+│     }
+├─ 列4: `mockExamples`   (Json?)   ← 独立列，由触发器同步生成
+│  └─ {
+│       "examples": [
+│         {"statusCode": 200, "responseBody": "...", ...}
+│       ]
+│     }
+└─ ...
+```
+
+#### 字段对比表
+
+| 名称 | 层级 | 类型 | 同步关系 | 被 mock 服务读取 | 代码证据 |
+|-----|------|------|---------|----------------|---------|
+| `request` | **独立列** | `Json` | **源列** | ❌ | `schema.prisma:185`（UserRequest）<br>`schema.prisma:64`（TeamRequest） |
+| `responses` | **request 内部内嵌字段** | - | 数据源（内嵌于 request） | ❌ | `migration.sql:111` `NEW.request->'responses'` |
+| `mockExamples` | **独立列** | `Json?` | **目标列，触发器自动同步** | ✅ | `schema.prisma:186`（UserRequest）<br>`schema.prisma:65`（TeamRequest） |
+
+#### 证据 1：数据库 schema 定义（`schema.prisma:180-195`）
+
 ```prisma
 model UserRequest {
-  // ...
-  request        Json
-  mockExamples   Json?  // ← 由触发器自动同步，mock 服务读取此字段
-  // ...
-}
-
-model TeamRequest {
-  // ...
-  request        Json
-  mockExamples   Json?  // ← 由触发器自动同步，mock 服务读取此字段
+  id             String         @id @default(cuid())
+  collectionID   String
+  userUid        String
+  title          String
+  request        Json           // ← 独立列（第 185 行）
+  mockExamples   Json?          // ← 独立列（第 186 行）
+  type           ReqType
+  orderIndex     Int
   // ...
 }
 ```
+
+**TeamRequest 同理**（`schema.prisma:59-73`）：
+```prisma
+model TeamRequest {
+  id           String         @id @default(cuid())
+  collectionID String
+  teamID       String
+  title        String
+  request      Json           // ← 独立列（第 64 行）
+  mockExamples Json?          // ← 独立列（第 65 行）
+  // ...
+}
+```
+
+#### 证据 2：migration 添加独立列（`migration.sql:82-88`）
+
+```sql
+-- Add mockExamples column to UserRequest
+ALTER TABLE "UserRequest" 
+ADD COLUMN "mockExamples" JSONB;   -- ← 作为独立列添加（第 84 行）
+
+-- Add mockExamples column to TeamRequest
+ALTER TABLE "TeamRequest" 
+ADD COLUMN "mockExamples" JSONB;   -- ← 作为独立列添加（第 88 行）
+```
+
+#### 证据 3：responses 是内嵌结构（`migration.sql:111-112`）
+
+触发器函数从 `NEW.request->'responses'` 读取数据，证明 `responses` 是 `request` JSON 内部的字段：
+
+```sql
+FROM jsonb_each(NEW.request->'responses') AS responses(key, value)
+WHERE jsonb_typeof(NEW.request->'responses') = 'object'
+```
+
+使用 `->` 操作符访问 JSON 内部字段，这是 PostgreSQL 访问 JSON 内嵌属性的标准语法。
 
 ---
 
@@ -449,67 +513,88 @@ model TeamRequest {
 
 **源码位置**：`migrations/20251016080714_mock_server/migration.sql:91-120`
 
-这是一个 PostgreSQL PL/pgSQL 触发器函数，在每次 INSERT 或 UPDATE request 字段时自动执行，将 `request.responses` 转换为 `mockExamples` 格式：
+这是一个 PostgreSQL PL/pgSQL 触发器函数，在每次 INSERT 或 UPDATE `request` 独立列时自动执行，将 `request` 列内部内嵌的 `responses` 结构转换为 `mockExamples` 独立列的格式。
+
+#### 同步函数完整代码
 
 ```sql
 CREATE OR REPLACE FUNCTION sync_mock_examples()
 RETURNS TRIGGER AS $$
 BEGIN
-  NEW."mockExamples" := jsonb_build_object(
+  NEW."mockExamples" := jsonb_build_object(                      -- 第 94 行：写入 mockExamples 独立列
     'examples',
     COALESCE(
       (
         SELECT jsonb_agg(
-          jsonb_build_object(
-            'key', key,
-            'name', value->>'name',
-            'endpoint', value->'originalRequest'->>'endpoint',
-            'method', value->'originalRequest'->>'method',
-            'headers', COALESCE(value->'originalRequest'->'headers', '[]'::jsonb),
-            'statusCode', (value->>'code')::int,
-            'statusText', value->>'status',
-            'responseBody', value->>'body',
-            'responseHeaders', COALESCE(value->'headers', '[]'::jsonb)
+          jsonb_build_object(                                    -- 第 98 行：构造每个示例
+            'key', key,                                          -- 第 100 行
+            'name', value->>'name',                              -- 第 101 行
+            'endpoint', value->'originalRequest'->>'endpoint',   -- 第 102 行
+            'method', value->'originalRequest'->>'method',       -- 第 103 行
+            'headers', COALESCE(value->'originalRequest'->'headers', '[]'::jsonb),  -- 第 104 行
+            'statusCode', (value->>'code')::int,                 -- 第 105 行
+            'statusText', value->>'status',                      -- 第 106 行
+            'responseBody', value->>'body',                      -- 第 107 行
+            'responseHeaders', COALESCE(value->'headers', '[]'::jsonb)  -- 第 108 行
           )
         )
-        FROM jsonb_each(NEW.request->'responses') AS responses(key, value)
-        WHERE jsonb_typeof(NEW.request->'responses') = 'object'
+        FROM jsonb_each(NEW.request->'responses') AS responses(key, value)  -- 第 111 行：从 request 内嵌字段读取
+        WHERE jsonb_typeof(NEW.request->'responses') = 'object'  -- 第 112 行
       ),
       '[]'::jsonb
     )
   );
   
-  RETURN NEW;
+  RETURN NEW;                                                     -- 第 118 行
 END;
 $$ LANGUAGE plpgsql;
 ```
 
-**函数逻辑拆解**：
+#### 函数逻辑拆解（含代码证据位置）
 
-| 步骤 | 操作 | 源码行 |
-|-----|------|--------|
-| 1 | 构造外层 `{ examples: [...] }` 对象 | 第94-95行 |
-| 2 | 从 `NEW.request->'responses'` 提取响应数据 | 第111行 |
-| 3 | 使用 `jsonb_each()` 将 object 转为行集 | 第111行 |
-| 4 | 对每个响应，调用 `jsonb_build_object()` 构造新格式 | 第98-109行 |
-| 5 | 使用 `jsonb_agg()` 聚合成数组 | 第98行 |
-| 6 | 使用 `COALESCE()` 处理空值，无 responses 时返回 `[]` | 第96-115行 |
-| 7 | 赋值给 `NEW."mockExamples"` | 第94行 |
-| 8 | 返回 `NEW` 以继续 INSERT/UPDATE | 第118行 |
+| 步骤 | 操作 | 源码位置 | 说明 |
+|-----|------|---------|------|
+| 1 | 构造外层 `{ examples: [...] }` 对象 | `migration.sql:94-95` | `jsonb_build_object('examples', ...)` |
+| 2 | **从 `request` 内嵌字段读取** | `migration.sql:111` | `NEW.request->'responses'` 使用 `->` 访问 JSON 内部字段 |
+| 3 | 将 responses object 转为行集 | `migration.sql:111` | `jsonb_each(NEW.request->'responses')` |
+| 4 | 对每个响应构造 mock 示例格式 | `migration.sql:98-109` | `jsonb_build_object()` 映射 9 个字段 |
+| 5 | 聚合成数组 | `migration.sql:98` | `jsonb_agg()` |
+| 6 | 处理空值 | `migration.sql:96-115` | `COALESCE(..., '[]'::jsonb)` 无 responses 时返回空数组 |
+| 7 | **写入 mockExamples 独立列** | `migration.sql:94` | `NEW."mockExamples" := ...` 赋值给独立列 |
+| 8 | 返回 NEW 继续操作 | `migration.sql:118` | `RETURN NEW;` |
 
-**字段映射表**：
+#### 字段映射表（含代码证据位置）
 
-| responses 路径 | mockExamples 字段 | 说明 |
-|---------------|-------------------|------|
-| `key`（jsonb_each 的 key） | `key` | 响应唯一标识 |
-| `value->>'name'` | `name` | 响应名称 |
-| `value->'originalRequest'->>'endpoint'` | `endpoint` | 端点 URL（含 `<<variable>>`） |
-| `value->'originalRequest'->>'method'` | `method` | HTTP 方法 |
-| `value->'originalRequest'->'headers'` | `headers` | **请求头**（用于匹配） |
-| `(value->>'code')::int` | `statusCode` | 响应状态码 |
-| `value->>'status'` | `statusText` | 状态文本 |
-| `value->>'body'` | `responseBody` | 响应体 |
-| `value->'headers'` | `responseHeaders` | **响应头**（用于返回） |
+| responses 路径（内嵌于 request） | mockExamples 字段（独立列） | 说明 | 源码位置 |
+|---------------------------------|-------------------|------|---------|
+| `key`（jsonb_each 输出） | `key` | 响应唯一标识 | `migration.sql:100` |
+| `value->>'name'` | `name` | 响应名称 | `migration.sql:101` |
+| `value->'originalRequest'->>'endpoint'` | `endpoint` | 端点 URL（含 `<<variable>>`） | `migration.sql:102` |
+| `value->'originalRequest'->>'method'` | `method` | HTTP 方法 | `migration.sql:103` |
+| `value->'originalRequest'->'headers'` | `headers` | **请求头**（用于匹配） | `migration.sql:104` |
+| `(value->>'code')::int` | `statusCode` | 响应状态码 | `migration.sql:105` |
+| `value->>'status'` | `statusText` | 状态文本 | `migration.sql:106` |
+| `value->>'body'` | `responseBody` | 响应体 | `migration.sql:107` |
+| `value->'headers'` | `responseHeaders` | **响应头**（用于返回） | `migration.sql:108` |
+
+#### 关键架构证据
+
+**证据 1：从内嵌结构读取**（`migration.sql:111`）
+```sql
+FROM jsonb_each(NEW.request->'responses') AS responses(key, value)
+```
+使用 `->` 操作符访问 JSON 内部字段，证明 `responses` 是 `request` JSON 列的内嵌属性，不是独立列。
+
+**证据 2：写入独立列**（`migration.sql:94`）
+```sql
+NEW."mockExamples" := jsonb_build_object(...)
+```
+直接赋值给 `NEW."mockExamples"`，这是数据库的独立列名。
+
+**证据 3：同步方向是单向的**
+- 仅在 `BEFORE INSERT OR UPDATE OF request` 时触发（见 7.3 节）
+- 没有反向触发器将 mockExamples 同步回 request.responses
+- 同步方向：`request.responses`（内嵌） → `mockExamples`（独立列）
 
 ---
 
@@ -517,7 +602,7 @@ $$ LANGUAGE plpgsql;
 
 **源码位置**：`migrations/20251016080714_mock_server/migration.sql:123-132`
 
-#### UserRequest 触发器
+#### UserRequest 触发器（`migration.sql:123-126`）
 ```sql
 CREATE TRIGGER trigger_sync_mock_examples_user_request
 BEFORE INSERT OR UPDATE OF request ON "UserRequest"
@@ -525,7 +610,7 @@ FOR EACH ROW
 EXECUTE FUNCTION sync_mock_examples();
 ```
 
-#### TeamRequest 触发器
+#### TeamRequest 触发器（`migration.sql:129-132`）
 ```sql
 CREATE TRIGGER trigger_sync_mock_examples_team_request
 BEFORE INSERT OR UPDATE OF request ON "TeamRequest"
@@ -533,24 +618,31 @@ FOR EACH ROW
 EXECUTE FUNCTION sync_mock_examples();
 ```
 
-**触发时机详解**：
+**触发时机详解（含代码证据）**：
 
-| 触发条件 | 说明 |
-|---------|------|
-| `BEFORE INSERT` | 插入新请求记录**之前**执行，mockExamples 随记录一起写入 |
-| `BEFORE UPDATE OF request` | 仅当 `request` 字段被更新时**之前**执行，其他字段更新不触发 |
-| `FOR EACH ROW` | 每行记录变更都独立执行一次 |
+| 触发条件 | 说明 | 源码位置 |
+|---------|------|---------|
+| `BEFORE INSERT` | 插入新请求记录**之前**执行，mockExamples 随记录一起写入 | `migration.sql:124, 130` |
+| `BEFORE UPDATE OF request` | 仅当 `request` **独立列**被更新时**之前**执行，其他字段更新不触发 | `migration.sql:124, 130` |
+| `FOR EACH ROW` | 每行记录变更都独立执行一次 | `migration.sql:125, 131` |
 
-**触发场景**：
+**触发场景（含代码证据）**：
 
-| 操作 | 是否触发 | 原因 |
-|-----|---------|------|
-| 创建新请求（`createRequest`） | ✅ | INSERT 触发 |
-| 更新请求内容（`updateRequest`） | ✅ | UPDATE OF request 触发 |
-| 导入集合（`importCollectionsFromJSON`） | ✅ | INSERT 触发 |
-| 仅更新 request 标题 | ❌ | 未修改 request 字段 |
-| 仅更新 request 的 orderIndex | ❌ | 未修改 request 字段 |
-| 直接修改 mockExamples 字段 | ❌ | 未修改 request 字段（不建议直接修改） |
+| 操作 | 是否触发 | 原因 | 代码证据 |
+|-----|---------|------|---------|
+| 创建新请求（`createRequest`） | ✅ | INSERT 操作触发 `BEFORE INSERT` | `user-request.service.ts:119-175` |
+| 更新请求内容（`updateRequest`） | ✅ | 更新 `request` 独立列触发 `BEFORE UPDATE OF request` | `user-request.service.ts:185-220` |
+| 导入集合（`importCollectionsFromJSON`） | ✅ | 批量 INSERT 触发 `BEFORE INSERT` | `user-collection.service.ts:1126-1231` |
+| 仅更新 request 标题 | ❌ | 未修改 `request` 独立列 | - |
+| 仅更新 request 的 orderIndex | ❌ | 未修改 `request` 独立列 | - |
+| 直接修改 mockExamples 独立列 | ❌ | 未修改 `request` 独立列（不建议） | - |
+
+**架构确认证据**：
+
+`BEFORE UPDATE OF request` 中的 `request` 是列名，证明：
+- `request` 是数据库的独立列（不是内嵌结构）
+- 只有当这个独立列被更新时才触发同步
+- `responses` 内嵌于 `request` JSON 列中，所以更新 `request.responses` 也会触发触发器
 
 ---
 
@@ -706,65 +798,84 @@ data: {
 
 ---
 
-### 7.7 完整同步链路总结
+### 7.7 完整同步链路总结（架构确认版）
 
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    responses → mockExamples 完整同步链路                    │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  1. 应用层写入                                                             │
-│     ├─ createRequest()         → 写入 request 字段                         │
-│     ├─ updateRequest()         → 更新 request 字段                         │
-│     └─ importCollectionsFromJSON() → 批量 INSERT request 字段              │
-│                                                                           │
-│  2. 数据库触发层                                                           │
-│     ├─ BEFORE INSERT                                                       │
-│     │   └─ trigger_sync_mock_examples_user_request                         │
-│     ├─ BEFORE UPDATE OF request                                            │
-│     │   └─ trigger_sync_mock_examples_user_request                         │
-│     └─ （TeamRequest 同理）                                                │
-│                                                                           │
-│  3. 同步函数执行（sync_mock_examples）                                     │
-│     ├─ 读取 NEW.request->'responses'                                       │
-│     ├─ jsonb_each() 展开为 (key, value) 行集                               │
-│     ├─ 对每个响应执行字段映射：                                             │
-│     │   responses.originalRequest.endpoint → mockExamples.endpoint        │
-│     │   responses.originalRequest.method   → mockExamples.method          │
-│     │   responses.originalRequest.headers  → mockExamples.headers         │
-│     │   responses.code                     → mockExamples.statusCode      │
-│     │   responses.status                   → mockExamples.statusText      │
-│     │   responses.body                     → mockExamples.responseBody    │
-│     │   responses.headers                  → mockExamples.responseHeaders │
-│     ├─ jsonb_agg() 聚合成数组                                               │
-│     ├─ 构造 { examples: [...] }                                            │
-│     └─ 赋值给 NEW.mockExamples                                              │
-│                                                                           │
-│  4. 数据持久化                                                             │
-│     └─ INSERT/UPDATE 记录（request + mockExamples 同时写入）                │
-│                                                                           │
-│  5. mock 服务读取                                                          │
-│     ├─ fetchRequestsWithExamples()                                         │
-│     │   └─ WHERE mockExamples IS NOT NULL                                  │
-│     ├─ findExampleByIdOrName()                                             │
-│     │   └─ 直接遍历 mockExamples.examples                                  │
-│     └─ fetchCandidateExamples()                                            │
-│         └─ 直接遍历 mockExamples.examples                                  │
-│                                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│           request.responses（内嵌） → mockExamples（独立列）完整同步链路            │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  1. 应用层写入（仅操作 request 独立列）                                            │
+│     ├─ createRequest()                 → 写入 request 独立列                     │
+│     │  源码：`user-request.service.ts:119-175`                                   │
+│     ├─ updateRequest()                 → 更新 request 独立列                     │
+│     │  源码：`user-request.service.ts:185-220`                                   │
+│     └─ importCollectionsFromJSON()     → 批量 INSERT request 独立列              │
+│        源码：`user-collection.service.ts:1126-1231`                              │
+│                                                                                 │
+│  2. 数据库触发层（监听 request 独立列变更）                                        │
+│     ├─ BEFORE INSERT ON UserRequest                                              │
+│     │  └─ trigger_sync_mock_examples_user_request                                │
+│     │     源码：`migration.sql:123-126`                                          │
+│     ├─ BEFORE UPDATE OF request ON UserRequest                                   │
+│     │  └─ trigger_sync_mock_examples_user_request                                │
+│     │     源码：`migration.sql:123-126`                                          │
+│     └─ （TeamRequest 同理）                                                      │
+│        源码：`migration.sql:129-132`                                             │
+│                                                                                 │
+│  3. 同步函数执行（sync_mock_examples）                                            │
+│     源码：`migration.sql:91-120`                                                 │
+│     ├─ 从内嵌结构读取：NEW.request->'responses'                                   │
+│     │  源码：`migration.sql:111`                                                 │
+│     ├─ jsonb_each() 展开为 (key, value) 行集                                      │
+│     ├─ 9 个字段映射转换（见 7.2 节字段映射表）                                    │
+│     ├─ jsonb_agg() 聚合成数组                                                     │
+│     ├─ 构造 { examples: [...] } 外层对象                                          │
+│     └─ 写入 mockExamples 独立列：NEW."mockExamples" := ...                        │
+│        源码：`migration.sql:94`                                                  │
+│                                                                                 │
+│  4. 数据持久化（两个独立列同时写入）                                               │
+│     └─ INSERT/UPDATE 记录                                                        │
+│        ├─ request 独立列：{ ..., "responses": {...} }                            │
+│        └─ mockExamples 独立列：{ "examples": [...] }                             │
+│                                                                                 │
+│  5. mock 服务读取（仅读取 mockExamples 独立列）                                    │
+│     ├─ fetchRequestsWithExamples()                                               │
+│     │  ├─ WHERE mockExamples IS NOT NULL                                         │
+│     │  │  源码：`mock-server.service.ts:814,824`                                 │
+│     │  └─ SELECT id, mockExamples                                                │
+│     │     源码：`mock-server.service.ts:817-818,827-828`                         │
+│     ├─ findExampleByIdOrName()                                                   │
+│     │  └─ 直接遍历 mockExamples.examples                                         │
+│     │     源码：`mock-server.service.ts:846-847`                                 │
+│     └─ fetchCandidateExamples()                                                  │
+│         └─ 直接遍历 mockExamples.examples                                         │
+│            源码：`mock-server.service.ts:903-904`                                │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**同步方向**：**单向同步** `request.responses` → `mockExamples`
+#### 同步方向确认（含代码证据）
 
-- ✅ 修改 request.responses 会自动更新 mockExamples
-- ❌ 修改 mockExamples 不会反向更新 request.responses
-- ⚠️ 不建议直接修改 mockExamples 字段
+**单向同步**：`request.responses`（内嵌结构） → `mockExamples`（独立列）
+
+| 操作 | 结果 | 代码证据 |
+|-----|------|---------|
+| 修改 `request.responses` | ✅ 自动更新 `mockExamples` | `migration.sql:124, 130` 触发器定义 |
+| 修改 `mockExamples` 独立列 | ❌ 不会反向同步到 `request.responses` | 无反向触发器 |
+| 建议操作方式 | 始终通过修改 `request` 独立列来间接更新 mockExamples | - |
+
+#### 架构设计优势
+
+1. **性能优化**：mock 服务查询时只需读取 `mockExamples` 独立列，无需解析 `request` JSON 的嵌套结构
+2. **数据一致性**：数据库触发器保证 `request.responses` 和 `mockExamples` 始终同步
+3. **架构解耦**：应用层和 mock 服务层完全解耦，应用层只需维护 `request` 格式，mock 服务层只需读取 `mockExamples` 格式
 
 ---
 
 ### 7.8 与 mock 服务读取路径的衔接
 
-mock 服务完全不需要感知同步机制，直接读取 mockExamples 字段即可：
+mock 服务完全不需要感知同步机制，直接读取 `mockExamples` 独立列即可：
 
 **`fetchRequestsWithExamples`**（`mock-server.service.ts:809-831`）：
 ```typescript
@@ -772,11 +883,11 @@ return mockServer.workspaceType === WorkspaceType.USER
   ? await this.prisma.userRequest.findMany({
       where: {
         collectionID: { in: collectionIds },
-        mockExamples: { not: null },  // ← 数据库级过滤
+        mockExamples: { not: null },  // ← 数据库级过滤独立列
       },
       select: {
         id: true,
-        mockExamples: true,  // ← 直接读取同步后的字段
+        mockExamples: true,  // ← 直接读取独立列，不读取 request 列
       },
     })
   : // team 同理
@@ -785,7 +896,7 @@ return mockServer.workspaceType === WorkspaceType.USER
 **`findExampleByIdOrName`**（`mock-server.service.ts:837-874`）：
 ```typescript
 for (const request of requests) {
-  const mockExamples = request.mockExamples as any;
+  const mockExamples = request.mockExamples as any;  // ← 从独立列读取
   if (mockExamples?.examples && Array.isArray(mockExamples.examples)) {
     for (const exampleData of mockExamples.examples) {
       // 直接使用同步后的数据，无需访问 request.responses
@@ -797,7 +908,7 @@ for (const request of requests) {
 **`fetchCandidateExamples`**（`mock-server.service.ts:879-925`）：
 ```typescript
 for (const request of requests) {
-  const mockExamples = request.mockExamples as any;
+  const mockExamples = request.mockExamples as any;  // ← 从独立列读取
   if (mockExamples?.examples && Array.isArray(mockExamples.examples)) {
     for (const exampleData of mockExamples.examples) {
       // 直接使用同步后的数据，无需访问 request.responses
@@ -805,6 +916,8 @@ for (const request of requests) {
   }
 }
 ```
+
+**架构证据**：mock 服务的查询中 `select` 子句只选择 `mockExamples` 独立列，不选择 `request` 列，证明 `mockExamples` 是完全独立的列，mock 服务不需要读取 `request` 列的任何内容。
 
 ---
 
