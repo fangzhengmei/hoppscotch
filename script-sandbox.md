@@ -860,8 +860,51 @@ if (originalOnTestPromise) {
 - 避免 QuickJS 上下文在异步回调完成前被销毁
 
 **前置脚本 vs 测试脚本差异**：
-- **前置脚本**：不使用 `keepAlivePromises`，同步执行完成即返回
-- **测试脚本**：使用 `keepAlivePromises` 等待所有异步操作
+
+| 特性 | 前置脚本（pre-request） | 测试脚本（test/post-request） |
+|------|------------------------|------------------------------|
+| **keepAlivePromises** | ❌ 不使用 | ✅ 使用 |
+| **异步回调状态捕获** | ❌ 不保证（可能丢失） | ✅ 保证（等待所有 Promise） |
+| **hopp.fetch().then()** | 回调可能在 capture 后执行，状态修改丢失 | 回调在 capture 前完成，状态修改保留 |
+| **执行完成时机** | 同步代码执行完成即返回 | 所有异步操作完成后返回 |
+
+**⚠️ 前置脚本异步限制重要说明**（代码位置：`src/cage-modules/scripting-modules.ts:401-409`）：
+
+```typescript
+// Only register keepAlive for post-request tests; 
+// pre-request scripts shouldn't block on this
+let testPromiseKeepAlive: Promise<void> | null = null
+if ((type as ModuleType) === "post") {
+  testPromiseKeepAlive = new Promise<void>((resolve, reject) => {
+    resolveKeepAlive = resolve
+    rejectKeepAlive = reject
+  })
+  ctx.keepAlivePromises.push(testPromiseKeepAlive)
+}
+```
+
+**问题场景**：
+```javascript
+// 前置脚本中的异步操作 - 环境变量设置可能丢失！
+hopp.fetch("https://api.example.com/config").then((res) => {
+  return res.json()
+}).then((data) => {
+  // ❌ 这个设置可能在 capture 之后才执行，不会生效！
+  hopp.env.set("authToken", data.token)
+})
+```
+
+**解决方案**：
+1. 前置脚本中使用同步代码
+2. 或使用顶层 await（仅 experimental 沙箱支持）：
+```javascript
+// ✅ 顶层 await 确保在 capture 前完成
+const res = await hopp.fetch("https://api.example.com/config")
+const data = await res.json()
+hopp.env.set("authToken", data.token)
+```
+
+> **注意**：顶层 await 仅在 experimental 沙箱中支持，legacy 沙箱不支持。
 
 ---
 
@@ -922,7 +965,251 @@ handleSandboxResults: ({ envs, request, cookies }) => {
 
 ---
 
-## 八、文件索引
+## 八、pm.request 可变性差异
+
+### 8.1 前置脚本（pre-request）：完全可修改
+
+**代码位置**：`src/bootstrap-code/pre-request.js:847-1100`
+
+```javascript
+// URL 可修改
+pm.request.url = "https://new.example.com/path"  // ✅ 支持
+
+// Method 可修改
+pm.request.method = "POST"  // ✅ 支持
+
+// Headers 可修改
+pm.request.headers.add({ key: "Authorization", value: "Bearer token" })  // ✅ 支持
+pm.request.headers.remove("X-Old-Header")  // ✅ 支持
+pm.request.headers.upsert({ key: "Content-Type", value: "application/json" })  // ✅ 支持
+
+// Body 可修改
+pm.request.body.update({ mode: "raw", raw: '{"key": "value"}' })  // ✅ 支持
+
+// Auth 可修改
+pm.request.auth.type = "bearer"  // ✅ 支持
+```
+
+**可修改属性完整列表**：
+
+| 属性 | getter | setter | 修改方法 |
+|-----|--------|--------|---------|
+| `url` | ✅ | ✅ | 直接赋值 `pm.request.url = "..."` |
+| `method` | ✅ | ✅ | 直接赋值 `pm.request.method = "POST"` |
+| `headers` | ✅ | ✅ | `add()` / `remove()` / `upsert()` / `clear()` |
+| `body` | ✅ | ✅ | `update()` / `setMode()` |
+| `auth` | ✅ | ✅ | 直接赋值 `pm.request.auth = {...}` |
+| `id` | ✅ | ❌ | 只读 |
+| `name` | ✅ | ❌ | 只读 |
+
+### 8.2 测试脚本（post-request）：只读
+
+**代码位置**：`src/bootstrap-code/post-request.js:2780-2950`
+
+```javascript
+// 注释明确说明：URL - Read-only with Postman-compatible structure (no setters in post-request)
+get url() {
+  const urlObj = {
+    // 只有 getter，没有 setter
+    toString: () => globalThis.hopp.request.url,
+    // ... 仅读方法
+  }
+  return urlObj
+}
+```
+
+**只读属性列表**：
+
+| 属性 | getter | setter | 说明 |
+|-----|--------|--------|------|
+| `url` | ✅ | ❌ | 仅可读取，尝试赋值静默失败或抛出错误 |
+| `method` | ✅ | ❌ | 仅可读取 |
+| `headers` | ✅ | ❌ | 只有 `get()` / `has()` / `toObject()` 等读方法 |
+| `body` | ✅ | ❌ | 仅可读取 |
+| `auth` | ✅ | ❌ | 仅可读取 |
+| `id` | ✅ | ❌ | 只读 |
+| `name` | ✅ | ❌ | 只读 |
+
+### 8.3 设计意图与差异原因
+
+**为什么测试脚本中 pm.request 是只读的？**
+
+| 原因 | 说明 |
+|-----|------|
+| **时序逻辑** | 测试脚本在请求发送后执行，此时请求已发出，修改请求参数无意义 |
+| **数据一致性** | 测试断言应该基于实际发送的请求，而不是修改后的请求 |
+| **职责分离** | 请求修改是前置脚本的职责，测试脚本专注于响应验证 |
+| **避免混淆** | 防止用户在测试脚本中修改请求后疑惑为什么实际请求没有变化 |
+
+> **⚠️ 注意**：虽然 `pm.request` 在测试脚本中是只读的，但 `hopp.request` 仍然可以调用 setter 方法（如 `hopp.request.setUrl()`），但这些修改只会影响沙箱内的状态，不会影响后续请求（除非通过环境变量传递）。
+
+---
+
+## 九、Experimental vs Legacy 执行路径能力边界
+
+### 9.1 两套执行路径对比
+
+| 特性 | Experimental（默认） | Legacy（向后兼容） |
+|-----|----------------------|-------------------|
+| **技术栈** | faraday-cage + QuickJS | 浏览器：Web Worker<br/>Node.js：isolated-vm |
+| **语法模式** | ESM Module（`sourceType: "module"`） | Script（`sourceType: "script"`） |
+| **顶层 `import`** | ✅ 支持 | ❌ 不支持（解析阶段报错） |
+| **顶层 `await`** | ✅ 支持 | ❌ 不支持（解析阶段报错） |
+| **动态 `import()`** | ✅ 支持 | ❌ 不支持 |
+| **命名空间** | `hopp` + `pw` + `pm`（完整） | 仅 `pw`（有限） |
+| **请求修改** | ✅ 支持（前置脚本） | ❌ 不支持 |
+| **Cookie 管理** | ✅ 支持（桌面端） | ❌ 不支持 |
+| `hopp.fetch()` | ✅ 支持 | ❌ 不支持 |
+| **加密 API** | ✅ 完整 Web Crypto | ❌ 不支持 |
+| **异步等待** | ✅ 测试脚本等待所有 Promise | ❌ 同步执行 |
+| **Chai 断言** | ✅ 完整 Chai 支持 | ✅ 基础断言支持 |
+
+### 9.2 Experimental 沙箱能力详解
+
+**支持的命名空间**：
+- `hopp`：Hoppscotch 原生 API，完整功能
+- `pw`：旧版兼容 API
+- `pm`：Postman 兼容层，完整 API
+
+**注入的全局 API**：
+- `console`：完整支持（log/error/warn/table/dir/group 等）
+- `fetch` / `Headers` / `Request` / `Response`：完整封装
+- `crypto` / `crypto.subtle`：Web Crypto API 完整支持
+- `Blob` / `URL` / `atob` / `btoa`：Polyfill
+- `setTimeout` / `setInterval`：定时器
+- `TextEncoder` / `TextDecoder`：编解码
+
+**语法预处理**（`src/utils/scripting.ts:38-53`）：
+```typescript
+const PARSE_OPTIONS = {
+  experimental: {
+    ecmaVersion: "latest",
+    sourceType: "module",           // ESM 模块模式
+    allowReturnOutsideFunction: true,
+  },
+  legacy: {
+    ecmaVersion: "latest",
+    sourceType: "script",           // 脚本模式
+    allowReturnOutsideFunction: true,
+  },
+}
+```
+
+### 9.3 Legacy 沙箱能力限制
+
+**Web Worker 实现**（`src/web/pre-request/worker.ts:6-30`）：
+```javascript
+// 仅注入 pw 命名空间
+const executeScript = new Function("pw", preRequestScript)
+executeScript(pw)
+```
+
+**Node.js isolated-vm 实现**（`src/node/pre-request/legacy.ts:39-57`）：
+```javascript
+// 通过 Proxy 包装 API，仅支持同步调用
+const finalScript = `
+  const pw = new Proxy(serializedAPIMethods, {
+    get: (pwObjTarget, pwObjProp) => {
+      // 仅支持 pw.env.* 等基础 API
+      // 所有方法通过 applySync 同步调用
+    }
+  })
+  ${preRequestScript}
+`
+```
+
+**Legacy 仅支持的 API**：
+```javascript
+// 环境变量（仅字符串值）
+pw.env.get(key)
+pw.env.set(key, value)
+pw.env.unset(key)
+pw.env.resolve(key)
+
+// 基础断言（测试脚本）
+pw.expect(value).toBe(expected)
+pw.expect(value).toBeType("string")
+pw.expect(value).toHaveLength(5)
+pw.expect(value).toInclude("foo")
+```
+
+### 9.4 import / await 约束详解
+
+**Experimental 路径 - import 处理流程**（`src/utils/scripting.ts:103-149`）：
+
+1. **提取顶层 import**：使用 Acorn 解析 AST，提取 `import` 和 `export ... from` 声明
+2. **去重相同 import**：相同的 import 语句只保留一个
+3. **冲突检测**：
+   - 同名导入来自不同源 → 抛出 `SyntaxError`
+   - 导入名称与保留名称冲突（`__hoppReporter`、`globalThis`）→ 抛出 `SyntaxError`
+4. **提升到模块顶层**：import 语句被提升到 IIFE 包装外部
+5. **主体包装**：脚本主体包装为 `async function()`，支持顶层 `await`
+
+**import 约束**：
+```javascript
+// ✅ 允许 - 命名导入
+import { parse } from "date-fns"
+
+// ✅ 允许 - 默认导入
+import moment from "moment"
+
+// ✅ 允许 - 副作用导入
+import "polyfill"
+
+// ✅ 允许 - 重导出
+export { parse } from "date-fns"
+
+// ✅ 允许 - 动态导入
+const module = await import("lodash")
+
+// ❌ 禁止 - 同名不同源（跨脚本冲突）
+// 脚本 1: import { v4 } from "uuid"
+// 脚本 2: import { v4 } from "uuid-v4" → 冲突！
+
+// ❌ 禁止 - 保留名称
+import { __hoppReporter } from "some-module" → 保留名称冲突！
+```
+
+**await 约束**：
+```javascript
+// ✅ 允许 - 顶层 await（experimental）
+const data = await hopp.fetch("/api/data").then(r => r.json())
+
+// ✅ 允许 - 函数内 await
+async function fetchData() {
+  const res = await hopp.fetch("/api/data")
+  return res.json()
+}
+
+// ✅ 允许 - Promise.all
+const [a, b] = await Promise.all([
+  hopp.fetch("/api/a"),
+  hopp.fetch("/api/b")
+])
+
+// ❌ 禁止 - 顶层 await（legacy）→ 解析阶段报错
+const data = await hopp.fetch("/api/data")
+```
+
+**语法预检查**（`src/web/test-runner/index.ts:223-236`）：
+```typescript
+// Pre-parse before sandbox spin-up so syntax errors surface as a friendly
+// host-side message. Each target uses the grammar that matches its eventual
+// executor: experimental → ESM module (top-level imports + await accepted);
+// legacy → script mode (top-level imports + await rejected).
+try {
+  parseScriptForSyntax(
+    testScript,
+    experimentalScriptingSandbox ? "experimental" : "legacy"
+  )
+} catch (e) {
+  // 友好的错误提示
+}
+```
+
+---
+
+## 十、文件索引（更新）
 
 | 功能 | 文件路径 |
 |------|----------|
@@ -934,10 +1221,15 @@ handleSandboxResults: ({ envs, request, cookies }) => {
 | 环境变量逻辑 | `src/utils/shared.ts` |
 | 前置脚本引导 | `src/bootstrap-code/pre-request.js` |
 | 测试脚本引导 | `src/bootstrap-code/post-request.js` |
+| 语法分析与 import 处理 | `src/utils/scripting.ts` |
 | Web 执行入口 | `src/web/pre-request/index.ts` |
 | Web 测试入口 | `src/web/test-runner/index.ts` |
+| Web Worker（Legacy） | `src/web/pre-request/worker.ts` |
+| Web 测试 Worker（Legacy） | `src/web/test-runner/worker.ts` |
 | Node 执行入口 | `src/node/pre-request/index.ts` |
 | Node 测试入口 | `src/node/test-runner/index.ts` |
+| Node Legacy（isolated-vm） | `src/node/pre-request/legacy.ts` |
+| Node 测试 Legacy | `src/node/test-runner/legacy.ts` |
 | Cage 管理 | `src/utils/cage.ts` |
 | 类型定义 | `src/types/index.ts` |
 | 沙箱标记 | `src/constants/sandbox-markers.ts` |
