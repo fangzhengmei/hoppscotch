@@ -414,44 +414,155 @@ const responseTime = Date.now() - startTime;  // 包含 delayInMs
 
 ---
 
-## 七、Mock Examples 数据来源与写入流程
+## 七、Mock Examples 数据来源与写入流程（修正版）
 
-### 7.1 三个独立的 JSON 字段对比
+### 7.1 三个字段的关系（核心修正）
 
-`UserRequest` 和 `TeamRequest` 表中存在三个独立的 JSON 字段，用途各不相同：
+**重要结论：`mockExamples` 不是独立维护的字段，而是由数据库触发器自动从 `request.responses` 同步的派生字段。**
 
-| 字段 | 类型 | 用途 | 被 mock 服务读取 |
-|-----|------|------|----------------|
-| `request` | `Json` | 存储请求定义（method/endpoint/headers/params/body 等），内部嵌套 `responses` 字段保存响应历史 | ❌ |
-| `responses` | `Json?` | （已弃用/迁移中）独立的响应保存字段 | ❌ |
-| `mockExamples` | `Json?` | **Mock 服务专用**的示例数据，格式 `{ examples: [...] }` | ✅ |
+| 字段 | 类型 | 用途 | 同步关系 | 被 mock 服务读取 |
+|-----|------|------|---------|----------------|
+| `request` | `Json` | 存储请求定义，内部嵌套 `responses` 字段保存响应历史 | **源字段** | ❌ |
+| `responses` | `Json?` | （已弃用）独立的响应保存字段 | - | ❌ |
+| `mockExamples` | `Json?` | Mock 服务专用的示例数据，格式 `{ examples: [...] }` | **目标字段，由触发器自动同步** | ✅ |
 
 **数据库 schema 定义**（`schema.prisma:62-65, 183-186`）：
 ```prisma
 model UserRequest {
   // ...
   request        Json
-  mockExamples   Json?  // ← mock 服务唯一读取的字段
+  mockExamples   Json?  // ← 由触发器自动同步，mock 服务读取此字段
   // ...
 }
 
 model TeamRequest {
   // ...
   request        Json
-  mockExamples   Json?  // ← mock 服务唯一读取的字段
+  mockExamples   Json?  // ← 由触发器自动同步，mock 服务读取此字段
   // ...
 }
 ```
 
-### 7.2 autoCreateRequestExample 导入数据映射流程
+---
 
-当用户创建 mock server 并勾选 "自动创建请求示例" 时，数据映射流程如下：
+### 7.2 sync_mock_examples() 自动同步函数（PostgreSQL）
+
+**源码位置**：`migrations/20251016080714_mock_server/migration.sql:91-120`
+
+这是一个 PostgreSQL PL/pgSQL 触发器函数，在每次 INSERT 或 UPDATE request 字段时自动执行，将 `request.responses` 转换为 `mockExamples` 格式：
+
+```sql
+CREATE OR REPLACE FUNCTION sync_mock_examples()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW."mockExamples" := jsonb_build_object(
+    'examples',
+    COALESCE(
+      (
+        SELECT jsonb_agg(
+          jsonb_build_object(
+            'key', key,
+            'name', value->>'name',
+            'endpoint', value->'originalRequest'->>'endpoint',
+            'method', value->'originalRequest'->>'method',
+            'headers', COALESCE(value->'originalRequest'->'headers', '[]'::jsonb),
+            'statusCode', (value->>'code')::int,
+            'statusText', value->>'status',
+            'responseBody', value->>'body',
+            'responseHeaders', COALESCE(value->'headers', '[]'::jsonb)
+          )
+        )
+        FROM jsonb_each(NEW.request->'responses') AS responses(key, value)
+        WHERE jsonb_typeof(NEW.request->'responses') = 'object'
+      ),
+      '[]'::jsonb
+    )
+  );
+  
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+**函数逻辑拆解**：
+
+| 步骤 | 操作 | 源码行 |
+|-----|------|--------|
+| 1 | 构造外层 `{ examples: [...] }` 对象 | 第94-95行 |
+| 2 | 从 `NEW.request->'responses'` 提取响应数据 | 第111行 |
+| 3 | 使用 `jsonb_each()` 将 object 转为行集 | 第111行 |
+| 4 | 对每个响应，调用 `jsonb_build_object()` 构造新格式 | 第98-109行 |
+| 5 | 使用 `jsonb_agg()` 聚合成数组 | 第98行 |
+| 6 | 使用 `COALESCE()` 处理空值，无 responses 时返回 `[]` | 第96-115行 |
+| 7 | 赋值给 `NEW."mockExamples"` | 第94行 |
+| 8 | 返回 `NEW` 以继续 INSERT/UPDATE | 第118行 |
+
+**字段映射表**：
+
+| responses 路径 | mockExamples 字段 | 说明 |
+|---------------|-------------------|------|
+| `key`（jsonb_each 的 key） | `key` | 响应唯一标识 |
+| `value->>'name'` | `name` | 响应名称 |
+| `value->'originalRequest'->>'endpoint'` | `endpoint` | 端点 URL（含 `<<variable>>`） |
+| `value->'originalRequest'->>'method'` | `method` | HTTP 方法 |
+| `value->'originalRequest'->'headers'` | `headers` | **请求头**（用于匹配） |
+| `(value->>'code')::int` | `statusCode` | 响应状态码 |
+| `value->>'status'` | `statusText` | 状态文本 |
+| `value->>'body'` | `responseBody` | 响应体 |
+| `value->'headers'` | `responseHeaders` | **响应头**（用于返回） |
+
+---
+
+### 7.3 触发器定义与触发时机
+
+**源码位置**：`migrations/20251016080714_mock_server/migration.sql:123-132`
+
+#### UserRequest 触发器
+```sql
+CREATE TRIGGER trigger_sync_mock_examples_user_request
+BEFORE INSERT OR UPDATE OF request ON "UserRequest"
+FOR EACH ROW
+EXECUTE FUNCTION sync_mock_examples();
+```
+
+#### TeamRequest 触发器
+```sql
+CREATE TRIGGER trigger_sync_mock_examples_team_request
+BEFORE INSERT OR UPDATE OF request ON "TeamRequest"
+FOR EACH ROW
+EXECUTE FUNCTION sync_mock_examples();
+```
+
+**触发时机详解**：
+
+| 触发条件 | 说明 |
+|---------|------|
+| `BEFORE INSERT` | 插入新请求记录**之前**执行，mockExamples 随记录一起写入 |
+| `BEFORE UPDATE OF request` | 仅当 `request` 字段被更新时**之前**执行，其他字段更新不触发 |
+| `FOR EACH ROW` | 每行记录变更都独立执行一次 |
+
+**触发场景**：
+
+| 操作 | 是否触发 | 原因 |
+|-----|---------|------|
+| 创建新请求（`createRequest`） | ✅ | INSERT 触发 |
+| 更新请求内容（`updateRequest`） | ✅ | UPDATE OF request 触发 |
+| 导入集合（`importCollectionsFromJSON`） | ✅ | INSERT 触发 |
+| 仅更新 request 标题 | ❌ | 未修改 request 字段 |
+| 仅更新 request 的 orderIndex | ❌ | 未修改 request 字段 |
+| 直接修改 mockExamples 字段 | ❌ | 未修改 request 字段（不建议直接修改） |
+
+---
+
+### 7.4 autoCreateRequestExample 导入数据映射流程（修正版）
+
+当用户创建 mock server 并勾选 "自动创建请求示例" 时，完整流程如下：
 
 ```
 用户勾选 autoCreateRequestExample: true
         ↓
 mockServerCollRequestExample(input.name)
-  └─ 生成传统 Hoppscotch 请求格式（含 responses 字段）
+  └─ 生成传统 Hoppscotch 请求格式（含 responses 字段，嵌套 originalRequest）
      源码位置：constants/mock-server-coll-request-example.ts:5-781
         ↓
 importCollectionsFromJSON(jsonString, user.uid, ...)
@@ -459,18 +570,30 @@ importCollectionsFromJSON(jsonString, user.uid, ...)
         ↓
 generatePrismaQueryObj(folder, userID, ...)
   源码位置：user-collection.service.ts:1065-1114
-  ├─ 遍历 folder.requests（即 mockServerCollRequestExample 的请求数组）
+  ├─ 遍历 folder.requests
   └─ 对每个请求 r，创建 Prisma create 数据：
      {
        title: r.name,
-       request: r,        // ← 整个 r 对象（含 responses）写入 request 字段
-       mockExamples: ,    // ← 未设置，保持 null（数据库默认值）
+       request: r,        // ← 含 responses.originalRequest
        orderIndex: index + 1,
-       ...
+       // ❗ 无需设置 mockExamples，触发器自动处理
      }
         ↓
-tx.userCollection.create({ data: { ...query, parent } })
+tx.userCollection.create(...)
   源码位置：user-collection.service.ts:1182-1186
+        ↓
+🔴 【数据库触发器自动执行】
+   trigger_sync_mock_examples_user_request
+   BEFORE INSERT ON "UserRequest"
+        ↓
+sync_mock_examples() 函数执行
+   ├─ 读取 NEW.request->'responses'
+   ├─ jsonb_each() 展开每个响应
+   ├─ 字段映射转换
+   ├─ 构造 { examples: [...] }
+   └─ 赋值给 NEW.mockExamples
+        ↓
+记录写入数据库（request + mockExamples 同时写入）
 ```
 
 **关键代码：请求记录创建**（`user-collection.service.ts:1093-1104`）：
@@ -480,23 +603,61 @@ requests: {
     title: r.name,
     user: { connect: { uid: userID } },
     type: reqType,
-    request: r,           // ⚠️ 仅将 r 写入 request 字段
+    request: r,           // ← 仅写入 request，触发器自动同步 mockExamples
     orderIndex: index + 1,
-    // ❗ 无 mockExamples 字段 —— 保持 null
+    // ✅ 无需手动设置 mockExamples
   })),
 },
 ```
 
-**导入后各字段状态**：
-- `request` 字段：包含完整的请求定义，内部有 `responses` 对象（含多个状态码的响应示例）
-- `mockExamples` 字段：`null`
-- 结果：**mock 服务此时还无法匹配到任何示例**
+**导入后各字段状态（已修正）**：
+- `request` 字段：包含完整的请求定义，内部有 `responses` 对象（每个响应含 `originalRequest`）
+- `mockExamples` 字段：**由触发器自动同步，格式为 `{ examples: [...] }`**
+- 结果：**mock 服务可以直接匹配到示例，无需额外转换步骤**
 
-### 7.3 mockExamples 字段的写入路径分析
+---
 
-经过全面代码搜索，**后端不存在专门的 mockExamples 写入接口**。写入路径分析如下：
+### 7.5 Backfill 历史数据处理
 
-#### 路径 1：后端 createRequest / updateRequest（不支持）
+**源码位置**：`migrations/20251016080714_mock_server/migration.sql:134-138`
+
+migration 在创建函数和触发器后，执行以下 SQL 回填历史数据：
+
+```sql
+-- Backfill existing data for UserRequest
+UPDATE "UserRequest" SET request = request WHERE request IS NOT NULL;
+
+-- Backfill existing data for TeamRequest
+UPDATE "TeamRequest" SET request = request WHERE request IS NOT NULL;
+```
+
+**Backfill 原理**：
+- `UPDATE ... SET request = request` 看似是"无操作"，但实际上会触发 `UPDATE OF request` 触发器
+- 对所有 `request IS NOT NULL` 的历史记录执行一次"假更新"
+- 触发器被触发，为所有历史记录生成 `mockExamples` 字段
+
+**Backfill 影响范围**：
+
+| 场景 | 处理方式 |
+|-----|---------|
+| migration 执行前已存在的请求 | ✅ 自动回填，生成 mockExamples |
+| migration 执行后新增/更新的请求 | ✅ 触发器实时同步 |
+| request 为 null 的请求 | ❌ 跳过，mockExamples 保持 null |
+
+**GIN 索引**（`migration.sql:140-142`）：
+```sql
+CREATE INDEX "idx_mock_examples_user_requests_gin" ON "UserRequest" USING GIN ("mockExamples");
+CREATE INDEX "idx_mock_examples_team_requests_gin" ON "TeamRequest" USING GIN ("mockExamples");
+```
+为 mockExamples 字段创建 GIN 索引，加速 JSONB 查询。
+
+---
+
+### 7.6 mockExamples 写入路径完整分析（修正版）
+
+**结论：后端不需要专门的 mockExamples 写入接口，数据库触发器自动处理所有同步。**
+
+#### 路径 1：后端 createRequest / updateRequest（✅ 自动支持）
 
 **`createRequest`**（`user-request.service.ts:119-175`）：
 ```typescript
@@ -504,11 +665,11 @@ return tx.userRequest.create({
   data: {
     collectionID,
     title,
-    request: jsonRequest.right,  // ← 仅写入 request 字段
+    request: jsonRequest.right,  // ← 写入 request 字段
     type: ReqType[type],
     orderIndex: lastUserRequest ? lastUserRequest.orderIndex + 1 : 1,
     userUid: user.uid,
-    // ❗ 无 mockExamples 字段
+    // ✅ 无需设置 mockExamples，触发器自动同步
   },
 });
 ```
@@ -517,40 +678,93 @@ return tx.userRequest.create({
 ```typescript
 data: {
   title,
-  request: jsonRequest,  // ← 仅更新 request 字段
-  // ❗ 无 mockExamples 字段
+  request: jsonRequest,  // ← 更新 request 字段，触发同步
+  // ✅ 无需设置 mockExamples，触发器自动同步
 },
 ```
 
-#### 路径 2：后端 GraphQL / REST 接口（不存在）
+#### 路径 2：后端导入接口（✅ 自动支持）
 
-搜索 `mock-server.resolver.ts` 和所有后端 mutation，未发现任何专门用于更新 mockExamples 的接口。mock server 的 mutation 仅支持：
-- `createMockServer` - 创建 mock server
-- `updateMockServer` - 更新 mock server 元数据（name/isActive/delayInMs/isPublic）
-- `deleteMockServer` - 删除 mock server
+**`importCollectionsFromJSON`**（`user-collection.service.ts:1126-1231`）：
+- 调用 `generatePrismaQueryObj()` 创建请求记录
+- INSERT 操作触发触发器，自动同步 mockExamples
+- **无需任何额外代码**
 
-#### 路径 3：前端写入（未发现）
+#### 路径 3：数据库直接操作（⚠️ 注意）
 
-搜索前端代码 `packages/hoppscotch-common/src`：
-- `newstore/mockServers.ts` - 仅管理 mock server 列表，不涉及 mockExamples
-- `composables/mockServer.ts` - 仅提供 mock server 状态查询
-- 无 `addMockExample` / `updateMockExample` 等 action
+- 直接 `UPDATE` 修改 `request` 字段：✅ 触发器自动同步
+- 直接 `UPDATE` 修改 `mockExamples` 字段：❌ 不会反向同步到 request.responses
+- **建议始终通过修改 request 字段来间接更新 mockExamples**
 
-#### 路径 4：数据库 schema 允许直接更新
+#### 路径 4：前端 UI（✅ 透明处理）
 
-虽然后端没有专门接口，但数据库 schema 中 `mockExamples` 是可写字段（`Json?`），理论上可以通过：
-1. 直接执行 SQL 更新
-2. 扩展后端接口（需自行开发）
+前端无需感知 mockExamples 字段：
+- 前端仅发送 `request` 对象（含 `responses`）
+- 后端接收后写入 `request` 字段
+- 数据库触发器自动完成同步
+- 前端无需修改任何代码
 
-**当前实际使用方式推测**：mockExamples 字段主要通过以下方式写入：
-- 测试用例中直接构造 mock 数据（如 `mock-server.service.spec.ts:1147-1148`）
-- 前端 UI 中通过通用的请求更新接口，将 mockExamples 作为 request 对象的一部分发送，后端需要扩展支持
+---
 
-### 7.4 responses 到 mockExamples 的转换流程分析
+### 7.7 完整同步链路总结
 
-**结论：当前代码库中不存在 responses 到 mockExamples 的自动转换流程。**
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                    responses → mockExamples 完整同步链路                    │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  1. 应用层写入                                                             │
+│     ├─ createRequest()         → 写入 request 字段                         │
+│     ├─ updateRequest()         → 更新 request 字段                         │
+│     └─ importCollectionsFromJSON() → 批量 INSERT request 字段              │
+│                                                                           │
+│  2. 数据库触发层                                                           │
+│     ├─ BEFORE INSERT                                                       │
+│     │   └─ trigger_sync_mock_examples_user_request                         │
+│     ├─ BEFORE UPDATE OF request                                            │
+│     │   └─ trigger_sync_mock_examples_user_request                         │
+│     └─ （TeamRequest 同理）                                                │
+│                                                                           │
+│  3. 同步函数执行（sync_mock_examples）                                     │
+│     ├─ 读取 NEW.request->'responses'                                       │
+│     ├─ jsonb_each() 展开为 (key, value) 行集                               │
+│     ├─ 对每个响应执行字段映射：                                             │
+│     │   responses.originalRequest.endpoint → mockExamples.endpoint        │
+│     │   responses.originalRequest.method   → mockExamples.method          │
+│     │   responses.originalRequest.headers  → mockExamples.headers         │
+│     │   responses.code                     → mockExamples.statusCode      │
+│     │   responses.status                   → mockExamples.statusText      │
+│     │   responses.body                     → mockExamples.responseBody    │
+│     │   responses.headers                  → mockExamples.responseHeaders │
+│     ├─ jsonb_agg() 聚合成数组                                               │
+│     ├─ 构造 { examples: [...] }                                            │
+│     └─ 赋值给 NEW.mockExamples                                              │
+│                                                                           │
+│  4. 数据持久化                                                             │
+│     └─ INSERT/UPDATE 记录（request + mockExamples 同时写入）                │
+│                                                                           │
+│  5. mock 服务读取                                                          │
+│     ├─ fetchRequestsWithExamples()                                         │
+│     │   └─ WHERE mockExamples IS NOT NULL                                  │
+│     ├─ findExampleByIdOrName()                                             │
+│     │   └─ 直接遍历 mockExamples.examples                                  │
+│     └─ fetchCandidateExamples()                                            │
+│         └─ 直接遍历 mockExamples.examples                                  │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
 
-#### 证据 1：mock 服务读取路径（直接读 mockExamples）
+**同步方向**：**单向同步** `request.responses` → `mockExamples`
+
+- ✅ 修改 request.responses 会自动更新 mockExamples
+- ❌ 修改 mockExamples 不会反向更新 request.responses
+- ⚠️ 不建议直接修改 mockExamples 字段
+
+---
+
+### 7.8 与 mock 服务读取路径的衔接
+
+mock 服务完全不需要感知同步机制，直接读取 mockExamples 字段即可：
 
 **`fetchRequestsWithExamples`**（`mock-server.service.ts:809-831`）：
 ```typescript
@@ -558,11 +772,11 @@ return mockServer.workspaceType === WorkspaceType.USER
   ? await this.prisma.userRequest.findMany({
       where: {
         collectionID: { in: collectionIds },
-        mockExamples: { not: null },  // ← 数据库级过滤，只查有 mockExamples 的
+        mockExamples: { not: null },  // ← 数据库级过滤
       },
       select: {
         id: true,
-        mockExamples: true,  // ← 只查询 mockExamples 字段
+        mockExamples: true,  // ← 直接读取同步后的字段
       },
     })
   : // team 同理
@@ -574,7 +788,7 @@ for (const request of requests) {
   const mockExamples = request.mockExamples as any;
   if (mockExamples?.examples && Array.isArray(mockExamples.examples)) {
     for (const exampleData of mockExamples.examples) {
-      // 直接从 mockExamples.examples 读取，不访问 request.responses
+      // 直接使用同步后的数据，无需访问 request.responses
     }
   }
 }
@@ -586,57 +800,11 @@ for (const request of requests) {
   const mockExamples = request.mockExamples as any;
   if (mockExamples?.examples && Array.isArray(mockExamples.examples)) {
     for (const exampleData of mockExamples.examples) {
-      // 直接从 mockExamples.examples 读取，不访问 request.responses
+      // 直接使用同步后的数据，无需访问 request.responses
     }
   }
 }
 ```
-
-#### 证据 2：全局搜索无转换代码
-
-搜索整个代码库 `"responses.*mockExamples|mockExamples.*responses|convert.*mock|parse.*mock"`，未发现任何转换逻辑。
-
-#### 两种格式对比
-
-**传统 responses 格式**（在 `request.responses` 内）：
-```json
-{
-  "responses": {
-    "successful operation": {
-      "code": 200,
-      "body": "{...}",
-      "header": [...]
-    }
-  }
-}
-```
-
-**mockExamples 格式**：
-```json
-{
-  "examples": [
-    {
-      "name": "successful operation",
-      "statusCode": 200,
-      "responseBody": "{...}",
-      "responseHeaders": [...],
-      "method": "GET",
-      "endpoint": "/v2/pet/<<petId>>"
-    }
-  ]
-}
-```
-
-**所需字段映射**（如果未来需要实现转换）：
-
-| responses 字段 | mockExamples 字段 |
-|---------------|-------------------|
-| key（如 "successful operation"） | `name` |
-| `code` | `statusCode` |
-| `body` | `responseBody` |
-| `header` | `responseHeaders` |
-| （需从父 request 取） | `method` |
-| （需从父 request 取） | `endpoint` |
 
 ---
 
@@ -694,10 +862,10 @@ if (!isSubdomainAccess) {
 
 ### 8.4 关于自动创建示例的说明
 
-`mockServerCollRequestExample()`（`constants/mock-server-coll-request-example.ts`）定义的是**传统 Hoppscotch 请求格式**，使用的是 `responses` 字段而非 `mockExamples` 字段。这个文件的作用是：
+`mockServerCollRequestExample()`（`constants/mock-server-coll-request-example.ts`）定义的是**传统 Hoppscotch 请求格式**，使用的是 `responses` 字段（嵌套 `originalRequest`）。这个文件的作用是：
 
 1. 当用户勾选"自动创建请求示例"时，导入这个集合作为起点模板
-2. **导入后 mockExamples 字段为 null**，需要额外的转换步骤才能被 mock 服务使用
+2. **导入后触发器自动同步 mockExamples 字段**，mock 服务可直接使用
 3. 导入的集合包含 6 个示例请求（见下表）
 
 | 请求名称 | 方法 | 端点 | 状态码示例 |
@@ -786,12 +954,17 @@ handleMockRequest(mockServer, path, method, query, headers)
 | 主处理流程 | `mock-server.service.ts:698-800` |
 | 响应时间统计 | `mock-server-logging.interceptor.ts:23, 56` |
 | Example 接口定义 | `mock-server.service.ts:884-896` |
-| **（新增）autoCreateRequestExample 导入 | `mock-server.service.ts:328-334` |
-| **（新增）generatePrismaQueryObj 请求创建 | `user-collection.service.ts:1093-1104` |
-| **（新增）importCollectionsFromJSON 主流程 | `user-collection.service.ts:1126-1231` |
-| **（新增）createRequest（不处理 mockExamples | `user-request.service.ts:119-175` |
-| **（新增）updateRequest（不处理 mockExamples | `user-request.service.ts:185-220` |
-| **（新增）fetchRequestsWithExamples | `mock-server.service.ts:809-831` |
-| **（新增）findExampleByIdOrName | `mock-server.service.ts:837-874` |
-| **（新增）fetchCandidateExamples | `mock-server.service.ts:879-925` |
-| **（新增）mockExamples 数据库 schema | `schema.prisma:62-65, 183-186` |
+| autoCreateRequestExample 导入 | `mock-server.service.ts:328-334` |
+| generatePrismaQueryObj 请求创建 | `user-collection.service.ts:1093-1104` |
+| importCollectionsFromJSON 主流程 | `user-collection.service.ts:1126-1231` |
+| createRequest（触发同步） | `user-request.service.ts:119-175` |
+| updateRequest（触发同步） | `user-request.service.ts:185-220` |
+| fetchRequestsWithExamples | `mock-server.service.ts:809-831` |
+| findExampleByIdOrName | `mock-server.service.ts:837-874` |
+| fetchCandidateExamples | `mock-server.service.ts:879-925` |
+| mockExamples 数据库 schema | `schema.prisma:62-65, 183-186` |
+| **sync_mock_examples 触发器函数 | `migrations/20251016080714_mock_server/migration.sql:91-120` |
+| **UserRequest 触发器定义 | `migrations/20251016080714_mock_server/migration.sql:123-126` |
+| **TeamRequest 触发器定义 | `migrations/20251016080714_mock_server/migration.sql:129-132` |
+| **Backfill 历史数据 | `migrations/20251016080714_mock_server/migration.sql:134-138` |
+| **GIN 索引创建 | `migrations/20251016080714_mock_server/migration.sql:140-142` |
