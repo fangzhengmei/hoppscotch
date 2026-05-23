@@ -414,9 +414,235 @@ const responseTime = Date.now() - startTime;  // 包含 delayInMs
 
 ---
 
-## 七、示例数据合成响应
+## 七、Mock Examples 数据来源与写入流程
 
-### 7.1 响应头处理
+### 7.1 三个独立的 JSON 字段对比
+
+`UserRequest` 和 `TeamRequest` 表中存在三个独立的 JSON 字段，用途各不相同：
+
+| 字段 | 类型 | 用途 | 被 mock 服务读取 |
+|-----|------|------|----------------|
+| `request` | `Json` | 存储请求定义（method/endpoint/headers/params/body 等），内部嵌套 `responses` 字段保存响应历史 | ❌ |
+| `responses` | `Json?` | （已弃用/迁移中）独立的响应保存字段 | ❌ |
+| `mockExamples` | `Json?` | **Mock 服务专用**的示例数据，格式 `{ examples: [...] }` | ✅ |
+
+**数据库 schema 定义**（`schema.prisma:62-65, 183-186`）：
+```prisma
+model UserRequest {
+  // ...
+  request        Json
+  mockExamples   Json?  // ← mock 服务唯一读取的字段
+  // ...
+}
+
+model TeamRequest {
+  // ...
+  request        Json
+  mockExamples   Json?  // ← mock 服务唯一读取的字段
+  // ...
+}
+```
+
+### 7.2 autoCreateRequestExample 导入数据映射流程
+
+当用户创建 mock server 并勾选 "自动创建请求示例" 时，数据映射流程如下：
+
+```
+用户勾选 autoCreateRequestExample: true
+        ↓
+mockServerCollRequestExample(input.name)
+  └─ 生成传统 Hoppscotch 请求格式（含 responses 字段）
+     源码位置：constants/mock-server-coll-request-example.ts:5-781
+        ↓
+importCollectionsFromJSON(jsonString, user.uid, ...)
+  源码位置：user-collection.service.ts:1126-1231
+        ↓
+generatePrismaQueryObj(folder, userID, ...)
+  源码位置：user-collection.service.ts:1065-1114
+  ├─ 遍历 folder.requests（即 mockServerCollRequestExample 的请求数组）
+  └─ 对每个请求 r，创建 Prisma create 数据：
+     {
+       title: r.name,
+       request: r,        // ← 整个 r 对象（含 responses）写入 request 字段
+       mockExamples: ,    // ← 未设置，保持 null（数据库默认值）
+       orderIndex: index + 1,
+       ...
+     }
+        ↓
+tx.userCollection.create({ data: { ...query, parent } })
+  源码位置：user-collection.service.ts:1182-1186
+```
+
+**关键代码：请求记录创建**（`user-collection.service.ts:1093-1104`）：
+```typescript
+requests: {
+  create: folder.requests.map((r, index) => ({
+    title: r.name,
+    user: { connect: { uid: userID } },
+    type: reqType,
+    request: r,           // ⚠️ 仅将 r 写入 request 字段
+    orderIndex: index + 1,
+    // ❗ 无 mockExamples 字段 —— 保持 null
+  })),
+},
+```
+
+**导入后各字段状态**：
+- `request` 字段：包含完整的请求定义，内部有 `responses` 对象（含多个状态码的响应示例）
+- `mockExamples` 字段：`null`
+- 结果：**mock 服务此时还无法匹配到任何示例**
+
+### 7.3 mockExamples 字段的写入路径分析
+
+经过全面代码搜索，**后端不存在专门的 mockExamples 写入接口**。写入路径分析如下：
+
+#### 路径 1：后端 createRequest / updateRequest（不支持）
+
+**`createRequest`**（`user-request.service.ts:119-175`）：
+```typescript
+return tx.userRequest.create({
+  data: {
+    collectionID,
+    title,
+    request: jsonRequest.right,  // ← 仅写入 request 字段
+    type: ReqType[type],
+    orderIndex: lastUserRequest ? lastUserRequest.orderIndex + 1 : 1,
+    userUid: user.uid,
+    // ❗ 无 mockExamples 字段
+  },
+});
+```
+
+**`updateRequest`**（`user-request.service.ts:185-220`）：
+```typescript
+data: {
+  title,
+  request: jsonRequest,  // ← 仅更新 request 字段
+  // ❗ 无 mockExamples 字段
+},
+```
+
+#### 路径 2：后端 GraphQL / REST 接口（不存在）
+
+搜索 `mock-server.resolver.ts` 和所有后端 mutation，未发现任何专门用于更新 mockExamples 的接口。mock server 的 mutation 仅支持：
+- `createMockServer` - 创建 mock server
+- `updateMockServer` - 更新 mock server 元数据（name/isActive/delayInMs/isPublic）
+- `deleteMockServer` - 删除 mock server
+
+#### 路径 3：前端写入（未发现）
+
+搜索前端代码 `packages/hoppscotch-common/src`：
+- `newstore/mockServers.ts` - 仅管理 mock server 列表，不涉及 mockExamples
+- `composables/mockServer.ts` - 仅提供 mock server 状态查询
+- 无 `addMockExample` / `updateMockExample` 等 action
+
+#### 路径 4：数据库 schema 允许直接更新
+
+虽然后端没有专门接口，但数据库 schema 中 `mockExamples` 是可写字段（`Json?`），理论上可以通过：
+1. 直接执行 SQL 更新
+2. 扩展后端接口（需自行开发）
+
+**当前实际使用方式推测**：mockExamples 字段主要通过以下方式写入：
+- 测试用例中直接构造 mock 数据（如 `mock-server.service.spec.ts:1147-1148`）
+- 前端 UI 中通过通用的请求更新接口，将 mockExamples 作为 request 对象的一部分发送，后端需要扩展支持
+
+### 7.4 responses 到 mockExamples 的转换流程分析
+
+**结论：当前代码库中不存在 responses 到 mockExamples 的自动转换流程。**
+
+#### 证据 1：mock 服务读取路径（直接读 mockExamples）
+
+**`fetchRequestsWithExamples`**（`mock-server.service.ts:809-831`）：
+```typescript
+return mockServer.workspaceType === WorkspaceType.USER
+  ? await this.prisma.userRequest.findMany({
+      where: {
+        collectionID: { in: collectionIds },
+        mockExamples: { not: null },  // ← 数据库级过滤，只查有 mockExamples 的
+      },
+      select: {
+        id: true,
+        mockExamples: true,  // ← 只查询 mockExamples 字段
+      },
+    })
+  : // team 同理
+```
+
+**`findExampleByIdOrName`**（`mock-server.service.ts:837-874`）：
+```typescript
+for (const request of requests) {
+  const mockExamples = request.mockExamples as any;
+  if (mockExamples?.examples && Array.isArray(mockExamples.examples)) {
+    for (const exampleData of mockExamples.examples) {
+      // 直接从 mockExamples.examples 读取，不访问 request.responses
+    }
+  }
+}
+```
+
+**`fetchCandidateExamples`**（`mock-server.service.ts:879-925`）：
+```typescript
+for (const request of requests) {
+  const mockExamples = request.mockExamples as any;
+  if (mockExamples?.examples && Array.isArray(mockExamples.examples)) {
+    for (const exampleData of mockExamples.examples) {
+      // 直接从 mockExamples.examples 读取，不访问 request.responses
+    }
+  }
+}
+```
+
+#### 证据 2：全局搜索无转换代码
+
+搜索整个代码库 `"responses.*mockExamples|mockExamples.*responses|convert.*mock|parse.*mock"`，未发现任何转换逻辑。
+
+#### 两种格式对比
+
+**传统 responses 格式**（在 `request.responses` 内）：
+```json
+{
+  "responses": {
+    "successful operation": {
+      "code": 200,
+      "body": "{...}",
+      "header": [...]
+    }
+  }
+}
+```
+
+**mockExamples 格式**：
+```json
+{
+  "examples": [
+    {
+      "name": "successful operation",
+      "statusCode": 200,
+      "responseBody": "{...}",
+      "responseHeaders": [...],
+      "method": "GET",
+      "endpoint": "/v2/pet/<<petId>>"
+    }
+  ]
+}
+```
+
+**所需字段映射**（如果未来需要实现转换）：
+
+| responses 字段 | mockExamples 字段 |
+|---------------|-------------------|
+| key（如 "successful operation"） | `name` |
+| `code` | `statusCode` |
+| `body` | `responseBody` |
+| `header` | `responseHeaders` |
+| （需从父 request 取） | `method` |
+| （需从父 request 取） | `endpoint` |
+
+---
+
+## 八、示例数据合成响应
+
+### 8.1 响应头处理
 
 **安全头黑名单**（`mock-server.controller.ts:19-25`）防止 XSS 攻击：
 ```typescript
@@ -439,7 +665,7 @@ if (!isSubdomainAccess && ACTIVE_CONTENT_TYPES.has(mimeType)) {
 }
 ```
 
-### 7.2 响应格式自动检测
+### 8.2 响应格式自动检测
 
 `MockServerController.handleMockRequest()`（`mock-server.controller.ts:157-176`）：
 
@@ -455,7 +681,7 @@ if (!res.getHeader('Content-Type')) {
 }
 ```
 
-### 7.3 安全头注入
+### 8.3 安全头注入
 
 无论用户是否定义，都会自动注入安全头（`mock-server.controller.ts:177-182`）：
 ```typescript
@@ -466,13 +692,13 @@ if (!isSubdomainAccess) {
 }
 ```
 
-### 7.4 关于自动创建示例的说明
+### 8.4 关于自动创建示例的说明
 
 `mockServerCollRequestExample()`（`constants/mock-server-coll-request-example.ts`）定义的是**传统 Hoppscotch 请求格式**，使用的是 `responses` 字段而非 `mockExamples` 字段。这个文件的作用是：
 
 1. 当用户勾选"自动创建请求示例"时，导入这个集合作为起点模板
-2. 用户需要在 UI 中手动将 `responses` 转换为 `mockExamples` 才能被 mock 服务使用
-3. 导入的集合包含 6 个示例请求（见下表），但需要手动启用 mock
+2. **导入后 mockExamples 字段为 null**，需要额外的转换步骤才能被 mock 服务使用
+3. 导入的集合包含 6 个示例请求（见下表）
 
 | 请求名称 | 方法 | 端点 | 状态码示例 |
 |---------|------|------|-----------|
@@ -485,7 +711,7 @@ if (!isSubdomainAccess) {
 
 ---
 
-## 八、完整匹配流程（修正版）
+## 九、完整匹配流程（修正版）
 
 ```
 handleMockRequest(mockServer, path, method, query, headers)
@@ -534,7 +760,7 @@ handleMockRequest(mockServer, path, method, query, headers)
 
 ---
 
-## 九、关键优化点
+## 十、关键优化点
 
 1. **单次数据库查询**：`fetchRequestsWithExamples()` 一次性获取所有候选请求，避免 N+1 查询
 2. **快速路径预检查**：`couldPathMatch()` 在评分前过滤 80% 不可能匹配的示例
@@ -545,7 +771,7 @@ handleMockRequest(mockServer, path, method, query, headers)
 
 ---
 
-## 十、代码引用速查
+## 十一、代码引用速查
 
 | 功能 | 文件位置 |
 |-----|---------|
@@ -560,3 +786,12 @@ handleMockRequest(mockServer, path, method, query, headers)
 | 主处理流程 | `mock-server.service.ts:698-800` |
 | 响应时间统计 | `mock-server-logging.interceptor.ts:23, 56` |
 | Example 接口定义 | `mock-server.service.ts:884-896` |
+| **（新增）autoCreateRequestExample 导入 | `mock-server.service.ts:328-334` |
+| **（新增）generatePrismaQueryObj 请求创建 | `user-collection.service.ts:1093-1104` |
+| **（新增）importCollectionsFromJSON 主流程 | `user-collection.service.ts:1126-1231` |
+| **（新增）createRequest（不处理 mockExamples | `user-request.service.ts:119-175` |
+| **（新增）updateRequest（不处理 mockExamples | `user-request.service.ts:185-220` |
+| **（新增）fetchRequestsWithExamples | `mock-server.service.ts:809-831` |
+| **（新增）findExampleByIdOrName | `mock-server.service.ts:837-874` |
+| **（新增）fetchCandidateExamples | `mock-server.service.ts:879-925` |
+| **（新增）mockExamples 数据库 schema | `schema.prisma:62-65, 183-186` |
