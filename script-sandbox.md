@@ -787,89 +787,76 @@ return E.right({
 
 ---
 
-### 5.3 关键特性
+### 5.3 keepAlive 异步等待机制（完整校正版）
 
-| 特性 | 说明 |
-|------|------|
-| **无隐式共享** | 每次脚本执行使用独立的 QuickJS 上下文，沙箱内全局变量不跨请求 |
-| **显式传递** | 只有 `envs` 和 `cookies` 通过返回值显式传递 |
-| **深拷贝隔离** | 进入沙箱的所有数据都经过 `cloneDeep`，避免引用共享 |
-| **异步等待** | 通过 `keepAlivePromises` 等待异步操作完成后再捕获结果 |
+#### ⚠️ 之前的错误结论修正
 
-**异步等待实现**：
+| 错误结论 | 正确结论 |
+|---------|---------|
+| ❌ pre-request 不使用 keepAlivePromises | ✅ pre-request 使用 `customFetchModule` 的 keepAlivePromise 等待 fetch 完成 |
+| ❌ 顶层 await 仅测试脚本支持 | ✅ 顶层 await 在两种场景下都被完整支持（ESM module 模式） |
+| ❌ `fetch().then()` 中 env.set 一定会丢失 | ✅ 50ms 宽限期内的回调会被捕获，长链/延迟回调可能丢失 |
+
+---
+
+#### 5.3.1 keepAlive 负责模块与 Promise 范围
+
+**两个独立模块负责添加 keepAlivePromises**：
+
+| 模块 | 适用场景 | 等待范围 | 代码位置 |
+|-----|---------|---------|----------|
+| **`customFetchModule`** | pre-request + test script | 所有 `hopp.fetch()` 操作 + 50ms 宽限期 | `src/cage-modules/fetch.ts:35-62` |
+| **`postRequestModule`** | 仅 test script | 测试执行链 + 旧风格 testPromises | `src/cage-modules/scripting-modules.ts:403-409` |
+
+---
+
+#### 5.3.2 customFetchModule 的 keepAlive 机制（所有场景）
+
+**代码实现**（`src/cage-modules/fetch.ts:35-62`）：
 ```typescript
-// 代码位置：src/cage-modules/scripting-modules.ts:396-409
-if (type === "post") {
-  testPromiseKeepAlive = new Promise<void>((resolve, reject) => {
-    resolveKeepAlive = resolve
-    rejectKeepAlive = reject
-  })
-  ctx.keepAlivePromises.push(testPromiseKeepAlive)
-}
-```
+// Track pending async operations
+const pendingOperations: Promise<unknown>[] = []
+let resolveKeepAlive: (() => void) | null = null
 
-#### keepAlivePromises 完整工作机制
-
-**测试脚本异步执行链**（`src/cage-modules/scripting-modules.ts:524-563`）：
-```typescript
-ctx.afterScriptExecutionHooks.push(async () => {
-  try {
-    // 1. 等待引导代码返回的测试执行链 Promise
-    if (testExecutionChainPromise) {
-      const resolvedPromise = ctx.vm.resolvePromise(testExecutionChainPromise)
-      const awaitResult = await resolvedPromise
-      // 处理执行错误
-    }
-    
-    // 2. 等待所有旧风格测试 Promise（向后兼容）
-    if (testPromises.length > 0) {
-      await Promise.allSettled(testPromises)
-    }
-    
-    resolveKeepAlive?.()
-  } catch (error) {
-    rejectKeepAlive?.(error)
-  }
+// Create keepAlive promise BEFORE registering hook
+const keepAlivePromise = new Promise<void>((resolve) => {
+  resolveKeepAlive = resolve
 })
-```
 
-**Promise 追踪机制**：
-```typescript
-// 代码位置：src/cage-modules/scripting-modules.ts:411-419
-const originalOnTestPromise = (config as PostRequestModuleConfig).onTestPromise
-if (originalOnTestPromise) {
-  ;(config as PostRequestModuleConfig).onTestPromise = (promise) => {
-    testPromises.push(promise)  // 追踪所有测试 Promise
-    originalOnTestPromise(promise)
+ctx.keepAlivePromises.push(keepAlivePromise)
+
+// Register async hook to wait for all fetch operations
+const asyncHook: AsyncScriptExecutionHook = async () => {
+  // Poll until all operations are complete with grace period
+  let emptyRounds = 0
+  const maxEmptyRounds = 5
+
+  while (emptyRounds < maxEmptyRounds) {
+    if (pendingOperations.length > 0) {
+      emptyRounds = 0
+      await Promise.allSettled(pendingOperations)
+      await new Promise((r) => setTimeout(r, 10))
+    } else {
+      emptyRounds++
+      // Grace period: wait for VM to process jobs
+      await new Promise((r) => setTimeout(r, 10))
+    }
   }
+  resolveKeepAlive?.()
 }
+ctx.afterScriptExecutionHooks.push(asyncHook as () => void)
 ```
 
-**关键时序保证**：
-| 阶段 | 动作 | 目的 |
-|-----|------|------|
-| 模块初始化 | 创建 `testPromiseKeepAlive` 并加入 `ctx.keepAlivePromises` | 告知 faraday-cage 需要等待异步操作完成 |
-| 脚本执行 | `onTestPromise` 追踪测试创建的 Promise | 收集所有需要等待的异步操作 |
-| 脚本同步执行完成 | `afterScriptExecutionHooks` 触发 | 开始等待异步操作 |
-| 所有 Promise 完成 | 调用 `resolveKeepAlive()` | 解除沙箱保持状态 |
-| 结果捕获 | `captureHook.capture()` 被调用 | 确保包含异步回调中的状态修改 |
+**宽限期算法**：
+- 每轮检查：10ms 等待
+- 最多 5 轮空检查 → **总共 ~50ms 宽限期**
+- 期间如果有新的 fetch 操作，重置计数器
 
-**设计意图**：
-- 确保 `hopp.fetch().then()` 等异步回调中的环境变量修改被正确捕获
-- 测试脚本中的 `pm.test()` 异步断言能完整执行
-- 避免 QuickJS 上下文在异步回调完成前被销毁
+---
 
-**前置脚本 vs 测试脚本差异**：
+#### 5.3.3 postRequestModule 的 keepAlive 机制（仅 test script）
 
-| 特性 | 前置脚本（pre-request） | 测试脚本（test/post-request） |
-|------|------------------------|------------------------------|
-| **keepAlivePromises** | ❌ 不使用 | ✅ 使用 |
-| **异步回调状态捕获** | ❌ 不保证（可能丢失） | ✅ 保证（等待所有 Promise） |
-| **hopp.fetch().then()** | 回调可能在 capture 后执行，状态修改丢失 | 回调在 capture 前完成，状态修改保留 |
-| **执行完成时机** | 同步代码执行完成即返回 | 所有异步操作完成后返回 |
-
-**⚠️ 前置脚本异步限制重要说明**（代码位置：`src/cage-modules/scripting-modules.ts:401-409`）：
-
+**代码实现**（`src/cage-modules/scripting-modules.ts:403-563`）：
 ```typescript
 // Only register keepAlive for post-request tests; 
 // pre-request scripts shouldn't block on this
@@ -881,30 +868,168 @@ if ((type as ModuleType) === "post") {
   })
   ctx.keepAlivePromises.push(testPromiseKeepAlive)
 }
+
+// afterScriptExecutionHooks 中等待测试执行链
+if ((type as ModuleType) === "post") {
+  ctx.afterScriptExecutionHooks.push(async () => {
+    try {
+      // 1. 等待引导代码返回的测试执行链 Promise
+      if (testExecutionChainPromise) {
+        const resolvedPromise = ctx.vm.resolvePromise(testExecutionChainPromise)
+        const awaitResult = await resolvedPromise
+        // ...
+      }
+      
+      // 2. 等待所有旧风格测试 Promise（向后兼容）
+      if (testPromises.length > 0) {
+        await Promise.allSettled(testPromises)
+      }
+      
+      resolveKeepAlive?.()
+    } catch (error) {
+      rejectKeepAlive?.(error)
+    }
+  })
+}
 ```
 
-**问题场景**：
+---
+
+#### 5.3.4 统一执行时序图
+
+```
+调用方 await cage.runCode(script, [defaultModules, module])
+    │
+    ├─ defaultModules 注入 customFetchModule（所有场景）
+    │    ├─ 创建 keepAlivePromise (fetch)
+    │    ├─ ctx.keepAlivePromises.push(keepAlivePromise)
+    │    └─ 注册 afterScriptExecutionHooks (轮询 pendingOperations)
+    │
+    ├─ postRequestModule（仅 test script）
+    │    ├─ 创建 testPromiseKeepAlive
+    │    ├─ ctx.keepAlivePromises.push(testPromiseKeepAlive)
+    │    └─ 注册 afterScriptExecutionHooks (等待测试执行链)
+    │
+    ├─ faraday-cage 执行用户脚本
+    │    ├─ 同步代码执行
+    │    ├─ 顶层 await 完成（ESM module 模式自动等待）
+    │    └─ 脚本同步部分完成
+    │
+    ├─ faraday-cage 内部：等待所有 keepAlivePromises
+    │    │
+    │    ├─ 执行 afterScriptExecutionHooks
+    │    │    ├─ customFetchModule hook（所有场景）
+    │    │    │    ├─ 轮询 pendingOperations 数组
+    │    │    │    ├─ 等待所有 fetch 完成
+    │    │    │    ├─ 50ms 宽限期（5 × 10ms）
+    │    │    │    └─ resolve keepAlivePromise
+    │    │    │
+    │    │    └─ postRequestModule hook（仅 test script）
+    │    │         ├─ await 测试执行链 Promise
+    │    │         ├─ await Promise.allSettled(testPromises)
+    │    │         └─ resolve testPromiseKeepAlive
+    │    │
+    │    └─ 所有 keepAlivePromises 已 resolve
+    │
+    ├─ cage.runCode() 返回 ✅
+    │
+    ├─ test script 特有（显式顺序等待）：
+    │    └─ for (const p of testPromises) { await p }
+    │
+    └─ captureHook.capture() → 捕获 envs/request/cookies/testRunStack
+```
+
+---
+
+#### 5.3.5 pre-request vs test script 完整对比
+
+| 特性 | 前置脚本（pre-request） | 测试脚本（test/post-request） |
+|-----|------------------------|------------------------------|
+| **keepAlive 来源** | `customFetchModule` | `customFetchModule` + `postRequestModule` |
+| **等待 fetch 完成** | ✅ 是 | ✅ 是 |
+| **fetch 宽限期** | ✅ 50ms | ✅ 50ms |
+| **等待测试执行链** | ❌ 否 | ✅ 是 |
+| **等待 testPromises** | ❌ 否 | ✅ 是（hook 中 + 显式 for 循环） |
+| **顶层 await** | ✅ 完整支持 | ✅ 完整支持 |
+| **显式顺序等待** | ❌ 否 | ✅ 是（for 循环顺序 await） |
+| **`fetch().then()` 捕获** | ⚠️ 宽限期内有效，之后丢失 | ✅ 完整保证（测试执行链等待） |
+| **env/request/cookies 捕获时机** | `cage.runCode()` 返回后立即 | 先 `await testPromises`，再 capture |
+
+---
+
+#### 5.3.6 对 env/request/cookies 捕获时机的影响
+
+**场景 1：顶层 await（两种场景都安全）**
 ```javascript
-// 前置脚本中的异步操作 - 环境变量设置可能丢失！
-hopp.fetch("https://api.example.com/config").then((res) => {
+// ✅ 100% 保证被捕获
+const res = await hopp.fetch("/api/config")
+const data = await res.json()
+hopp.env.set("authToken", data.token)  // 在 capture 前执行
+```
+
+**场景 2：单级 .then() 回调（宽限期内安全）**
+```javascript
+// ⚠️ pre-request：取决于回调执行速度，50ms 内有效
+// ✅ test script：100% 保证
+hopp.fetch("/api/config").then((res) => {
   return res.json()
 }).then((data) => {
-  // ❌ 这个设置可能在 capture 之后才执行，不会生效！
+  // pre-request: 如果在 capture 后 50ms 内执行，会被捕获
+  // test script: 保证被捕获
   hopp.env.set("authToken", data.token)
 })
 ```
 
-**解决方案**：
-1. 前置脚本中使用同步代码
-2. 或使用顶层 await（仅 experimental 沙箱支持）：
+**场景 3：长链异步或延迟操作（可能丢失）**
 ```javascript
-// ✅ 顶层 await 确保在 capture 前完成
-const res = await hopp.fetch("https://api.example.com/config")
-const data = await res.json()
-hopp.env.set("authToken", data.token)
+// ❌ pre-request：几乎肯定丢失
+// ✅ test script：仍被捕获（测试执行链等待）
+hopp.fetch("/api/config")
+  .then(r => r.json())
+  .then(delay(100))  // 延迟超过 50ms
+  .then((data) => {
+    // pre-request: 宽限期已过，capture 已完成
+    // test script: 仍在测试执行链中，会被捕获
+    hopp.env.set("authToken", data.token)
+  })
 ```
 
-> **注意**：顶层 await 仅在 experimental 沙箱中支持，legacy 沙箱不支持。
+**场景 4：setTimeout 中的修改（肯定丢失）**
+```javascript
+// ❌ 两种场景都会丢失！
+setTimeout(() => {
+  hopp.env.set("key", "value")  // 不在任何追踪机制中
+}, 0)
+```
+
+---
+
+#### 5.3.7 faraday-cage 的已知限制
+
+代码注释明确警告（`src/web/pre-request/index.ts:111-113`）：
+```typescript
+// faraday-cage's keepAlive loop swallows rejected promises and does not
+// await afterScriptExecutionHooks, so async-boundary errors reach us
+// only via this synchronous host reporter.
+```
+
+**影响**：
+- `afterScriptExecutionHooks` 中抛出的异常不会导致 `cage.runCode()` reject
+- 异步边界的错误只能通过同步的 `setScriptExecutionError` 回调报告
+- 这就是为什么需要 `captureHook.scriptExecutionError` 检查机制
+
+---
+
+#### 5.3.8 最佳实践建议
+
+| 场景 | 推荐写法 | 不推荐写法 |
+|-----|---------|-----------|
+| **前置脚本 fetch** | 使用顶层 `await` | 使用多级 `.then()` 链 |
+| **测试脚本 fetch** | 两种都可以，推荐 `await` | 无 |
+| **环境变量设置** | 同步或顶层 await 后设置 | `setTimeout` 或长链回调中设置 |
+| **请求修改** | 同步修改 `pm.request.*` | 异步回调中修改 |
+
+> **注意**：`setTimeout`、`setInterval` 回调中的状态修改在两种场景下都不会被捕获，因为它们不在任何 keepAlive 追踪机制中。
 
 ---
 
