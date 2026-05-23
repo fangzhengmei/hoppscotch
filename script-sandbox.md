@@ -34,22 +34,22 @@ hopp.env.setInitial(key, value)
 hopp.env.active.*   // 仅操作选中环境
 hopp.env.global.*   // 仅操作全局环境
 
-// 请求操作（前置脚本）
-hopp.request.url                // 只读
-hopp.request.method             // 只读
-hopp.request.headers            // 只读
-hopp.request.setUrl(url)
-hopp.request.setMethod(method)
-hopp.request.setHeader(name, value)
-hopp.request.setHeaders(headers)
-hopp.request.removeHeader(key)
-hopp.request.setParam(name, value)
-hopp.request.setBody(body)
-hopp.request.setAuth(auth)
+// 请求操作（仅前置脚本可写，测试脚本只读）
+hopp.request.url                // 只读（两种场景）
+hopp.request.method             // 只读（两种场景）
+hopp.request.headers            // 只读（两种场景）
+hopp.request.setUrl(url)        // ⚠️ 仅 pre-request 可用
+hopp.request.setMethod(method)  // ⚠️ 仅 pre-request 可用
+hopp.request.setHeader(name, value)  // ⚠️ 仅 pre-request 可用
+hopp.request.setHeaders(headers)     // ⚠️ 仅 pre-request 可用
+hopp.request.removeHeader(key)       // ⚠️ 仅 pre-request 可用
+hopp.request.setParam(name, value)   // ⚠️ 仅 pre-request 可用
+hopp.request.setBody(body)           // ⚠️ 仅 pre-request 可用
+hopp.request.setAuth(auth)           // ⚠️ 仅 pre-request 可用
 
 // 请求变量
-hopp.request.variables.get(key)
-hopp.request.variables.set(key, value)
+hopp.request.variables.get(key)      // 两种场景都可用
+hopp.request.variables.set(key, value)  // ⚠️ 仅 pre-request 可用
 
 // Cookie 管理（仅桌面端）
 hopp.cookies.get(domain, name)
@@ -428,7 +428,7 @@ request.auth          // 通过 setRequestAuth
 request.requestVariables // 通过 setRequestVariable
 ```
 
-**读写路径**：
+**读写路径**（⚠️ 仅 pre-request 场景适用，test script 场景下 request 只读）：
 1. 进入沙箱：`cloneDeep(request)` 传入
 2. 执行期间：`createRequestSetterMethods` 维护内部 `updatedRequest` 引用
 3. 离开沙箱：`getUpdatedRequest()` 返回修改后的对象
@@ -436,6 +436,7 @@ request.requestVariables // 通过 setRequestVariable
 **代码位置**：
 - Setter 实现：`src/cage-modules/utils/request-setters.ts:17-96`
 - 结果捕获：`src/cage-modules/scripting-modules.ts:441-457`
+- 测试脚本限制：`src/cage-modules/scripting-modules.ts:176-207`（不注入 setter 方法）
 
 ---
 
@@ -776,7 +777,7 @@ if (captureHook.capture) {
   captureHook.capture()
 }
 
-// 返回结果
+// 返回结果（⚠️ 注意：测试脚本不返回 updatedRequest，因为请求已发送）
 return E.right({
   tests: safeTestResults,
   envs: safeEnvs,
@@ -784,6 +785,18 @@ return E.right({
   updatedCookies: safeCookies,
 })
 ```
+
+#### 两种场景返回类型差异
+
+| 字段 | `SandboxPreRequestResult` | `SandboxTestResult` | 说明 |
+|-----|---------------------------|---------------------|------|
+| `updatedEnvs` | ✅ | ✅ | 两种场景都返回更新后的环境变量 |
+| `updatedRequest` | ✅ | ❌ | 仅前置脚本返回修改后的请求对象 |
+| `updatedCookies` | ✅ | ✅ | 两种场景都返回更新后的 Cookie |
+| `tests` | ❌ | ✅ | 仅测试脚本返回测试结果 |
+| `consoleEntries` | ✅ | ✅ | 两种场景都返回控制台输出 |
+
+> **原因**：测试脚本在请求发送后执行，此时修改请求参数无意义，因此不提供 `updatedRequest` 字段。
 
 ---
 
@@ -1090,7 +1103,7 @@ handleSandboxResults: ({ envs, request, cookies }) => {
 
 ---
 
-## 八、pm.request 可变性差异
+## 八、请求对象可变性差异（hopp.request + pm.request）
 
 ### 8.1 前置脚本（pre-request）：完全可修改
 
@@ -1166,7 +1179,169 @@ get url() {
 | **职责分离** | 请求修改是前置脚本的职责，测试脚本专注于响应验证 |
 | **避免混淆** | 防止用户在测试脚本中修改请求后疑惑为什么实际请求没有变化 |
 
-> **⚠️ 注意**：虽然 `pm.request` 在测试脚本中是只读的，但 `hopp.request` 仍然可以调用 setter 方法（如 `hopp.request.setUrl()`），但这些修改只会影响沙箱内的状态，不会影响后续请求（除非通过环境变量传递）。
+> **⚠️ 重要修正**：在测试脚本中，**`hopp.request` 和 `pm.request` 都是只读的**！所有请求 setter 方法（`setUrl`、`setMethod`、`setHeader` 等）在 post-request 场景下根本没有被注入，调用会抛出 `TypeError`。原因：1) post-request 路径不注入 `requestSetterMethods`；2) `hopp.request.*` 属性的 setter 显式抛出 `TypeError('hopp.request.${prop} is read-only')`。
+
+---
+
+### 8.4 hopp.request 可变性对比（完整对照）
+
+#### 8.4.1 两个命名空间的双重保护
+
+`hopp.request` 的可写性通过 **两层机制** 保证：
+
+| 层级 | 控制机制 | pre-request | post-request | 代码位置 |
+|-----|---------|-------------|--------------|----------|
+| **1. API 注入层** | `createScriptingInputsObj` 中是否注入 `requestSetterMethods` | ✅ 注入 | ❌ 不注入 | `scripting-modules.ts:148-173` |
+| **2. 属性访问层** | `hopp.request.*` 属性的 getter/setter | ✅ 有 setter 调用 inputs 方法 | ❌ setter 抛出 TypeError | `post-request.js:2229-2240` |
+
+#### 8.4.2 requestSetterMethods 注入差异（对照证据）
+
+**pre-request 路径**（`scripting-modules.ts:145-173`）：
+```typescript
+if (type === "pre") {
+  // ✅ 创建请求 setter 方法
+  const { methods: requestSetterMethods, getUpdatedRequest } =
+    createRequestSetterMethods(ctx, preConfig.request)
+
+  // ✅ 注入到返回对象中
+  return {
+    ...baseInputs,
+    ...requestSetterMethods,  // 包含所有 setter
+  } as PreRequestInputs
+}
+```
+
+**post-request 路径**（`scripting-modules.ts:176-207`）：
+```typescript
+// ❌ 不创建 requestSetterMethods
+const baseInputs = createBaseInputs(ctx, {
+  envs: config.envs,
+  request: config.request,
+  cookies: config.cookies,
+  // 注意：没有 getUpdatedRequest 参数
+})
+
+return {
+  ...baseInputs,
+  ...expectationMethods,
+  ...chaiMethods,
+  // ❌ 没有 ...requestSetterMethods
+}
+```
+
+#### 8.4.3 hopp.request 属性保护差异（对照证据）
+
+**pre-request 引导代码**（`pre-request.js:37-48`）：
+```javascript
+const requestProps = {
+  // ✅ 有 setter 方法
+  setUrl: (url) => inputs.setRequestUrl(url),
+  setMethod: (method) => inputs.setRequestMethod(method),
+  setHeader: (name, value) => inputs.setRequestHeader(name, value),
+  setHeaders: (headers) => inputs.setRequestHeaders(headers),
+  removeHeader: (key) => inputs.removeRequestHeader(key),
+  setParam: (name, value) => inputs.setRequestParam(name, value),
+  setParams: (params) => inputs.setRequestParams(params),
+  removeParam: (key) => inputs.removeRequestParam(key),
+  setBody: (body) => inputs.setRequestBody(body),
+  setAuth: (auth) => inputs.setRequestAuth(auth),
+  // ...
+}
+```
+
+**post-request 引导代码**（`post-request.js:2225-2240`）：
+```javascript
+const requestProps = {}
+
+// ❌ 所有属性只读，setter 抛出 TypeError
+;["url", "method", "params", "headers", "body", "auth"].forEach((prop) => {
+  Object.defineProperty(requestProps, prop, {
+    enumerable: true,
+    configurable: false,
+    get() {
+      return inputs.getRequestProps()[prop]
+    },
+    set(_value) {
+      throw new TypeError(`hopp.request.${prop} is read-only`)
+    },
+  })
+})
+```
+
+#### 8.4.4 完整可写性对比表
+
+| API | pre-request | post-request | 说明 |
+|-----|-------------|--------------|------|
+| **属性访问** | | | |
+| `hopp.request.url` | ✅ 读 + ✅ 写（通过 setUrl） | ✅ 读 + ❌ 写 | 写操作在 post-request 中直接抛错 |
+| `hopp.request.method` | ✅ 读 + ✅ 写 | ✅ 读 + ❌ 写 | |
+| `hopp.request.headers` | ✅ 读 + ✅ 写 | ✅ 读 + ❌ 写 | |
+| `hopp.request.params` | ✅ 读 + ✅ 写 | ✅ 读 + ❌ 写 | |
+| `hopp.request.body` | ✅ 读 + ✅ 写 | ✅ 读 + ❌ 写 | |
+| `hopp.request.auth` | ✅ 读 + ✅ 写 | ✅ 读 + ❌ 写 | |
+| **Setter 方法** | | | |
+| `hopp.request.setUrl()` | ✅ 可用 | ❌ 不存在 | post-request 中未注入 |
+| `hopp.request.setMethod()` | ✅ 可用 | ❌ 不存在 | post-request 中未注入 |
+| `hopp.request.setHeader()` | ✅ 可用 | ❌ 不存在 | post-request 中未注入 |
+| `hopp.request.setHeaders()` | ✅ 可用 | ❌ 不存在 | post-request 中未注入 |
+| `hopp.request.removeHeader()` | ✅ 可用 | ❌ 不存在 | post-request 中未注入 |
+| `hopp.request.setParam()` | ✅ 可用 | ❌ 不存在 | post-request 中未注入 |
+| `hopp.request.setParams()` | ✅ 可用 | ❌ 不存在 | post-request 中未注入 |
+| `hopp.request.removeParam()` | ✅ 可用 | ❌ 不存在 | post-request 中未注入 |
+| `hopp.request.setBody()` | ✅ 可用 | ❌ 不存在 | post-request 中未注入 |
+| `hopp.request.setAuth()` | ✅ 可用 | ❌ 不存在 | post-request 中未注入 |
+| `hopp.request.setRequestVariable()` | ✅ 可用 | ❌ 不存在 | post-request 中未注入 |
+| **请求变量** | | | |
+| `hopp.request.variables.get()` | ✅ 可用 | ✅ 可用 | 两种场景都只读访问 |
+| `hopp.request.variables.set()` | ✅ 可用 | ❌ 不存在 | post-request 中 variables 被 freeze |
+
+---
+
+### 8.5 测试脚本不可用 API 完整列表
+
+#### 8.5.1 请求修改相关（全部不可用）
+
+| API | 可用性 | 错误表现 |
+|-----|--------|---------|
+| `hopp.request.setUrl(url)` | ❌ | `TypeError: hopp.request.setUrl is not a function` |
+| `hopp.request.setMethod(method)` | ❌ | `TypeError: hopp.request.setMethod is not a function` |
+| `hopp.request.setHeader(name, value)` | ❌ | `TypeError: hopp.request.setHeader is not a function` |
+| `hopp.request.setHeaders(headers)` | ❌ | `TypeError: hopp.request.setHeaders is not a function` |
+| `hopp.request.removeHeader(key)` | ❌ | `TypeError: hopp.request.removeHeader is not a function` |
+| `hopp.request.setParam(name, value)` | ❌ | `TypeError: hopp.request.setParam is not a function` |
+| `hopp.request.setParams(params)` | ❌ | `TypeError: hopp.request.setParams is not a function` |
+| `hopp.request.removeParam(key)` | ❌ | `TypeError: hopp.request.removeParam is not a function` |
+| `hopp.request.setBody(body)` | ❌ | `TypeError: hopp.request.setBody is not a function` |
+| `hopp.request.setAuth(auth)` | ❌ | `TypeError: hopp.request.setAuth is not a function` |
+| `hopp.request.setRequestVariable(key, value)` | ❌ | `TypeError: hopp.request.setRequestVariable is not a function` |
+| `hopp.request.variables.set(key, value)` | ❌ | `TypeError: Cannot add property set, object is not extensible` |
+
+#### 8.5.2 属性赋值（全部只读）
+
+| 操作 | 可用性 | 错误表现 |
+|-----|--------|---------|
+| `hopp.request.url = "..."` | ❌ | `TypeError: hopp.request.url is read-only` |
+| `hopp.request.method = "POST"` | ❌ | `TypeError: hopp.request.method is read-only` |
+| `hopp.request.headers = [...]` | ❌ | `TypeError: hopp.request.headers is read-only` |
+| `hopp.request.body = {...}` | ❌ | `TypeError: hopp.request.body is read-only` |
+| `hopp.request.auth = {...}` | ❌ | `TypeError: hopp.request.auth is read-only` |
+| `hopp.request.params = [...]` | ❌ | `TypeError: hopp.request.params is read-only` |
+| `hopp.request.variables = {...}` | ❌ | `TypeError: hopp.request.variables is read-only` |
+
+#### 8.5.3 测试脚本可用的只读 API
+
+| API | 可用性 | 说明 |
+|-----|--------|------|
+| `hopp.request.url` | ✅ 只读 | 返回请求 URL 字符串 |
+| `hopp.request.method` | ✅ 只读 | 返回请求方法 |
+| `hopp.request.headers` | ✅ 只读 | 返回请求头数组 |
+| `hopp.request.params` | ✅ 只读 | 返回查询参数数组 |
+| `hopp.request.body` | ✅ 只读 | 返回请求体对象 |
+| `hopp.request.auth` | ✅ 只读 | 返回认证配置对象 |
+| `hopp.request.variables.get(key)` | ✅ 只读 | 获取请求变量 |
+| `pm.request.*` | ✅ 只读 | 所有属性只读访问 |
+
+> **设计原因**：测试脚本在请求发送后执行，此时修改请求参数无实际效果。强制只读可以避免用户困惑，同时明确职责分离——请求修改是前置脚本的职责。
 
 ---
 
