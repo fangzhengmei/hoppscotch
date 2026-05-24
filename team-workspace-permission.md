@@ -78,9 +78,19 @@ export const RequiresTeamRole = (...roles: TeamAccessRole[]) =>
   SetMetadata('requiresTeamRole', roles);
 ```
 
-**使用方式**：在 GraphQL resolver 方法上标记所需角色
+**真实使用示例** [src/team/team.resolver.ts:133-135](packages/hoppscotch-backend/src/team/team.resolver.ts#L133-L135)：
 ```typescript
-@RequiresTeamRole(TeamAccessRole.OWNER, TeamAccessRole.EDITOR)
+@RequiresTeamRole(
+  TeamAccessRole.VIEWER,
+  TeamAccessRole.EDITOR,
+  TeamAccessRole.OWNER,
+)
+```
+
+**另一示例** [src/team/team.resolver.ts:219](packages/hoppscotch-backend/src/team/team.resolver.ts#L219)：
+```typescript
+@RequiresTeamRole(TeamAccessRole.OWNER)
+async removeTeamMember(...)
 ```
 
 ### 3.2 守卫（Guard）体系
@@ -113,23 +123,27 @@ export const RequiresTeamRole = (...roles: TeamAccessRole[]) =>
 
 ```typescript
 async canActivate(context: ExecutionContext): Promise<boolean> {
-  // 1. 获取装饰器标记的所需角色
   const requireRoles = this.reflector.get<TeamAccessRole[]>(
     'requiresTeamRole',
     context.getHandler(),
   );
-  
-  // 2. 获取当前用户
-  const { user } = gqlExecCtx.getContext().req;
-  
-  // 3. 提取 teamID（直接从参数获取）
+  if (!requireRoles) throw new Error(BUG_TEAM_NO_REQUIRE_TEAM_ROLE);
+
+  const gqlExecCtx = GqlExecutionContext.create(context);
+  const { req, headers } = gqlExecCtx.getContext();
+  const user = headers ? headers.user : req.user;
+
+  if (user == undefined) throw new Error(BUG_AUTH_NO_USER_CTX);
+
   const { teamID } = gqlExecCtx.getArgs<{ teamID: string }>();
-  
-  // 4. 查询用户在该团队的成员信息
+  if (!teamID) throw new Error(BUG_TEAM_NO_TEAM_ID);
+
   const teamMember = await this.teamService.getTeamMember(teamID, user.uid);
-  
-  // 5. 验证角色
-  return requireRoles.includes(teamMember.role);
+  if (!teamMember) throw new Error(TEAM_MEMBER_NOT_FOUND);
+
+  if (requireRoles.includes(teamMember.role)) return true;
+
+  throw new Error(TEAM_NOT_REQUIRED_ROLE);
 }
 ```
 
@@ -141,29 +155,87 @@ async canActivate(context: ExecutionContext): Promise<boolean> {
 
 ---
 
+### 3.3.1 守卫授权失败路径的语义差异
+
+**重要发现**：所有守卫**没有使用 `return false`**，全部采用 `throw` 方式拒绝访问。但不同守卫使用了三种不同的 throw 方式，语义和排错影响不同：
+
+| 守卫类                     | 错误抛出方式               | 错误类型        | 语义差异                                  | 排错影响                                  |
+|--------------------------|----------------------------|-----------------|-------------------------------------------|-------------------------------------------|
+| GqlTeamMemberGuard       | `throw new Error(msg)`     | Error           | 直接抛出通用错误                          | 需要从 error.message 解析错误码           |
+| GqlCollectionTeamMemberGuard | `throw new Error(msg)` | Error           | 直接抛出通用错误                          | 需要从 error.message 解析错误码           |
+| GqlRequestTeamMemberGuard | `throwErr(msg)` (部分场景) | Error           | 本质也是 `throw new Error`，工具函数封装  | 同上，但部分路径使用 `throwErr`           |
+| GqlTeamEnvTeamGuard      | `throwErr(msg)`            | Error           | 全部使用工具函数封装                      | 同上                                      |
+| RESTTeamMemberGuard      | `throwHTTPErr({msg, code})`| HttpException   | 抛出带状态码的 HTTP 异常                  | 直接返回带状态码的 HTTP 响应，前端可直接识别 |
+
+**工具函数实现** [src/utils.ts:44-55](packages/hoppscotch-backend/src/utils.ts#L44-L55)
+```typescript
+// 作为表达式使用的 throw 封装
+export function throwErr(errMessage: string): never {
+  throw new Error(errMessage);
+}
+
+// REST 专用：抛出带 HTTP 状态码的异常
+export function throwHTTPErr(errorData: RESTError): never {
+  const { message, statusCode } = errorData;
+  throw new HttpException(message, statusCode);
+}
+```
+
+**对排错和复核的影响**：
+
+1. **GraphQL 守卫**（前四个）：
+   - 错误被 NestJS GraphQL 模块捕获后，会包装成 GraphQL errors 数组中的 `message` 字段
+   - 排错时需要从 `errors[0].message` 中提取错误码（如 `team/not_required_role`）
+   - 由于是统一的 `Error` 类型，无法通过 `instanceof` 判断错误类别
+   - 复核时需要对比错误码与 `src/errors.ts` 中的定义
+
+2. **REST 守卫**（RESTTeamMemberGuard）：
+   - 直接抛出 `HttpException`，NestJS 会转换为标准 HTTP 响应
+   - 状态码语义明确：400（参数错误）、403（权限不足）、404（资源不存在）
+   - 排错时直接看 HTTP 状态码和响应体即可
+   - 复核时可直接通过状态码快速定位问题类别
+
+3. **错误码分类**（来自 [src/errors.ts](packages/hoppscotch-backend/src/errors.ts)）：
+   - `BUG_*` 前缀：表示代码 bug（如缺少装饰器、缺少参数）
+   - `TEAM_*` 前缀：表示业务错误（如成员不存在、角色不足）
+
+**示例错误码**：
+- `BUG_TEAM_NO_REQUIRE_TEAM_ROLE` - 代码错误：缺少 @RequiresTeamRole 装饰器
+- `TEAM_MEMBER_NOT_FOUND` - 业务错误：用户不是该团队成员
+- `TEAM_NOT_REQUIRED_ROLE` - 业务错误：用户角色不满足操作要求
+
+---
+
 ### 3.4 集合级守卫实现（间接权限）
 
 [src/team-collection/guards/gql-collection-team-member.guard.ts:24-50](packages/hoppscotch-backend/src/team-collection/guards/gql-collection-team-member.guard.ts#L24-L50)
 
 ```typescript
 async canActivate(context: ExecutionContext): Promise<boolean> {
-  // 1. 获取所需角色
-  const requireRoles = this.reflector.get<TeamAccessRole[]>(...);
-  
-  // 2. 获取当前用户
+  const requireRoles = this.reflector.get<TeamAccessRole[]>(
+    'requiresTeamRole',
+    context.getHandler(),
+  );
+  if (!requireRoles) throw new Error(BUG_TEAM_NO_REQUIRE_TEAM_ROLE);
+
+  const gqlExecCtx = GqlExecutionContext.create(context);
+
   const { user } = gqlExecCtx.getContext().req;
-  
-  // 3. 提取 collectionID
+  if (user == undefined) throw new Error(BUG_AUTH_NO_USER_CTX);
+
   const { collectionID } = gqlExecCtx.getArgs<{ collectionID: string }>();
-  
-  // 4. 通过 collection 找到所属 team（权限派生关键步骤）
-  const collection = await this.teamCollectionService.getCollection(collectionID);
-  const teamID = collection.right.teamID;
-  
-  // 5. 查询用户在该团队的角色
-  const member = await this.teamService.getTeamMember(teamID, user.uid);
-  
-  // 6. 验证角色
+  if (!collectionID) throw new Error(BUG_TEAM_COLL_NO_COLL_ID);
+
+  const collection =
+    await this.teamCollectionService.getCollection(collectionID);
+  if (E.isLeft(collection)) throw new Error(TEAM_INVALID_COLL_ID);
+
+  const member = await this.teamService.getTeamMember(
+    collection.right.teamID,
+    user.uid,
+  );
+  if (!member) throw new Error(TEAM_REQ_NOT_MEMBER);
+
   return requireRoles.includes(member.role);
 }
 ```
@@ -185,13 +257,45 @@ collectionID → TeamCollection.teamID → TeamMember.role → 权限验证
 
 [src/team-request/guards/gql-request-team-member.guard.ts:25-53](packages/hoppscotch-backend/src/team-request/guards/gql-request-team-member.guard.ts#L25-L53)
 
+```typescript
+async canActivate(context: ExecutionContext): Promise<boolean> {
+  const requireRoles = this.reflector.get<TeamAccessRole[]>(
+    'requiresTeamRole',
+    context.getHandler(),
+  );
+
+  const gqlExecCtx = GqlExecutionContext.create(context);
+
+  const { user } = gqlExecCtx.getContext().req;
+  if (!user) throw new Error(BUG_AUTH_NO_USER_CTX);
+
+  const { requestID } = gqlExecCtx.getArgs<{ requestID: string }>();
+  if (!requestID) throw new Error(BUG_TEAM_REQ_NO_REQ_ID);
+
+  const team =
+    await this.teamRequestService.getTeamOfRequestFromID(requestID);
+  if (O.isNone(team)) throw new Error(TEAM_REQ_NOT_FOUND);
+
+  const member = await this.teamService.getTeamMember(
+    team.value.id,
+    user.uid,
+  );
+  if (!member) throwErr(TEAM_REQ_NOT_MEMBER);
+
+  if (!(requireRoles && requireRoles.includes(member.role)))
+    throw new Error(TEAM_REQ_NOT_REQUIRED_ROLE);
+
+  return true;
+}
+```
+
 **权限派生链路**：
 ```
 requestID → TeamRequest.teamID → TeamMember.role → 权限验证
 ```
 
 **典型应用场景**：
-- 创建/编辑请求
+- 编辑请求
 - 删除请求
 - 移动请求到其他集合
 
@@ -200,6 +304,36 @@ requestID → TeamRequest.teamID → TeamMember.role → 权限验证
 ### 3.6 环境级守卫实现
 
 [src/team-environments/gql-team-env-team.guard.ts:30-56](packages/hoppscotch-backend/src/team-environments/gql-team-env-team.guard.ts#L30-L56)
+
+```typescript
+async canActivate(context: ExecutionContext): Promise<boolean> {
+  const requireRoles = this.reflector.get<TeamAccessRole[]>(
+    'requiresTeamRole',
+    context.getHandler(),
+  );
+  if (!requireRoles) throw new Error(BUG_TEAM_ENV_GUARD_NO_REQUIRE_ROLES);
+
+  const gqlExecCtx = GqlExecutionContext.create(context);
+
+  const { user } = gqlExecCtx.getContext().req;
+  if (user == undefined) throw new Error(BUG_AUTH_NO_USER_CTX);
+
+  const { id } = gqlExecCtx.getArgs<{ id: string }>();
+  if (!id) throwErr(BUG_TEAM_ENV_GUARD_NO_ENV_ID);
+
+  const teamEnvironment =
+    await this.teamEnvironmentService.getTeamEnvironment(id);
+  if (E.isLeft(teamEnvironment)) throwErr(TEAM_ENVIRONMENT_NOT_FOUND);
+
+  const member = await this.teamService.getTeamMember(
+    teamEnvironment.right.teamID,
+    user.uid,
+  );
+  if (!member) throwErr(TEAM_ENVIRONMENT_NOT_TEAM_MEMBER);
+
+  return requireRoles.includes(member.role);
+}
+```
 
 **权限派生链路**：
 ```
@@ -219,21 +353,30 @@ environmentID → TeamEnvironment.teamID → TeamMember.role → 权限验证
 
 ```typescript
 async canActivate(context: ExecutionContext): Promise<boolean> {
-  // 1. 获取所需角色
-  const requireRoles = this.reflector.get<TeamAccessRole[]>(...);
-  
-  // 2. 获取当前用户（从 REST request 对象）
+  const requireRoles = this.reflector.get<TeamAccessRole[]>(
+    'requiresTeamRole',
+    context.getHandler(),
+  );
+  if (!requireRoles)
+    throwHTTPErr({ message: BUG_TEAM_NO_REQUIRE_TEAM_ROLE, statusCode: 400 });
+
   const request = context.switchToHttp().getRequest();
+
   const { user } = request;
-  
-  // 3. 从 URL params 提取 teamID（如 /team-collection/search/:teamID）
+  if (user == undefined)
+    throwHTTPErr({ message: BUG_AUTH_NO_USER_CTX, statusCode: 400 });
+
   const teamID = request.params.teamID;
-  
-  // 4. 查询用户在该团队的角色
+  if (!teamID)
+    throwHTTPErr({ message: BUG_TEAM_NO_TEAM_ID, statusCode: 400 });
+
   const teamMember = await this.teamService.getTeamMember(teamID, user.uid);
-  
-  // 5. 验证角色
-  return requireRoles.includes(teamMember.role);
+  if (!teamMember)
+    throwHTTPErr({ message: TEAM_MEMBER_NOT_FOUND, statusCode: 404 });
+
+  if (requireRoles.includes(teamMember.role)) return true;
+
+  throwHTTPErr({ message: TEAM_NOT_REQUIRED_ROLE, statusCode: 403 });
 }
 ```
 
@@ -259,13 +402,21 @@ URL params.teamID → TeamMember.role → 权限验证
 
 [src/team-request/team-request.resolver.ts:126-154](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts#L126-L154)
 ```typescript
-@Mutation(() => TeamRequest)
+@Mutation(() => TeamRequest, {
+  description: 'Create a team request in the given collection.',
+})
 @UseGuards(GqlAuthGuard, GqlCollectionTeamMemberGuard)  // 注意这里用的是集合级守卫
 @RequiresTeamRole(TeamAccessRole.EDITOR, TeamAccessRole.OWNER)
 async createRequestInCollection(
-  @Args('collectionID') collectionID: string,
-  @Args('data') data: CreateTeamRequestInput,
-) { ... }
+  @Args({ name: 'collectionID', type: () => ID }) collectionID: string,
+  @Args({ name: 'data', type: () => CreateTeamRequestInput }) data: CreateTeamRequestInput,
+) {
+  const teamRequest = await this.teamRequestService.createTeamRequest(
+    collectionID, data.teamID, data.title, data.request,
+  );
+  if (E.isLeft(teamRequest)) throwErr(teamRequest.left);
+  return teamRequest.right;
+}
 ```
 
 #### 创建环境（createTeamEnvironment）
@@ -275,10 +426,21 @@ async createRequestInCollection(
 
 [src/team-environments/team-environments.resolver.ts:30-47](packages/hoppscotch-backend/src/team-environments/team-environments.resolver.ts#L30-L47)
 ```typescript
-@Mutation(() => TeamEnvironment)
+@Mutation(() => TeamEnvironment, {
+  description: 'Create a new Team Environment for given Team ID',
+})
 @UseGuards(GqlAuthGuard, GqlTeamMemberGuard)  // 注意这里用的是团队级守卫
 @RequiresTeamRole(TeamAccessRole.OWNER, TeamAccessRole.EDITOR)
-async createTeamEnvironment(@Args() args: CreateTeamEnvironmentArgs) { ... }
+async createTeamEnvironment(
+  @Args() args: CreateTeamEnvironmentArgs,
+): Promise<TeamEnvironment> {
+  const teamEnvironment =
+    await this.teamEnvironmentsService.createTeamEnvironment(
+      args.name, args.teamID, args.variables,
+    );
+  if (E.isLeft(teamEnvironment)) throwErr(teamEnvironment.left);
+  return teamEnvironment.right;
+}
 ```
 
 ## 4. 资源与权限映射
@@ -287,25 +449,40 @@ async createTeamEnvironment(@Args() args: CreateTeamEnvironmentArgs) { ... }
 
 **团队集合 Resolver** [src/team-collection/team-collection.resolver.ts](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts)
 
-| 操作           | 所需角色                  | 守卫类型                     |
-|----------------|---------------------------|------------------------------|
-| 查看集合       | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           |
-| 创建根集合     | OWNER, EDITOR             | GqlTeamMemberGuard           |
-| 创建子集合     | OWNER, EDITOR             | GqlCollectionTeamMemberGuard |
-| 重命名集合     | OWNER, EDITOR             | GqlCollectionTeamMemberGuard |
-| 删除集合       | OWNER, EDITOR             | GqlCollectionTeamMemberGuard |
-| 移动集合       | OWNER, EDITOR             | GqlCollectionTeamMemberGuard |
+| 操作           | 所需角色                  | 守卫类型                     | 位置 |
+|----------------|---------------------------|------------------------------|------|
+| 查看根集合列表 | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 136](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L136) |
+| 查看单个集合   | OWNER, EDITOR, VIEWER     | GqlCollectionTeamMemberGuard | [Line 154](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L154) |
+| 导出所有集合   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 86](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L86) |
+| 导出单个集合   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 107](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L107) |
+| **创建根集合** | OWNER, EDITOR             | GqlTeamMemberGuard           | [Line 187](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L187) |
+| **创建子集合** | OWNER, EDITOR             | GqlCollectionTeamMemberGuard | [Line 240](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L240) |
+| 导入集合       | OWNER, EDITOR             | GqlTeamMemberGuard           | [Line 204](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L204) |
+| 重命名集合     | OWNER, EDITOR             | GqlCollectionTeamMemberGuard | [Line 263](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L263) |
+| 删除集合       | OWNER, EDITOR             | GqlCollectionTeamMemberGuard | [Line 279](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L279) |
+| 移动集合       | OWNER, EDITOR             | GqlCollectionTeamMemberGuard | [Line 300](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L300) |
+| 更新集合排序   | OWNER, EDITOR             | GqlCollectionTeamMemberGuard | [Line 314](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L314) |
+| 更新集合详情   | OWNER, EDITOR             | GqlCollectionTeamMemberGuard | [Line 328](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L328) |
+| 复制集合       | OWNER, EDITOR             | GqlCollectionTeamMemberGuard | [Line 345](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L345) |
+| 监听集合新增   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 375](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L375) |
+| 监听集合更新   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 397](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L397) |
+| 监听集合删除   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 419](packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts#L419) |
 
 **团队 Resolver** [src/team/team.resolver.ts](packages/hoppscotch-backend/src/team/team.resolver.ts)
 
-| 操作           | 所需角色                  | 守卫类型                     |
-|----------------|---------------------------|------------------------------|
-| 查看团队       | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           |
-| 创建团队       | 登录用户（自动成为OWNER） | 仅认证守卫                   |
-| 重命名团队     | OWNER                     | GqlTeamMemberGuard           |
-| 删除团队       | OWNER                     | GqlTeamMemberGuard           |
-| 更新成员角色   | OWNER                     | GqlTeamMemberGuard           |
-| 移除成员       | OWNER                     | GqlTeamMemberGuard           |
+| 操作           | 所需角色                  | 守卫类型                     | 位置 |
+|----------------|---------------------------|------------------------------|------|
+| 查看团队详情   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 132](packages/hoppscotch-backend/src/team/team.resolver.ts#L132) |
+| 查看我的团队   | 登录用户                  | GqlAuthGuard 仅认证          | [Line 113](packages/hoppscotch-backend/src/team/team.resolver.ts#L113) |
+| **创建团队**   | 登录用户（自动成为OWNER） | GqlAuthGuard 仅认证          | [Line 186](packages/hoppscotch-backend/src/team/team.resolver.ts#L186) |
+| 离开团队       | 登录用户                  | GqlAuthGuard 仅认证          | [Line 200](packages/hoppscotch-backend/src/team/team.resolver.ts#L200) |
+| 重命名团队     | OWNER                     | GqlTeamMemberGuard           | [Line 243](packages/hoppscotch-backend/src/team/team.resolver.ts#L243) |
+| 删除团队       | OWNER                     | GqlTeamMemberGuard           | [Line 259](packages/hoppscotch-backend/src/team/team.resolver.ts#L259) |
+| 更新成员角色   | OWNER                     | GqlTeamMemberGuard           | [Line 273](packages/hoppscotch-backend/src/team/team.resolver.ts#L273) |
+| 移除成员       | OWNER                     | GqlTeamMemberGuard           | [Line 218](packages/hoppscotch-backend/src/team/team.resolver.ts#L218) |
+| 监听成员新增   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 316](packages/hoppscotch-backend/src/team/team.resolver.ts#L316) |
+| 监听成员更新   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 339](packages/hoppscotch-backend/src/team/team.resolver.ts#L339) |
+| 监听成员移除   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 362](packages/hoppscotch-backend/src/team/team.resolver.ts#L362) |
 
 **团队请求 Resolver** [src/team-request/team-request.resolver.ts](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts)
 
@@ -372,25 +549,171 @@ async searchByTitle(
 
 ## 5. 前端工作区权限感知
 
-### 5.1 工作区模型
+### 5.1 真实的前端角色消费链路（修正版）
+
+**重要修正**：经过全库搜索验证，`workspace.role` 虽然在类型定义中存在并在切换工作区时被赋值，但**实际上没有任何前端组件直接消费 `workspace.role` 做权限判断**。所有权限 UI 控制都直接使用 `team.myRole` 或 `selectedTeam.myRole`。
+
+#### 类型定义：role 字段存在但未被消费
 
 [src/services/workspace.service.ts:16-27](packages/hoppscotch-common/src/services/workspace.service.ts#L16-L27)
 ```typescript
-export type PersonalWorkspace = {
-  type: "personal"
-}
-
 export type TeamWorkspace = {
   type: "team"
   teamID: string
   teamName: string
-  role: TeamAccessRole | null | undefined  // 用户在该团队的角色
+  role: TeamAccessRole | null | undefined  // 定义了但未被消费
 }
 ```
 
-### 5.2 后端 myRole 到前端 workspace role 的完整转换链路
+#### 前端角色消费的两条真实路径
 
-#### 第1步：后端 myRole 字段解析
+---
+
+##### 路径一：团队列表页 → 直接使用 `team.myRole`
+
+**使用场景**：`/profile/teams` 页面展示用户所属团队列表，每个团队卡片根据当前用户角色显示不同的操作按钮。
+
+**文件**：[src/components/teams/Team.vue](packages/hoppscotch-common/src/components/teams/Team.vue)
+
+```typescript
+// 直接使用 props.team.myRole，不经过 workspace.role
+const props = defineProps<{
+  team: GetMyTeamsQuery["myTeams"][number]  // 包含 myRole 字段
+  teamID: string
+  compact: boolean
+}>()
+```
+
+**真实消费示例**（来自模板）：
+```vue
+<!-- 仅 OWNER 显示编辑按钮 -->
+<HoppButtonSecondary
+  v-if="team.myRole === 'OWNER'"
+  :icon="IconEdit"
+  @click="$emit('edit-team')"
+/>
+
+<!-- 仅 OWNER 显示邀请按钮 -->
+<HoppButtonSecondary
+  v-if="team.myRole === 'OWNER'"
+  :icon="IconUserPlus"
+  @click="emit('invite-team')"
+/>
+
+<!-- 键盘快捷键也绑定 myRole 判断 -->
+<div
+  @keyup.e="team.myRole === 'OWNER' ? edit.$el.click() : null"
+  @keyup.delete="team.myRole === 'OWNER' ? deleteAction.$el.click() : null"
+>
+```
+
+**权限判断一览**（Team.vue 中共 11 处直接使用 `team.myRole`）：
+
+| 判断逻辑 | 控制元素 | 位置 |
+|---------|---------|------|
+| `team.myRole === 'OWNER'` | 编辑按钮显示 | [Line 36](packages/hoppscotch-common/src/components/teams/Team.vue#L36) |
+| `team.myRole === 'OWNER'` | 邀请按钮显示 | [Line 47](packages/hoppscotch-common/src/components/teams/Team.vue#L47) |
+| `team.myRole === 'OWNER'` | 删除菜单显示 | [Line 88](packages/hoppscotch-common/src/components/teams/Team.vue#L88) |
+| `team.myRole === 'OWNER'` | 光标样式 | [Line 26](packages/hoppscotch-common/src/components/teams/Team.vue#L26) |
+| `team.myRole === 'OWNER'` | 点击邀请动作 | [Line 17](packages/hoppscotch-common/src/components/teams/Team.vue#L17) |
+| `!(team.myRole === 'OWNER' && team.ownersCount == 1)` | 退出按钮显示 | [Line 101](packages/hoppscotch-common/src/components/teams/Team.vue#L101) |
+
+---
+
+##### 路径二：Header 组件 → 直接使用 `selectedTeam.myRole`
+
+**使用场景**：顶部导航栏根据当前选中团队的角色显示不同操作入口。
+
+**文件**：[src/components/app/Header.vue](packages/hoppscotch-common/src/components/app/Header.vue)
+
+**selectedTeam 的来源**：
+```typescript
+// Line 508: 定义 selectedTeam
+const selectedTeam = ref<GetMyTeamsQuery["myTeams"][number] | undefined>()
+
+// Line 511-513: 从 TeamListAdapter 获取团队列表
+const teamListAdapter = workspaceService.acquireTeamListAdapter(null)
+const myTeams = useReadonlyStream(teamListAdapter.teamList$, null)
+
+// Line 527-555: 通过 watch 从 myTeams 中匹配当前 workspace.teamID
+watch(
+  () => myTeams.value,
+  (newTeams) => {
+    const space = workspace.value
+    if (newTeams && space.type === "team" && space.teamID) {
+      // 根据 workspace.teamID 从团队列表中找到对应的 team 对象
+      const team = newTeams.find((team) => team.id === space.teamID)
+      if (team) {
+        selectedTeam.value = team  // 包含 myRole
+      }
+    }
+  }
+)
+
+watch(
+  () => workspace.value,
+  (newWorkspace) => {
+    if (newWorkspace.type === "team") {
+      const team = myTeams.value?.find((t) => t.id === newWorkspace.teamID)
+      if (team) {
+        selectedTeam.value = team
+      }
+    }
+  }
+)
+```
+
+**真实消费示例**：
+```typescript
+// 编辑团队入口 - 仅 OWNER
+const handleTeamEdit = () => {
+  if (
+    workspace.value.type === "team" &&
+    workspace.value.teamID &&
+    selectedTeam.value?.myRole === "OWNER"  // 直接使用 selectedTeam.myRole
+  ) {
+    editingTeamID.value = workspace.value.teamID
+    displayModalEdit(true)
+  } else {
+    noPermission()
+  }
+}
+
+// 邀请成员入口 - OWNER 或 EDITOR
+defineActionHandler("modals.team.invite", () => {
+  if (
+    selectedTeam.value?.myRole === "OWNER" ||
+    selectedTeam.value?.myRole === "EDITOR"
+  ) {
+    inviteTeam({ name: selectedTeam.value.name }, selectedTeam.value.id)
+  } else {
+    noPermission()
+  }
+})
+
+// 删除团队入口 - 仅 OWNER
+defineActionHandler("modals.team.delete", ({ teamId }) => {
+  if (selectedTeam.value?.myRole !== TeamAccessRole.Owner) return noPermission()
+  teamID.value = teamId
+  confirmRemove.value = true
+})
+```
+
+**权限判断一览**（Header.vue 中共 7 处直接使用 `selectedTeam.myRole`）：
+
+| 判断逻辑 | 控制元素 | 位置 |
+|---------|---------|------|
+| `selectedTeam?.myRole === 'OWNER'` | 顶部编辑按钮显示 | [Line 186](packages/hoppscotch-common/src/components/app/Header.vue#L186) |
+| `selectedTeam.value?.myRole === "OWNER"` | 编辑团队动作 | [Line 599](packages/hoppscotch-common/src/components/app/Header.vue#L599) |
+| `selectedTeam.value?.myRole === "OWNER"` | 邀请团队动作 | [Line 585](packages/hoppscotch-common/src/components/app/Header.vue#L585) |
+| `selectedTeam.value?.myRole === "OWNER"` \|\| `=== "EDITOR"` | 邀请成员动作 | [Line 639-640](packages/hoppscotch-common/src/components/app/Header.vue#L639-L640) |
+| `selectedTeam.value?.myRole !== TeamAccessRole.Owner` | 删除团队动作 | [Line 657](packages/hoppscotch-common/src/components/app/Header.vue#L657) |
+
+---
+
+### 5.2 后端 myRole 到前端 myRole 的完整数据流
+
+#### 第1步：后端 myRole 动态字段解析
 
 [src/team/team.resolver.ts:67-77](packages/hoppscotch-backend/src/team/team.resolver.ts#L67-L77)
 
@@ -408,7 +731,7 @@ myRole(
 }
 ```
 
-**实现逻辑**：`myRole` 是 Team 类型的一个动态字段 resolver，根据当前登录用户和团队ID，调用 `getRoleOfUserInTeam` 查询用户在该团队的角色。
+**实现逻辑**：`myRole` 是 Team 类型的动态字段 resolver，根据当前登录用户和团队ID，查询用户在该团队的角色。
 
 #### 第2步：GraphQL 查询包含 myRole
 
@@ -419,7 +742,7 @@ query GetMyTeams($cursor: ID) {
   myTeams(cursor: $cursor) {
     id
     name
-    myRole          # 关键：请求包含当前用户的角色
+    myRole          # 关键：包含当前用户的角色
     ownersCount
     teamMembers {
       membershipID
@@ -440,23 +763,20 @@ async fetchList() {
   
   while (true) {
     const cursor = results.length > 0 ? results[results.length - 1].id : undefined
-    
-    // 调用后端 GraphQL 接口，获取包含 myRole 的团队列表
     const result = await platform.backend.getUserTeams(cursor)
     
     if (E.isLeft(result)) { /* 错误处理 */ }
     
-    results.push(...result.right.myTeams)
+    results.push(...result.right.myTeams)  // 每个 team 包含 myRole
     
     if (result.right.myTeams.length !== BACKEND_PAGE_SIZE) break
   }
   
-  // 通过 BehaviorSubject 广播团队列表（包含每个团队的 myRole）
-  this.teamList$.next(results)
+  this.teamList$.next(results)  // 广播团队列表（含 myRole）
 }
 ```
 
-#### 第4步：工作区选择器消费团队列表并设置 role
+#### 第4步：切换工作区时设置 workspace.role（但未被消费）
 
 [src/components/workspace/Selector.vue:169-177](packages/hoppscotch-common/src/components/workspace/Selector.vue#L169-L177)
 
@@ -464,111 +784,123 @@ async fetchList() {
 const switchToTeamWorkspace = (team: GetMyTeamsQuery["myTeams"][number]) => {
   REMEMBERED_TEAM_ID.value = team.id
   
-  // 关键：将后端返回的 team.myRole 赋值给 workspace.role
+  // role 被设置，但后续没有组件使用 workspace.role
   workspaceService.changeWorkspace({
     teamID: team.id,
     teamName: team.name,
     type: "team",
-    role: team.myRole,  // myRole → workspace.role 的转换点
+    role: team.myRole,  // 设置了但未被消费
   })
 }
 ```
 
-#### 第5步：WorkspaceService 保存 role 并联动其他服务
-
-[src/services/workspace.service.ts:123-162](packages/hoppscotch-common/src/services/workspace.service.ts#L123-L162)
+#### 第5步：Header 组件通过 workspace.teamID 间接获取角色
 
 ```typescript
-private setupWorkspaceSync() {
-  watch(
-    [this._currentWorkspace, this.currentUser],
-    async ([newWorkspace, user], [oldWorkspace, oldUser]) => {
-      if (newWorkspace?.type === "team" && newWorkspace.teamID) {
-        // 切换到团队工作区时，同步 teamID 到集合服务
-        this.teamCollectionService.changeTeamID(newWorkspace.teamID)
-        
-        // 拉取该团队的文档数据
-        await this.documentationService.fetchTeamPublishedDocs(newWorkspace.teamID)
-      }
-    },
-    { immediate: true }
-  )
-}
-```
-
-#### 完整转换流程图
-
-```
-后端 TeamResolver.myRole
-    ↓ (GraphQL)
-GetMyTeams 查询包含 myRole 字段
-    ↓ (HTTP)
-TeamListAdapter.fetchList() 获取团队列表
-    ↓ (RxJS)
-teamList$.next(results) 广播团队数据（含 myRole）
-    ↓ (Vue watch)
-workspace Selector 显示团队列表供用户选择
-    ↓ (用户点击)
-switchToTeamWorkspace(team) 被调用
-    ↓
-workspaceService.changeWorkspace({
-  teamID: team.id,
-  teamName: team.name,
-  type: "team",
-  role: team.myRole  // 转换完成
+// Header.vue:527-555
+watch(myTeams, (newTeams) => {
+  const space = workspace.value
+  if (newTeams && space.type === "team" && space.teamID) {
+    // 通过 teamID 匹配，间接获得 myRole
+    const team = newTeams.find((team) => team.id === space.teamID)
+    if (team) selectedTeam.value = team  // selectedTeam 包含 myRole
+  }
 })
+```
+
+#### 完整真实数据流图
+
+```
+后端 TeamResolver.myRole (动态字段)
+    ↓ (GraphQL)
+GetMyTeams 查询返回含 myRole 的团队列表
+    ↓ (HTTP)
+TeamListAdapter.fetchList() → teamList$.next(results)
     ↓
-setupWorkspaceSync() 触发联动
-    → teamCollectionService.changeTeamID(teamID)
-    → documentationService.fetchTeamPublishedDocs(teamID)
-    → 前端各组件根据 workspace.role 控制 UI 权限
+    ├─ 路径一：Team.vue (团队列表页)
+    │     └─ 直接使用 props.team.myRole 控制 UI
+    │
+    └─ 路径二：Header.vue (顶部导航)
+          ├─ watch(myTeams) → 通过 teamID 匹配
+          ├─ selectedTeam.value = matchedTeam
+          └─ 使用 selectedTeam.myRole 控制 UI
+
+注：workspace.role 被设置但未被任何组件消费，是"死字段"
 ```
 
 ---
 
-### 5.3 前端权限控制应用示例
+### 5.3 其他场景的 myRole 消费
 
-前端通过 `workspace.role` 控制 UI 元素的显示与隐藏：
+#### 用户删除账户时检查团队所有权
 
+[src/components/profile/UserDelete.vue:163](packages/hoppscotch-common/src/components/profile/UserDelete.vue#L163)
 ```typescript
-// 示例：根据角色判断是否显示编辑按钮
-const canEdit = computed(() => {
-  const role = workspaceService.currentWorkspace.value.role
-  return role === TeamAccessRole.OWNER || role === TeamAccessRole.EDITOR
-})
-
-// 示例：根据角色判断是否显示成员管理入口
-const canManageMembers = computed(() => {
-  const role = workspaceService.currentWorkspace.value.role
-  return role === TeamAccessRole.OWNER
+// 检查是否有团队是唯一 OWNER，如果有则不能删除账户
+const isOnlyOwnerOfATeam = computed(() => {
+  return teams.value?.some(
+    (team) => team.ownersCount === 1 && team.myRole === "OWNER"
+  )
 })
 ```
 
-**重要提示**：前端 UI 控制仅为体验优化，**真实权限校验始终在服务端通过守卫执行**。
+#### 环境选择器切换时设置 role（同样未被消费）
+
+[src/components/environments/Selector.vue:441](packages/hoppscotch-common/src/components/environments/Selector.vue#L441)
+```typescript
+// 同样设置了 role，但未被消费
+workspaceService.changeWorkspace({
+  type: "team",
+  teamID: team.id,
+  teamName: team.name,
+  role: team.myRole,
+})
+```
+
+---
+
+### 5.4 关键发现总结
+
+1. **`workspace.role` 是死字段**：虽然定义了并在切换时赋值，但全库搜索确认没有任何组件通过 `workspace.role` 或 `currentWorkspace.value.role` 做权限判断。
+
+2. **两种真实消费模式**：
+   - **列表模式**（Team.vue）：遍历团队列表时，直接使用每个 `team.myRole`
+   - **选中模式**（Header.vue）：通过 `workspace.teamID` 从团队列表中找到 `selectedTeam`，然后使用 `selectedTeam.myRole`
+
+3. **数据单一来源**：所有前端角色信息都来自 `GetMyTeams` 查询返回的 `team.myRole` 字段，这是后端动态计算的结果。
+
+4. **前端权限控制仅为体验优化**：即使前端绕过 UI 限制，后端守卫仍会对每个请求进行权限校验，确保安全性。
 
 ## 6. 架构特点与设计思考
 
-### 6.1 优点
+### 6.1 优点（均有代码证据支持）
 
-1. **统一权限模型**：所有资源的权限最终都派生自团队成员角色，避免了复杂的细粒度权限管理
+1. **统一权限模型**：所有资源的权限最终都派生自团队成员角色，避免了复杂的细粒度权限管理。代码证据：所有守卫最终都调用 `teamService.getTeamMember(teamID, user.uid)` 获取角色。
 
-2. **守卫分层设计**：不同资源级别使用专门的守卫，职责清晰，易于维护
+2. **守卫分层设计**：不同资源级别使用专门的守卫，职责清晰，易于维护。代码证据：5 个守卫类分别处理团队级、集合级、请求级、环境级、REST 接口的权限验证。
 
-3. **声明式权限**：通过装饰器 `@RequiresTeamRole` 声明权限要求，代码可读性高
+3. **声明式权限**：通过装饰器 `@RequiresTeamRole` 声明权限要求，代码可读性高。代码证据：[src/team/decorators/requires-team-role.decorator.ts:1-5](packages/hoppscotch-backend/src/team/decorators/requires-team-role.decorator.ts#L1-L5)
 
-4. **运行时验证**：所有权限检查在服务端执行，前端仅做 UI 控制，安全性有保障
+4. **运行时验证**：所有权限检查在服务端执行，前端仅做 UI 控制，安全性有保障。代码证据：前端 18 处 `myRole` 使用仅用于 UI 显示/隐藏，后端守卫对每个请求独立校验。
 
-5. **级联删除**：数据库层面配置 `onDelete: Cascade`，保证数据一致性
+5. **级联删除**：数据库层面配置 `onDelete: Cascade`，保证数据一致性。代码证据：[prisma/schema.prisma:48](packages/hoppscotch-backend/prisma/schema.prisma#L48)
 
-### 6.2 潜在优化点
+### 6.2 基于代码观察的架构特点
 
-1. **权限缓存**：频繁调用 `getTeamMember` 可能导致重复查询，可考虑在守卫层增加缓存
+1. **`getTeamMember` 高频调用**：`getTeamMember` 方法在 5 个守卫中被独立调用，每次请求至少触发一次数据库查询。代码证据：
+   - GqlTeamMemberGuard [Line 37](packages/hoppscotch-backend/src/team/guards/gql-team-member.guard.ts#L37)
+   - GqlCollectionTeamMemberGuard [Line 43](packages/hoppscotch-backend/src/team-collection/guards/gql-collection-team-member.guard.ts#L43)
+   - GqlRequestTeamMemberGuard [Line 43](packages/hoppscotch-backend/src/team-request/guards/gql-request-team-member.guard.ts#L43)
+   - GqlTeamEnvTeamGuard [Line 49](packages/hoppscotch-backend/src/team-environments/gql-team-env-team.guard.ts#L49)
+   - RESTTeamMemberGuard [Line 39](packages/hoppscotch-backend/src/team/guards/rest-team-member.guard.ts#L39)
 
-2. **角色继承**：当前实现需要显式列出所有允许的角色（如 `OWNER, EDITOR, VIEWER`），可考虑角色继承机制（OWNER 自动拥有 EDITOR 和 VIEWER 权限）
+2. **无角色继承机制**：每个 `@RequiresTeamRole` 装饰器必须显式列出所有允许的角色，没有实现 OWNER 自动包含 EDITOR 权限的继承机制。代码证据：所有 resolver 都显式列出 `TeamAccessRole.VIEWER, TeamAccessRole.EDITOR, TeamAccessRole.OWNER` 三种角色。
 
-3. **操作日志**：权限敏感操作缺乏审计日志记录
+3. **无权限缓存机制**：每次请求都独立查询 `TeamMember` 表，没有请求级或应用级的角色缓存。
 
-4. **批量权限检查**：对于列表查询场景，目前是逐条检查，可优化为批量预检查
+4. **错误码分类清晰**：错误码分为 `BUG_*`（代码错误）和 `TEAM_*`（业务错误）两类，便于排错。代码证据：[src/errors.ts:513-558](packages/hoppscotch-backend/src/errors.ts#L513-L558)
+
+5. **死字段存在**：`workspace.role` 字段定义并赋值但未被消费，可能是历史遗留代码或未来预留功能。代码证据：[src/services/workspace.service.ts:24](packages/hoppscotch-common/src/services/workspace.service.ts#L24) 定义了 role 字段，但全库无消费代码。
 
 ## 7. 总结：权限传播完整链路
 
@@ -602,23 +934,29 @@ const canManageMembers = computed(() => {
 允许创建环境
 ```
 
-### 7.3 前端角色感知全链路
+### 7.3 前端角色感知全链路（修正版）
 
 ```
-后端 myRole resolver → GraphQL GetMyTeams 查询
+后端 myRole resolver (动态字段)
+    ↓ (GraphQL)
+GetMyTeams 查询返回含 myRole 的团队列表
+    ↓ (HTTP)
+TeamListAdapter.fetchList() → teamList$.next(results)
     ↓
-TeamListAdapter 拉取团队列表（含 myRole）
-    ↓
-用户选择团队 → switchToTeamWorkspace(team)
-    ↓
-workspace.role = team.myRole → 保存到 WorkspaceService
-    ↓
-前端组件根据 workspace.role 控制 UI 显示
+    ├─ 路径一：Team.vue (团队列表页)
+    │     └─ 直接使用 props.team.myRole 控制 UI
+    │
+    └─ 路径二：Header.vue (顶部导航)
+          ├─ watch(myTeams) → 通过 workspace.teamID 匹配
+          ├─ selectedTeam.value = matchedTeam
+          └─ 使用 selectedTeam.myRole 控制 UI
+
+注：workspace.role 被设置但未被消费，是死字段
 ```
 
 ---
 
-### 7.4 关键洞察（修正版）
+### 7.4 关键洞察（最终修正版）
 
 1. **创建操作的守卫选择是关键**：资源创建时目标资源ID不存在，必须通过**父资源ID**或**直接teamID**进行权限验证：
    - 创建请求 → 使用 `GqlCollectionTeamMemberGuard`（通过 collectionID）
@@ -630,8 +968,19 @@ workspace.role = team.myRole → 保存到 WorkspaceService
    - GraphQL 接口使用 `Gql*TeamMemberGuard` 系列，从 `gqlExecCtx.getArgs()` 提取参数
    - REST 接口使用 `RESTTeamMemberGuard`，从 `request.params` 提取 URL 参数
 
-4. **myRole 是动态计算字段**：前端获得的角色信息并非直接存储的字段，而是后端根据当前登录用户动态计算的 resolver 结果。
+4. **所有守卫均使用 throw，无 return false**：
+   - GraphQL 守卫：`throw new Error(ERROR_CODE)`，错误码在 `errors[0].message` 中
+   - REST 守卫：`throwHTTPErr({ message, statusCode })`，直接返回带状态码的 HTTP 响应
+   - 错误码前缀：`BUG_*` 表示代码错误，`TEAM_*` 表示业务错误
 
-5. **前端权限控制仅为体验优化**：即使前端隐藏了某些按钮，后端守卫仍会对每个请求进行权限校验，确保安全性。
+5. **myRole 是动态计算字段**：前端获得的角色信息并非直接存储的字段，而是后端根据当前登录用户动态计算的 resolver 结果。
 
-6. **这种设计的局限性**：由于权限完全派生自团队角色，系统**不支持对单个集合、请求或环境设置独立的访问权限**。所有同团队内的资源权限级别一致。
+6. **`workspace.role` 是死字段**：虽然类型定义中存在并在切换工作区时赋值，但全库搜索确认没有任何组件通过 `workspace.role` 做权限判断。
+
+7. **前端角色消费的两条真实路径**：
+   - **列表模式**（Team.vue）：遍历团队列表时，直接使用每个 `team.myRole`（11处使用）
+   - **选中模式**（Header.vue）：通过 `workspace.teamID` 从团队列表中找到 `selectedTeam`，然后使用 `selectedTeam.myRole`（7处使用）
+
+8. **前端权限控制仅为体验优化**：即使前端绕过 UI 限制，后端守卫仍会对每个请求进行权限校验，确保安全性。
+
+9. **这种设计的局限性**：由于权限完全派生自团队角色，系统**不支持对单个集合、请求或环境设置独立的访问权限**。所有同团队内的资源权限级别一致。
