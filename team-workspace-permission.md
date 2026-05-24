@@ -198,12 +198,44 @@ async canActivate(context: ExecutionContext): Promise<boolean> {
 
 #### 三种失败处理方式的语义对比
 
-| 失败处理方式 | 使用守卫 | NestJS 处理结果 | 错误信息可用性 | 排错难度 |
-|-------------|---------|----------------|--------------|----------|
-| `throw new Error(ERROR_CODE)` | GqlTeamMemberGuard、GqlCollectionTeamMemberGuard（非角色检查）、GqlRequestTeamMemberGuard、GqlTeamEnvTeamGuard（非角色检查） | 包装为 GraphQL `errors[0].message = ERROR_CODE` | ✅ 完整错误码 | 低 - 可直接定位 |
-| `throwErr(ERROR_CODE)` | GqlRequestTeamMemberGuard（成员不存在）、GqlTeamEnvTeamGuard（无 id/环境不存在/成员不存在） | 同上，本质也是 `throw new Error` | ✅ 完整错误码 | 低 - 可直接定位 |
-| **`return false`** | **GqlCollectionTeamMemberGuard（角色检查）**、**GqlTeamEnvTeamGuard（角色检查）** | NestJS 抛出通用 `Forbidden` 异常 | ❌ 无具体错误码，仅显示 "Forbidden" | 高 - 无法区分是角色不足还是其他原因 |
-| `throwHTTPErr({ message, statusCode })` | RESTTeamMemberGuard | 标准 HTTP 响应，状态码 + 响应体 | ✅ 状态码 + 错误码 | 极低 - 状态码直接区分 |
+| 失败处理方式 | 使用场景 | 使用守卫 | NestJS 处理结果 | 错误信息可用性 | 排错难度 |
+|-------------|---------|---------|----------------|--------------|----------|
+| `throw new Error(ERROR_CODE)` | 所有非角色检查阶段（缺少装饰器、无用户、无ID、资源不存在、成员不存在） | GqlTeamMemberGuard、GqlCollectionTeamMemberGuard、GqlRequestTeamMemberGuard、GqlTeamEnvTeamGuard | 包装为 GraphQL `errors[0].message = ERROR_CODE` | ✅ 完整错误码 | 低 - 可直接定位 |
+| `throwErr(ERROR_CODE)` | 部分非角色检查阶段（无 id、环境不存在、成员不存在） | GqlRequestTeamMemberGuard、GqlTeamEnvTeamGuard | 同上，本质也是 `throw new Error` | ✅ 完整错误码 | 低 - 可直接定位 |
+| **`return false`** | **仅角色检查阶段（角色不匹配）** | **GqlCollectionTeamMemberGuard（角色检查）**、**GqlTeamEnvTeamGuard（角色检查）** | NestJS 抛出通用 `Forbidden` 异常 | ❌ 无具体错误码，仅显示 "Forbidden" | 中 - 可先排除其他阶段错误 |
+| `throwHTTPErr({ message, statusCode })` | 所有检查阶段 | RESTTeamMemberGuard | 标准 HTTP 响应，状态码 + 响应体 | ✅ 状态码 + 错误码 | 极低 - 状态码直接区分 |
+
+---
+
+#### return false 的影响说明：区分两种失败场景
+
+**重要澄清**：GqlCollectionTeamMemberGuard 和 GqlTeamEnvTeamGuard 并非所有错误都返回通用 Forbidden，而是**分阶段处理**：
+
+**阶段一：前置检查（资源存在性、参数完整性）→ throw 明确错误码**
+```typescript
+// GqlCollectionTeamMemberGuard:
+if (!requireRoles) throw new Error(BUG_TEAM_NO_REQUIRE_TEAM_ROLE);
+if (user == undefined) throw new Error(BUG_AUTH_NO_USER_CTX);
+if (!collectionID) throw new Error(BUG_TEAM_COLL_NO_COLL_ID);
+if (E.isLeft(collection)) throw new Error(TEAM_INVALID_COLL_ID);
+if (!member) throw new Error(TEAM_REQ_NOT_MEMBER);
+```
+
+**阶段二：角色权限检查 → return false（通用 Forbidden）**
+```typescript
+// 仅这一步 return false，丢失具体错误码
+return requireRoles.includes(member.role);
+```
+
+**排错影响**：
+- ✅ 如果是**资源不存在**（如 collectionID 无效），会返回明确的 `TEAM_INVALID_COLL_ID` 错误码
+- ✅ 如果是**用户不是成员**，会返回明确的 `TEAM_REQ_NOT_MEMBER` 错误码
+- ⚠️ 只有**角色不匹配**时，才返回通用 "Forbidden"，此时可以通过排除法判断：如果没有收到其他错误码但收到 Forbidden，基本可以确定是角色权限不足
+- 因此，排错难度为"中"而非"高"，因为大部分错误场景仍有明确错误码
+
+**复核影响**：
+- 审计权限失败日志时，"Forbidden" 无法区分是 VIEWER 尝试 EDIT 操作，还是其他权限边界问题
+- 建议统一改为 throw 带错误码的异常，便于审计和问题定位
 
 **工具函数实现** [src/utils.ts:44-55](packages/hoppscotch-backend/src/utils.ts#L44-L55)
 ```typescript
@@ -733,12 +765,17 @@ const props = defineProps<{
 
 | 判断逻辑 | 控制元素 | 位置 |
 |---------|---------|------|
+| `team.myRole === 'OWNER'` | class 样式 | [Line 10](packages/hoppscotch-common/src/components/teams/Team.vue#L10) |
+| `team.myRole === 'OWNER'` | @click 邀请动作 | [Line 17](packages/hoppscotch-common/src/components/teams/Team.vue#L17) |
+| `team.myRole === 'OWNER'` | :class 光标样式 | [Line 26](packages/hoppscotch-common/src/components/teams/Team.vue#L26) |
 | `team.myRole === 'OWNER'` | 编辑按钮显示 | [Line 36](packages/hoppscotch-common/src/components/teams/Team.vue#L36) |
 | `team.myRole === 'OWNER'` | 邀请按钮显示 | [Line 47](packages/hoppscotch-common/src/components/teams/Team.vue#L47) |
-| `team.myRole === 'OWNER'` | 删除菜单显示 | [Line 88](packages/hoppscotch-common/src/components/teams/Team.vue#L88) |
-| `team.myRole === 'OWNER'` | 光标样式 | [Line 26](packages/hoppscotch-common/src/components/teams/Team.vue#L26) |
-| `team.myRole === 'OWNER'` | 点击邀请动作 | [Line 17](packages/hoppscotch-common/src/components/teams/Team.vue#L17) |
-| `!(team.myRole === 'OWNER' && team.ownersCount == 1)` | 退出按钮显示 | [Line 101](packages/hoppscotch-common/src/components/teams/Team.vue#L101) |
+| `team.myRole === 'OWNER'` | @keyup.e 快捷键 | [Line 76](packages/hoppscotch-common/src/components/teams/Team.vue#L76) |
+| `team.myRole === 'OWNER'` | @keyup.x 快捷键条件 | [Line 78](packages/hoppscotch-common/src/components/teams/Team.vue#L78) |
+| `team.myRole === 'OWNER'` | @keyup.delete 快捷键 | [Line 83](packages/hoppscotch-common/src/components/teams/Team.vue#L83) |
+| `team.myRole === 'OWNER'` | 编辑菜单项显示 | [Line 88](packages/hoppscotch-common/src/components/teams/Team.vue#L88) |
+| `!(team.myRole === 'OWNER' && team.ownersCount == 1)` | 退出菜单项显示 | [Line 101](packages/hoppscotch-common/src/components/teams/Team.vue#L101) |
+| `team.myRole === 'OWNER'` | 删除菜单项显示 | [Line 114](packages/hoppscotch-common/src/components/teams/Team.vue#L114) |
 
 ---
 
@@ -821,15 +858,17 @@ defineActionHandler("modals.team.delete", ({ teamId }) => {
 })
 ```
 
-**权限判断一览**（Header.vue 中共 7 处直接使用 `selectedTeam.myRole`）：
+**权限判断一览**（Header.vue 中共 6 处直接使用 `selectedTeam.myRole`）：
 
 | 判断逻辑 | 控制元素 | 位置 |
 |---------|---------|------|
 | `selectedTeam?.myRole === 'OWNER'` | 顶部编辑按钮显示 | [Line 186](packages/hoppscotch-common/src/components/app/Header.vue#L186) |
-| `selectedTeam.value?.myRole === "OWNER"` | 编辑团队动作 | [Line 599](packages/hoppscotch-common/src/components/app/Header.vue#L599) |
-| `selectedTeam.value?.myRole === "OWNER"` | 邀请团队动作 | [Line 585](packages/hoppscotch-common/src/components/app/Header.vue#L585) |
-| `selectedTeam.value?.myRole === "OWNER"` \|\| `=== "EDITOR"` | 邀请成员动作 | [Line 639-640](packages/hoppscotch-common/src/components/app/Header.vue#L639-L640) |
-| `selectedTeam.value?.myRole !== TeamAccessRole.Owner` | 删除团队动作 | [Line 657](packages/hoppscotch-common/src/components/app/Header.vue#L657) |
+| `selectedTeam.value?.myRole === "OWNER"` | 邀请团队动作（handleInvite） | [Line 585](packages/hoppscotch-common/src/components/app/Header.vue#L585) |
+| `selectedTeam.value?.myRole === "OWNER"` | 编辑团队动作（handleTeamEdit） | [Line 599](packages/hoppscotch-common/src/components/app/Header.vue#L599) |
+| `selectedTeam.value?.myRole === "OWNER"` \|\| `=== "EDITOR"` | 邀请成员动作（defineActionHandler） | [Line 639-640](packages/hoppscotch-common/src/components/app/Header.vue#L639-L640) |
+| `selectedTeam.value?.myRole !== TeamAccessRole.Owner` | 删除团队动作（defineActionHandler） | [Line 657](packages/hoppscotch-common/src/components/app/Header.vue#L657) |
+
+> 注：Line 639-640 是同一处代码的两个条件判断，计为 1 处使用。
 
 ---
 
@@ -1102,7 +1141,7 @@ TeamListAdapter.fetchList() → teamList$.next(results)
 
 7. **前端角色消费的两条真实路径**：
    - **列表模式**（Team.vue）：遍历团队列表时，直接使用每个 `team.myRole`（11处使用）
-   - **选中模式**（Header.vue）：通过 `workspace.teamID` 从团队列表中找到 `selectedTeam`，然后使用 `selectedTeam.myRole`（7处使用）
+   - **选中模式**（Header.vue）：通过 `workspace.teamID` 从团队列表中找到 `selectedTeam`，然后使用 `selectedTeam.myRole`（6处使用）
 
 8. **前端权限控制仅为体验优化**：即使前端绕过 UI 限制，后端守卫仍会对每个请求进行权限校验，确保安全性。
 
