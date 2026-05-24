@@ -143,9 +143,12 @@ async canActivate(context: ExecutionContext): Promise<boolean> {
 
   if (requireRoles.includes(teamMember.role)) return true;
 
+  // 角色不匹配时 throw 错误，包含明确错误码
   throw new Error(TEAM_NOT_REQUIRED_ROLE);
 }
 ```
+
+**设计一致性说明**：GqlTeamMemberGuard 在所有检查阶段（包括角色检查）都使用 `throw new Error(ERROR_CODE)`，每个错误都带有明确的错误码。这种设计比 GqlCollectionTeamMemberGuard 和 GqlTeamEnvTeamGuard 更一致，排错更简单。
 
 **典型应用场景**：
 - 查看团队详情
@@ -157,19 +160,54 @@ async canActivate(context: ExecutionContext): Promise<boolean> {
 
 ### 3.3.1 守卫授权失败路径的语义差异
 
-**重要发现**：所有守卫**没有使用 `return false`**，全部采用 `throw` 方式拒绝访问。但不同守卫使用了三种不同的 throw 方式，语义和排错影响不同：
+**重要修正**：经过逐条源码验证，**并非所有守卫都仅通过 throw 拒绝访问**。5 个守卫的失败处理方式存在明显差异，具体如下：
 
-| 守卫类                     | 错误抛出方式               | 错误类型        | 语义差异                                  | 排错影响                                  |
-|--------------------------|----------------------------|-----------------|-------------------------------------------|-------------------------------------------|
-| GqlTeamMemberGuard       | `throw new Error(msg)`     | Error           | 直接抛出通用错误                          | 需要从 error.message 解析错误码           |
-| GqlCollectionTeamMemberGuard | `throw new Error(msg)` | Error           | 直接抛出通用错误                          | 需要从 error.message 解析错误码           |
-| GqlRequestTeamMemberGuard | `throwErr(msg)` (部分场景) | Error           | 本质也是 `throw new Error`，工具函数封装  | 同上，但部分路径使用 `throwErr`           |
-| GqlTeamEnvTeamGuard      | `throwErr(msg)`            | Error           | 全部使用工具函数封装                      | 同上                                      |
-| RESTTeamMemberGuard      | `throwHTTPErr({msg, code})`| HttpException   | 抛出带状态码的 HTTP 异常                  | 直接返回带状态码的 HTTP 响应，前端可直接识别 |
+#### 各守卫失败路径逐条分析
+
+| 守卫类                     | 检查阶段               | 失败处理方式                          | 代码行 |
+|--------------------------|------------------------|-----------------------------------|--------|
+| **GqlTeamMemberGuard**   | 缺少装饰器             | `throw new Error(BUG_TEAM_NO_REQUIRE_TEAM_ROLE)` | [Line 26](packages/hoppscotch-backend/src/team/guards/gql-team-member.guard.ts#L26) |
+|                          | 无用户上下文           | `throw new Error(BUG_AUTH_NO_USER_CTX)` | [Line 32](packages/hoppscotch-backend/src/team/guards/gql-team-member.guard.ts#L32) |
+|                          | 无 teamID              | `throw new Error(BUG_TEAM_NO_TEAM_ID)` | [Line 35](packages/hoppscotch-backend/src/team/guards/gql-team-member.guard.ts#L35) |
+|                          | 成员不存在             | `throw new Error(TEAM_MEMBER_NOT_FOUND)` | [Line 38](packages/hoppscotch-backend/src/team/guards/gql-team-member.guard.ts#L38) |
+|                          | **角色不匹配**         | `throw new Error(TEAM_NOT_REQUIRED_ROLE)` | [Line 42](packages/hoppscotch-backend/src/team/guards/gql-team-member.guard.ts#L42) |
+| **GqlCollectionTeamMemberGuard** | 缺少装饰器     | `throw new Error(BUG_TEAM_NO_REQUIRE_TEAM_ROLE)` | [Line 29](packages/hoppscotch-backend/src/team-collection/guards/gql-collection-team-member.guard.ts#L29) |
+|                          | 无用户上下文           | `throw new Error(BUG_AUTH_NO_USER_CTX)` | [Line 34](packages/hoppscotch-backend/src/team-collection/guards/gql-collection-team-member.guard.ts#L34) |
+|                          | 无 collectionID        | `throw new Error(BUG_TEAM_COLL_NO_COLL_ID)` | [Line 37](packages/hoppscotch-backend/src/team-collection/guards/gql-collection-team-member.guard.ts#L37) |
+|                          | 集合不存在             | `throw new Error(TEAM_INVALID_COLL_ID)` | [Line 41](packages/hoppscotch-backend/src/team-collection/guards/gql-collection-team-member.guard.ts#L41) |
+|                          | 成员不存在             | `throw new Error(TEAM_REQ_NOT_MEMBER)` | [Line 47](packages/hoppscotch-backend/src/team-collection/guards/gql-collection-team-member.guard.ts#L47) |
+|                          | **角色不匹配**         | `return requireRoles.includes(...)` → **return false** | [Line 49](packages/hoppscotch-backend/src/team-collection/guards/gql-collection-team-member.guard.ts#L49) |
+| **GqlRequestTeamMemberGuard** | 无用户上下文     | `throw new Error(BUG_AUTH_NO_USER_CTX)` | [Line 34](packages/hoppscotch-backend/src/team-request/guards/gql-request-team-member.guard.ts#L34) |
+|                          | 无 requestID           | `throw new Error(BUG_TEAM_REQ_NO_REQ_ID)` | [Line 37](packages/hoppscotch-backend/src/team-request/guards/gql-request-team-member.guard.ts#L37) |
+|                          | 请求不存在             | `throw new Error(TEAM_REQ_NOT_FOUND)` | [Line 41](packages/hoppscotch-backend/src/team-request/guards/gql-request-team-member.guard.ts#L41) |
+|                          | 成员不存在             | `throwErr(TEAM_REQ_NOT_MEMBER)` | [Line 47](packages/hoppscotch-backend/src/team-request/guards/gql-request-team-member.guard.ts#L47) |
+|                          | **角色不匹配**         | `throw new Error(TEAM_REQ_NOT_REQUIRED_ROLE)` | [Line 50](packages/hoppscotch-backend/src/team-request/guards/gql-request-team-member.guard.ts#L50) |
+| **GqlTeamEnvTeamGuard**  | 缺少装饰器             | `throw new Error(BUG_TEAM_ENV_GUARD_NO_REQUIRE_ROLES)` | [Line 35](packages/hoppscotch-backend/src/team-environments/gql-team-env-team.guard.ts#L35) |
+|                          | 无用户上下文           | `throw new Error(BUG_AUTH_NO_USER_CTX)` | [Line 40](packages/hoppscotch-backend/src/team-environments/gql-team-env-team.guard.ts#L40) |
+|                          | 无 id                 | `throwErr(BUG_TEAM_ENV_GUARD_NO_ENV_ID)` | [Line 43](packages/hoppscotch-backend/src/team-environments/gql-team-env-team.guard.ts#L43) |
+|                          | 环境不存在             | `throwErr(TEAM_ENVIRONMENT_NOT_FOUND)` | [Line 47](packages/hoppscotch-backend/src/team-environments/gql-team-env-team.guard.ts#L47) |
+|                          | 成员不存在             | `throwErr(TEAM_ENVIRONMENT_NOT_TEAM_MEMBER)` | [Line 53](packages/hoppscotch-backend/src/team-environments/gql-team-env-team.guard.ts#L53) |
+|                          | **角色不匹配**         | `return requireRoles.includes(...)` → **return false** | [Line 55](packages/hoppscotch-backend/src/team-environments/gql-team-env-team.guard.ts#L55) |
+| **RESTTeamMemberGuard**  | 缺少装饰器             | `throwHTTPErr({ message: BUG_TEAM_NO_REQUIRE_TEAM_ROLE, statusCode: 400 })` | [Line 27](packages/hoppscotch-backend/src/team/guards/rest-team-member.guard.ts#L27) |
+|                          | 无用户上下文           | `throwHTTPErr({ message: BUG_AUTH_NO_USER_CTX, statusCode: 400 })` | [Line 33](packages/hoppscotch-backend/src/team/guards/rest-team-member.guard.ts#L33) |
+|                          | 无 teamID              | `throwHTTPErr({ message: BUG_TEAM_NO_TEAM_ID, statusCode: 400 })` | [Line 37](packages/hoppscotch-backend/src/team/guards/rest-team-member.guard.ts#L37) |
+|                          | 成员不存在             | `throwHTTPErr({ message: TEAM_MEMBER_NOT_FOUND, statusCode: 404 })` | [Line 41](packages/hoppscotch-backend/src/team/guards/rest-team-member.guard.ts#L41) |
+|                          | **角色不匹配**         | `throwHTTPErr({ message: TEAM_NOT_REQUIRED_ROLE, statusCode: 403 })` | [Line 45](packages/hoppscotch-backend/src/team/guards/rest-team-member.guard.ts#L45) |
+
+---
+
+#### 三种失败处理方式的语义对比
+
+| 失败处理方式 | 使用守卫 | NestJS 处理结果 | 错误信息可用性 | 排错难度 |
+|-------------|---------|----------------|--------------|----------|
+| `throw new Error(ERROR_CODE)` | GqlTeamMemberGuard、GqlCollectionTeamMemberGuard（非角色检查）、GqlRequestTeamMemberGuard、GqlTeamEnvTeamGuard（非角色检查） | 包装为 GraphQL `errors[0].message = ERROR_CODE` | ✅ 完整错误码 | 低 - 可直接定位 |
+| `throwErr(ERROR_CODE)` | GqlRequestTeamMemberGuard（成员不存在）、GqlTeamEnvTeamGuard（无 id/环境不存在/成员不存在） | 同上，本质也是 `throw new Error` | ✅ 完整错误码 | 低 - 可直接定位 |
+| **`return false`** | **GqlCollectionTeamMemberGuard（角色检查）**、**GqlTeamEnvTeamGuard（角色检查）** | NestJS 抛出通用 `Forbidden` 异常 | ❌ 无具体错误码，仅显示 "Forbidden" | 高 - 无法区分是角色不足还是其他原因 |
+| `throwHTTPErr({ message, statusCode })` | RESTTeamMemberGuard | 标准 HTTP 响应，状态码 + 响应体 | ✅ 状态码 + 错误码 | 极低 - 状态码直接区分 |
 
 **工具函数实现** [src/utils.ts:44-55](packages/hoppscotch-backend/src/utils.ts#L44-L55)
 ```typescript
-// 作为表达式使用的 throw 封装
+// 作为表达式使用的 throw 封装（返回类型为 never，表示永不返回）
 export function throwErr(errMessage: string): never {
   throw new Error(errMessage);
 }
@@ -181,28 +219,86 @@ export function throwHTTPErr(errorData: RESTError): never {
 }
 ```
 
-**对排错和复核的影响**：
+---
 
-1. **GraphQL 守卫**（前四个）：
-   - 错误被 NestJS GraphQL 模块捕获后，会包装成 GraphQL errors 数组中的 `message` 字段
-   - 排错时需要从 `errors[0].message` 中提取错误码（如 `team/not_required_role`）
-   - 由于是统一的 `Error` 类型，无法通过 `instanceof` 判断错误类别
-   - 复核时需要对比错误码与 `src/errors.ts` 中的定义
+#### GraphQL 守卫与 REST 守卫失败返回语义的实际差异
 
-2. **REST 守卫**（RESTTeamMemberGuard）：
-   - 直接抛出 `HttpException`，NestJS 会转换为标准 HTTP 响应
-   - 状态码语义明确：400（参数错误）、403（权限不足）、404（资源不存在）
-   - 排错时直接看 HTTP 状态码和响应体即可
-   - 复核时可直接通过状态码快速定位问题类别
+**1. GraphQL 守卫（4个）**
 
-3. **错误码分类**（来自 [src/errors.ts](packages/hoppscotch-backend/src/errors.ts)）：
-   - `BUG_*` 前缀：表示代码 bug（如缺少装饰器、缺少参数）
-   - `TEAM_*` 前缀：表示业务错误（如成员不存在、角色不足）
+**throw 错误的响应格式**：
+```json
+{
+  "errors": [
+    {
+      "message": "team/not_required_role",
+      "locations": [{ "line": 2, "column": 3 }],
+      "path": ["getTeam"]
+    }
+  ]
+}
+```
+
+**return false 的响应格式**（GqlCollectionTeamMemberGuard 和 GqlTeamEnvTeamGuard 角色检查失败）：
+```json
+{
+  "errors": [
+    {
+      "message": "Forbidden",
+      "locations": [{ "line": 2, "column": 3 }],
+      "path": ["getTeamCollection"]
+    }
+  ]
+}
+```
+
+**排错影响**：
+- throw 错误：可直接从 `errors[0].message` 提取错误码，快速定位问题
+- return false：仅显示 "Forbidden"，**无法区分是角色不足、资源不存在还是其他权限问题**，排错时需要：
+  1. 检查请求参数是否正确
+  2. 检查用户是否为团队成员
+  3. 检查用户角色是否满足要求
+  4. 逐行调试守卫代码确认失败原因
+
+**2. REST 守卫（1个）**
+
+**throwHTTPErr 的响应格式**：
+```http
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{
+  "statusCode": 403,
+  "message": "team/not_required_role"
+}
+```
+
+**排错影响**：
+- 状态码语义明确：
+  - `400` - 参数错误（缺少装饰器、无用户上下文、无 teamID）
+  - `403` - 权限不足（角色不匹配）
+  - `404` - 资源不存在（成员不存在）
+- 无需解析 GraphQL errors 结构，直接从 HTTP 状态码和响应体即可定位问题
+- 前端可直接根据状态码进行差异化处理
+
+---
+
+#### 错误码分类（来自 [src/errors.ts:513-558](packages/hoppscotch-backend/src/errors.ts#L513-L558)）：
+- `BUG_*` 前缀：表示代码 bug（如缺少装饰器、缺少参数）
+- `TEAM_*` 前缀：表示业务错误（如成员不存在、角色不足）
 
 **示例错误码**：
 - `BUG_TEAM_NO_REQUIRE_TEAM_ROLE` - 代码错误：缺少 @RequiresTeamRole 装饰器
 - `TEAM_MEMBER_NOT_FOUND` - 业务错误：用户不是该团队成员
 - `TEAM_NOT_REQUIRED_ROLE` - 业务错误：用户角色不满足操作要求
+
+---
+
+#### 不一致性发现
+
+**GqlRequestTeamMemberGuard 的特殊处理**：
+与其他守卫不同，GqlRequestTeamMemberGuard 在 Line 26 没有检查 `requireRoles` 是否存在，而是延迟到 Line 49 才检查 `!(requireRoles && requireRoles.includes(member.role))`。如果忘记添加 `@RequiresTeamRole` 装饰器，`requireRoles` 为 `undefined`，会直接 throw 错误。
+
+这种不一致性可能导致开发时难以发现缺少装饰器的问题。
 
 ---
 
@@ -236,9 +332,12 @@ async canActivate(context: ExecutionContext): Promise<boolean> {
   );
   if (!member) throw new Error(TEAM_REQ_NOT_MEMBER);
 
+  // ⚠️ 注意：角色检查使用 return 布尔值，失败时 return false，不 throw 错误码
   return requireRoles.includes(member.role);
 }
 ```
+
+**不一致性说明**：GqlCollectionTeamMemberGuard 在角色检查阶段使用 `return requireRoles.includes(member.role)`，当角色不匹配时 return `false`，而不是 throw 带错误码的异常。NestJS 会将 return false 转换为通用 "Forbidden" 错误，丢失具体错误信息，增加排错难度。
 
 **权限派生链路**：
 ```
@@ -282,12 +381,15 @@ async canActivate(context: ExecutionContext): Promise<boolean> {
   );
   if (!member) throwErr(TEAM_REQ_NOT_MEMBER);
 
+  // ⚠️ 注意：这里 requireRoles 检查延迟到最后，与其他守卫不一致
   if (!(requireRoles && requireRoles.includes(member.role)))
     throw new Error(TEAM_REQ_NOT_REQUIRED_ROLE);
 
   return true;
 }
 ```
+
+**不一致性说明**：GqlRequestTeamMemberGuard 没有在函数开头检查 `requireRoles` 是否存在（即是否忘记添加 `@RequiresTeamRole` 装饰器），而是延迟到最后一步才检查。如果开发者忘记添加装饰器，`requireRoles` 为 `undefined`，会直接 throw `TEAM_REQ_NOT_REQUIRED_ROLE` 错误，难以定位真实原因。
 
 **权限派生链路**：
 ```
@@ -331,9 +433,12 @@ async canActivate(context: ExecutionContext): Promise<boolean> {
   );
   if (!member) throwErr(TEAM_ENVIRONMENT_NOT_TEAM_MEMBER);
 
+  // ⚠️ 注意：角色检查使用 return 布尔值，失败时 return false，不 throw 错误码
   return requireRoles.includes(member.role);
 }
 ```
+
+**不一致性说明**：GqlTeamEnvTeamGuard 在角色检查阶段使用 `return requireRoles.includes(member.role)`，当角色不匹配时 return `false`，而不是 throw 带错误码的异常。NestJS 会将 return false 转换为通用 "Forbidden" 错误，丢失具体错误信息，增加排错难度。
 
 **权限派生链路**：
 ```
@@ -376,9 +481,17 @@ async canActivate(context: ExecutionContext): Promise<boolean> {
 
   if (requireRoles.includes(teamMember.role)) return true;
 
+  // REST 守卫角色不匹配时 throwHTTPErr，状态码 403，包含明确错误码
   throwHTTPErr({ message: TEAM_NOT_REQUIRED_ROLE, statusCode: 403 });
 }
 ```
+
+**设计一致性说明**：RESTTeamMemberGuard 在所有检查阶段（包括角色检查）都使用 `throwHTTPErr`，每个错误都带有明确的 HTTP 状态码：
+- `400` - 参数/配置错误（缺少装饰器、无用户上下文、无 teamID）
+- `404` - 资源不存在（成员不存在）
+- `403` - 权限不足（角色不匹配）
+
+这种设计比 GraphQL 守卫更一致，排错更简单。
 
 **权限派生链路**：
 ```
@@ -486,25 +599,34 @@ async createTeamEnvironment(
 
 **团队请求 Resolver** [src/team-request/team-request.resolver.ts](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts)
 
-| 操作           | 所需角色                  | 守卫类型                     | 说明                                  |
-|----------------|---------------------------|------------------------------|---------------------------------------|
-| 搜索请求       | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | 通过 teamID 直接验证                  |
-| 查看请求详情   | OWNER, EDITOR, VIEWER     | GqlRequestTeamMemberGuard    | 通过 requestID → teamID 验证          |
-| 查看集合内请求 | OWNER, EDITOR, VIEWER     | GqlCollectionTeamMemberGuard | 通过 collectionID → teamID 验证       |
-| **创建请求**   | OWNER, EDITOR             | **GqlCollectionTeamMemberGuard** | ⚠️ 创建时无 requestID，通过 collectionID 验证 |
-| 更新请求       | OWNER, EDITOR             | GqlRequestTeamMemberGuard    | 通过 requestID → teamID 验证          |
-| 删除请求       | OWNER, EDITOR             | GqlRequestTeamMemberGuard    | 通过 requestID → teamID 验证          |
-| 移动请求       | OWNER, EDITOR             | GqlRequestTeamMemberGuard    | 通过 requestID → teamID 验证          |
+| 操作           | 所需角色                  | 守卫类型                     | 位置 | 说明                                  |
+|----------------|---------------------------|------------------------------|------|---------------------------------------|
+| 搜索请求       | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 70](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts#L70) | 通过 teamID 直接验证 |
+| 查看请求详情   | OWNER, EDITOR, VIEWER     | GqlRequestTeamMemberGuard    | [Line 89](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts#L89) | 通过 requestID → teamID 验证 |
+| 查看集合内请求 | OWNER, EDITOR, VIEWER     | GqlCollectionTeamMemberGuard | [Line 111](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts#L111) | 通过 collectionID → teamID 验证 |
+| **创建请求**   | OWNER, EDITOR             | **GqlCollectionTeamMemberGuard** | [Line 129](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts#L129) | ⚠️ 创建时无 requestID，通过 collectionID 验证 |
+| 更新请求       | OWNER, EDITOR             | GqlRequestTeamMemberGuard    | [Line 159](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts#L159) | 通过 requestID → teamID 验证 |
+| 删除请求       | OWNER, EDITOR             | GqlRequestTeamMemberGuard    | [Line 188](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts#L188) | 通过 requestID → teamID 验证 |
+| 更新请求排序   | OWNER, EDITOR             | GqlRequestTeamMemberGuard    | [Line 207](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts#L207) | 通过 requestID → teamID 验证 |
+| 移动请求       | OWNER, EDITOR             | GqlRequestTeamMemberGuard    | [Line 227](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts#L227) | 通过 requestID → teamID 验证 |
+| 监听请求新增   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 247](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts#L247) | 通过 teamID 直接验证 |
+| 监听请求更新   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 269](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts#L269) | 通过 teamID 直接验证 |
+| 监听请求删除   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 292](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts#L292) | 通过 teamID 直接验证 |
+| 监听请求重排   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 315](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts#L315) | 通过 teamID 直接验证 |
+| 监听请求移动   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 338](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts#L338) | 通过 teamID 直接验证 |
 
 **团队环境 Resolver** [src/team-environments/team-environments.resolver.ts](packages/hoppscotch-backend/src/team-environments/team-environments.resolver.ts)
 
-| 操作           | 所需角色                  | 守卫类型                     | 说明                                  |
-|----------------|---------------------------|------------------------------|---------------------------------------|
-| **创建环境**   | OWNER, EDITOR             | **GqlTeamMemberGuard**       | ⚠️ 创建时无 environmentID，通过 teamID 直接验证 |
-| 更新环境       | OWNER, EDITOR             | GqlTeamEnvTeamGuard          | 通过 environmentID → teamID 验证      |
-| 删除环境       | OWNER, EDITOR             | GqlTeamEnvTeamGuard          | 通过 environmentID → teamID 验证      |
-| 清空环境变量   | OWNER, EDITOR             | GqlTeamEnvTeamGuard          | 通过 environmentID → teamID 验证      |
-| 复制环境       | OWNER, EDITOR             | GqlTeamEnvTeamGuard          | 通过 environmentID → teamID 验证      |
+| 操作           | 所需角色                  | 守卫类型                     | 位置 | 说明                                  |
+|----------------|---------------------------|------------------------------|------|---------------------------------------|
+| **创建环境**   | OWNER, EDITOR             | **GqlTeamMemberGuard**       | [Line 33](packages/hoppscotch-backend/src/team-environments/team-environments.resolver.ts#L33) | ⚠️ 创建时无 environmentID，通过 teamID 直接验证 |
+| 更新环境       | OWNER, EDITOR             | GqlTeamEnvTeamGuard          | [Line 73](packages/hoppscotch-backend/src/team-environments/team-environments.resolver.ts#L73) | 通过 environmentID → teamID 验证      |
+| 删除环境       | OWNER, EDITOR             | GqlTeamEnvTeamGuard          | [Line 52](packages/hoppscotch-backend/src/team-environments/team-environments.resolver.ts#L52) | 通过 environmentID → teamID 验证      |
+| 清空环境变量   | OWNER, EDITOR             | GqlTeamEnvTeamGuard          | [Line 93](packages/hoppscotch-backend/src/team-environments/team-environments.resolver.ts#L93) | 通过 environmentID → teamID 验证      |
+| 复制环境       | OWNER, EDITOR             | GqlTeamEnvTeamGuard          | [Line 115](packages/hoppscotch-backend/src/team-environments/team-environments.resolver.ts#L115) | 通过 environmentID → teamID 验证      |
+| 监听环境更新   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 139](packages/hoppscotch-backend/src/team-environments/team-environments.resolver.ts#L139) | 通过 teamID 直接验证 |
+| 监听环境创建   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 161](packages/hoppscotch-backend/src/team-environments/team-environments.resolver.ts#L161) | 通过 teamID 直接验证 |
+| 监听环境删除   | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | [Line 183](packages/hoppscotch-backend/src/team-environments/team-environments.resolver.ts#L183) | 通过 teamID 直接验证 |
 
 ---
 
@@ -968,9 +1090,10 @@ TeamListAdapter.fetchList() → teamList$.next(results)
    - GraphQL 接口使用 `Gql*TeamMemberGuard` 系列，从 `gqlExecCtx.getArgs()` 提取参数
    - REST 接口使用 `RESTTeamMemberGuard`，从 `request.params` 提取 URL 参数
 
-4. **所有守卫均使用 throw，无 return false**：
-   - GraphQL 守卫：`throw new Error(ERROR_CODE)`，错误码在 `errors[0].message` 中
-   - REST 守卫：`throwHTTPErr({ message, statusCode })`，直接返回带状态码的 HTTP 响应
+4. **守卫失败处理方式不一致**：
+   - **3 个守卫角色检查使用 throw**：GqlTeamMemberGuard、GqlRequestTeamMemberGuard、RESTTeamMemberGuard 在角色不匹配时 throw 错误，包含明确错误码
+   - **2 个守卫角色检查使用 return false**：GqlCollectionTeamMemberGuard [Line 49](packages/hoppscotch-backend/src/team-collection/guards/gql-collection-team-member.guard.ts#L49)、GqlTeamEnvTeamGuard [Line 55](packages/hoppscotch-backend/src/team-environments/gql-team-env-team.guard.ts#L55) 在角色不匹配时 return false，NestJS 会转换为通用 "Forbidden" 错误，丢失具体错误码
+   - REST 守卫使用 `throwHTTPErr({ message, statusCode })`，直接返回带状态码的 HTTP 响应
    - 错误码前缀：`BUG_*` 表示代码错误，`TEAM_*` 表示业务错误
 
 5. **myRole 是动态计算字段**：前端获得的角色信息并非直接存储的字段，而是后端根据当前登录用户动态计算的 resolver 结果。
