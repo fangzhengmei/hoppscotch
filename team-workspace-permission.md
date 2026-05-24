@@ -97,12 +97,13 @@ export const RequiresTeamRole = (...roles: TeamAccessRole[]) =>
 
 #### 守卫类型对比
 
-| 守卫类                     | 资源级别 | 提取参数   | 定位方式                     | 文件                                                                 |
-|--------------------------|----------|------------|------------------------------|----------------------------------------------------------------------|
-| GqlTeamMemberGuard       | 团队级   | teamID     | 直接使用 teamID              | [src/team/guards/gql-team-member.guard.ts](packages/hoppscotch-backend/src/team/guards/gql-team-member.guard.ts) |
-| GqlCollectionTeamMemberGuard | 集合级 | collectionID | 通过 collection → teamID     | [src/team-collection/guards/gql-collection-team-member.guard.ts](packages/hoppscotch-backend/src/team-collection/guards/gql-collection-team-member.guard.ts) |
-| GqlRequestTeamMemberGuard | 请求级   | requestID  | 通过 request → teamID        | [src/team-request/guards/gql-request-team-member.guard.ts](packages/hoppscotch-backend/src/team-request/guards/gql-request-team-member.guard.ts) |
-| GqlTeamEnvTeamGuard      | 环境级   | id         | 通过 environment → teamID    | [src/team-environments/gql-team-env-team.guard.ts](packages/hoppscotch-backend/src/team-environments/gql-team-env-team.guard.ts) |
+| 守卫类                     | 协议类型 | 资源级别 | 提取参数   | 定位方式                     | 文件                                                                 |
+|--------------------------|----------|----------|------------|------------------------------|----------------------------------------------------------------------|
+| GqlTeamMemberGuard       | GraphQL  | 团队级   | teamID     | 直接使用 teamID              | [src/team/guards/gql-team-member.guard.ts](packages/hoppscotch-backend/src/team/guards/gql-team-member.guard.ts) |
+| GqlCollectionTeamMemberGuard | GraphQL | 集合级 | collectionID | 通过 collection → teamID     | [src/team-collection/guards/gql-collection-team-member.guard.ts](packages/hoppscotch-backend/src/team-collection/guards/gql-collection-team-member.guard.ts) |
+| GqlRequestTeamMemberGuard | GraphQL  | 请求级   | requestID  | 通过 request → teamID        | [src/team-request/guards/gql-request-team-member.guard.ts](packages/hoppscotch-backend/src/team-request/guards/gql-request-team-member.guard.ts) |
+| GqlTeamEnvTeamGuard      | GraphQL  | 环境级   | id         | 通过 environment → teamID    | [src/team-environments/gql-team-env-team.guard.ts](packages/hoppscotch-backend/src/team-environments/gql-team-env-team.guard.ts) |
+| RESTTeamMemberGuard      | REST     | 团队级   | teamID     | 从 URL params 提取 teamID    | [src/team/guards/rest-team-member.guard.ts](packages/hoppscotch-backend/src/team/guards/rest-team-member.guard.ts) |
 
 ---
 
@@ -206,9 +207,79 @@ environmentID → TeamEnvironment.teamID → TeamMember.role → 权限验证
 ```
 
 **典型应用场景**：
-- 创建/编辑环境变量
+- 编辑环境变量
 - 删除环境
 - 复制环境
+
+---
+
+### 3.7 REST 接口守卫实现
+
+[src/team/guards/rest-team-member.guard.ts:21-46](packages/hoppscotch-backend/src/team/guards/rest-team-member.guard.ts#L21-L46)
+
+```typescript
+async canActivate(context: ExecutionContext): Promise<boolean> {
+  // 1. 获取所需角色
+  const requireRoles = this.reflector.get<TeamAccessRole[]>(...);
+  
+  // 2. 获取当前用户（从 REST request 对象）
+  const request = context.switchToHttp().getRequest();
+  const { user } = request;
+  
+  // 3. 从 URL params 提取 teamID（如 /team-collection/search/:teamID）
+  const teamID = request.params.teamID;
+  
+  // 4. 查询用户在该团队的角色
+  const teamMember = await this.teamService.getTeamMember(teamID, user.uid);
+  
+  // 5. 验证角色
+  return requireRoles.includes(teamMember.role);
+}
+```
+
+**权限派生链路**：
+```
+URL params.teamID → TeamMember.role → 权限验证
+```
+
+**典型应用场景**：
+- REST API 搜索团队集合
+- 其他 REST 风格的团队资源访问
+
+---
+
+### 3.8 重要修正：创建操作的守卫选择
+
+**创建操作的特殊逻辑**：由于资源创建时目标资源ID尚未生成，需要通过"父资源ID"或"直接teamID"进行权限验证。
+
+#### 创建请求（createRequestInCollection）
+- **使用的守卫**：`GqlCollectionTeamMemberGuard`（不是 `GqlRequestTeamMemberGuard`）
+- **原因**：创建时 requestID 不存在，需要通过 `collectionID` 定位团队
+- **权限链路**：`collectionID → TeamCollection.teamID → TeamMember.role`
+
+[src/team-request/team-request.resolver.ts:126-154](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts#L126-L154)
+```typescript
+@Mutation(() => TeamRequest)
+@UseGuards(GqlAuthGuard, GqlCollectionTeamMemberGuard)  // 注意这里用的是集合级守卫
+@RequiresTeamRole(TeamAccessRole.EDITOR, TeamAccessRole.OWNER)
+async createRequestInCollection(
+  @Args('collectionID') collectionID: string,
+  @Args('data') data: CreateTeamRequestInput,
+) { ... }
+```
+
+#### 创建环境（createTeamEnvironment）
+- **使用的守卫**：`GqlTeamMemberGuard`（不是 `GqlTeamEnvTeamGuard`）
+- **原因**：创建时 environmentID 不存在，需要通过 `teamID` 直接验证
+- **权限链路**：`teamID → TeamMember.role`
+
+[src/team-environments/team-environments.resolver.ts:30-47](packages/hoppscotch-backend/src/team-environments/team-environments.resolver.ts#L30-L47)
+```typescript
+@Mutation(() => TeamEnvironment)
+@UseGuards(GqlAuthGuard, GqlTeamMemberGuard)  // 注意这里用的是团队级守卫
+@RequiresTeamRole(TeamAccessRole.OWNER, TeamAccessRole.EDITOR)
+async createTeamEnvironment(@Args() args: CreateTeamEnvironmentArgs) { ... }
+```
 
 ## 4. 资源与权限映射
 
@@ -236,13 +307,68 @@ environmentID → TeamEnvironment.teamID → TeamMember.role → 权限验证
 | 更新成员角色   | OWNER                     | GqlTeamMemberGuard           |
 | 移除成员       | OWNER                     | GqlTeamMemberGuard           |
 
+**团队请求 Resolver** [src/team-request/team-request.resolver.ts](packages/hoppscotch-backend/src/team-request/team-request.resolver.ts)
+
+| 操作           | 所需角色                  | 守卫类型                     | 说明                                  |
+|----------------|---------------------------|------------------------------|---------------------------------------|
+| 搜索请求       | OWNER, EDITOR, VIEWER     | GqlTeamMemberGuard           | 通过 teamID 直接验证                  |
+| 查看请求详情   | OWNER, EDITOR, VIEWER     | GqlRequestTeamMemberGuard    | 通过 requestID → teamID 验证          |
+| 查看集合内请求 | OWNER, EDITOR, VIEWER     | GqlCollectionTeamMemberGuard | 通过 collectionID → teamID 验证       |
+| **创建请求**   | OWNER, EDITOR             | **GqlCollectionTeamMemberGuard** | ⚠️ 创建时无 requestID，通过 collectionID 验证 |
+| 更新请求       | OWNER, EDITOR             | GqlRequestTeamMemberGuard    | 通过 requestID → teamID 验证          |
+| 删除请求       | OWNER, EDITOR             | GqlRequestTeamMemberGuard    | 通过 requestID → teamID 验证          |
+| 移动请求       | OWNER, EDITOR             | GqlRequestTeamMemberGuard    | 通过 requestID → teamID 验证          |
+
 **团队环境 Resolver** [src/team-environments/team-environments.resolver.ts](packages/hoppscotch-backend/src/team-environments/team-environments.resolver.ts)
 
-| 操作           | 所需角色                  | 守卫类型                     |
-|----------------|---------------------------|------------------------------|
-| 创建环境       | OWNER, EDITOR             | GqlTeamMemberGuard           |
-| 更新环境       | OWNER, EDITOR             | GqlTeamEnvTeamGuard          |
-| 删除环境       | OWNER, EDITOR             | GqlTeamEnvTeamGuard          |
+| 操作           | 所需角色                  | 守卫类型                     | 说明                                  |
+|----------------|---------------------------|------------------------------|---------------------------------------|
+| **创建环境**   | OWNER, EDITOR             | **GqlTeamMemberGuard**       | ⚠️ 创建时无 environmentID，通过 teamID 直接验证 |
+| 更新环境       | OWNER, EDITOR             | GqlTeamEnvTeamGuard          | 通过 environmentID → teamID 验证      |
+| 删除环境       | OWNER, EDITOR             | GqlTeamEnvTeamGuard          | 通过 environmentID → teamID 验证      |
+| 清空环境变量   | OWNER, EDITOR             | GqlTeamEnvTeamGuard          | 通过 environmentID → teamID 验证      |
+| 复制环境       | OWNER, EDITOR             | GqlTeamEnvTeamGuard          | 通过 environmentID → teamID 验证      |
+
+---
+
+### 4.2 REST API 权限配置示例
+
+**团队集合 Controller** [src/team-collection/team-collection.controller.ts](packages/hoppscotch-backend/src/team-collection/team-collection.controller.ts)
+
+| 操作           | 所需角色                  | 守卫类型                     | 权限链路                                  |
+|----------------|---------------------------|------------------------------|-------------------------------------------|
+| 搜索团队集合   | OWNER, EDITOR, VIEWER     | RESTTeamMemberGuard          | `GET /team-collection/search/:teamID` → URL params.teamID → TeamMember.role |
+
+```typescript
+@Get('search/:teamID')
+@RequiresTeamRole(TeamAccessRole.VIEWER, TeamAccessRole.EDITOR, TeamAccessRole.OWNER)
+@UseGuards(JwtAuthGuard, RESTTeamMemberGuard)
+async searchByTitle(
+  @Param('teamID') teamID: string,
+  @Query('searchQuery') searchQuery: string,
+) { ... }
+```
+
+---
+
+### 4.3 守卫选择决策树
+
+```
+请求到达
+   ↓
+是否有资源ID（已存在资源）？
+   ├─ 是 → 选择对应资源级守卫
+   │     ├─ teamID → GqlTeamMemberGuard
+   │     ├─ collectionID → GqlCollectionTeamMemberGuard
+   │     ├─ requestID → GqlRequestTeamMemberGuard
+   │     └─ environmentID → GqlTeamEnvTeamGuard
+   └─ 否（创建操作）→ 选择父资源级守卫
+         ├─ 创建团队 → 仅需认证（自动成为OWNER）
+         ├─ 创建根集合 → GqlTeamMemberGuard（通过teamID）
+         ├─ 创建子集合 → GqlCollectionTeamMemberGuard（通过父collectionID）
+         ├─ 创建请求 → GqlCollectionTeamMemberGuard（通过collectionID）
+         └─ 创建环境 → GqlTeamMemberGuard（通过teamID）
+```
 
 ## 5. 前端工作区权限感知
 
@@ -262,14 +388,163 @@ export type TeamWorkspace = {
 }
 ```
 
-### 5.2 工作区切换与权限联动
+### 5.2 后端 myRole 到前端 workspace role 的完整转换链路
+
+#### 第1步：后端 myRole 字段解析
+
+[src/team/team.resolver.ts:67-77](packages/hoppscotch-backend/src/team/team.resolver.ts#L67-L77)
+
+```typescript
+@ResolveField(() => TeamAccessRole, {
+  description: 'The role of the current user in the team',
+  nullable: true,
+})
+@UseGuards(GqlAuthGuard)
+myRole(
+  @Parent() team: Team,
+  @GqlUser() user: AuthUser,
+): Promise<TeamAccessRole | null> {
+  return this.teamService.getRoleOfUserInTeam(team.id, user.uid);
+}
+```
+
+**实现逻辑**：`myRole` 是 Team 类型的一个动态字段 resolver，根据当前登录用户和团队ID，调用 `getRoleOfUserInTeam` 查询用户在该团队的角色。
+
+#### 第2步：GraphQL 查询包含 myRole
+
+[src/helpers/backend/gql/queries/GetMyTeams.graphql:1-18](packages/hoppscotch-common/src/helpers/backend/gql/queries/GetMyTeams.graphql#L1-L18)
+
+```graphql
+query GetMyTeams($cursor: ID) {
+  myTeams(cursor: $cursor) {
+    id
+    name
+    myRole          # 关键：请求包含当前用户的角色
+    ownersCount
+    teamMembers {
+      membershipID
+      user { ... }
+      role
+    }
+  }
+}
+```
+
+#### 第3步：前端 TeamListAdapter 拉取团队列表
+
+[src/helpers/teams/TeamListAdapter.ts:60-98](packages/hoppscotch-common/src/helpers/teams/TeamListAdapter.ts#L60-L98)
+
+```typescript
+async fetchList() {
+  const results: GetMyTeamsQuery["myTeams"] = []
+  
+  while (true) {
+    const cursor = results.length > 0 ? results[results.length - 1].id : undefined
+    
+    // 调用后端 GraphQL 接口，获取包含 myRole 的团队列表
+    const result = await platform.backend.getUserTeams(cursor)
+    
+    if (E.isLeft(result)) { /* 错误处理 */ }
+    
+    results.push(...result.right.myTeams)
+    
+    if (result.right.myTeams.length !== BACKEND_PAGE_SIZE) break
+  }
+  
+  // 通过 BehaviorSubject 广播团队列表（包含每个团队的 myRole）
+  this.teamList$.next(results)
+}
+```
+
+#### 第4步：工作区选择器消费团队列表并设置 role
+
+[src/components/workspace/Selector.vue:169-177](packages/hoppscotch-common/src/components/workspace/Selector.vue#L169-L177)
+
+```typescript
+const switchToTeamWorkspace = (team: GetMyTeamsQuery["myTeams"][number]) => {
+  REMEMBERED_TEAM_ID.value = team.id
+  
+  // 关键：将后端返回的 team.myRole 赋值给 workspace.role
+  workspaceService.changeWorkspace({
+    teamID: team.id,
+    teamName: team.name,
+    type: "team",
+    role: team.myRole,  // myRole → workspace.role 的转换点
+  })
+}
+```
+
+#### 第5步：WorkspaceService 保存 role 并联动其他服务
 
 [src/services/workspace.service.ts:123-162](packages/hoppscotch-common/src/services/workspace.service.ts#L123-L162)
 
-当切换到团队工作区时：
-1. 同步团队集合服务的 teamID
-2. 拉取该团队的集合和请求数据
-3. 前端根据 `role` 字段控制 UI 元素的显示/隐藏
+```typescript
+private setupWorkspaceSync() {
+  watch(
+    [this._currentWorkspace, this.currentUser],
+    async ([newWorkspace, user], [oldWorkspace, oldUser]) => {
+      if (newWorkspace?.type === "team" && newWorkspace.teamID) {
+        // 切换到团队工作区时，同步 teamID 到集合服务
+        this.teamCollectionService.changeTeamID(newWorkspace.teamID)
+        
+        // 拉取该团队的文档数据
+        await this.documentationService.fetchTeamPublishedDocs(newWorkspace.teamID)
+      }
+    },
+    { immediate: true }
+  )
+}
+```
+
+#### 完整转换流程图
+
+```
+后端 TeamResolver.myRole
+    ↓ (GraphQL)
+GetMyTeams 查询包含 myRole 字段
+    ↓ (HTTP)
+TeamListAdapter.fetchList() 获取团队列表
+    ↓ (RxJS)
+teamList$.next(results) 广播团队数据（含 myRole）
+    ↓ (Vue watch)
+workspace Selector 显示团队列表供用户选择
+    ↓ (用户点击)
+switchToTeamWorkspace(team) 被调用
+    ↓
+workspaceService.changeWorkspace({
+  teamID: team.id,
+  teamName: team.name,
+  type: "team",
+  role: team.myRole  // 转换完成
+})
+    ↓
+setupWorkspaceSync() 触发联动
+    → teamCollectionService.changeTeamID(teamID)
+    → documentationService.fetchTeamPublishedDocs(teamID)
+    → 前端各组件根据 workspace.role 控制 UI 权限
+```
+
+---
+
+### 5.3 前端权限控制应用示例
+
+前端通过 `workspace.role` 控制 UI 元素的显示与隐藏：
+
+```typescript
+// 示例：根据角色判断是否显示编辑按钮
+const canEdit = computed(() => {
+  const role = workspaceService.currentWorkspace.value.role
+  return role === TeamAccessRole.OWNER || role === TeamAccessRole.EDITOR
+})
+
+// 示例：根据角色判断是否显示成员管理入口
+const canManageMembers = computed(() => {
+  const role = workspaceService.currentWorkspace.value.role
+  return role === TeamAccessRole.OWNER
+})
+```
+
+**重要提示**：前端 UI 控制仅为体验优化，**真实权限校验始终在服务端通过守卫执行**。
 
 ## 6. 架构特点与设计思考
 
@@ -297,15 +572,66 @@ export type TeamWorkspace = {
 
 ## 7. 总结：权限传播完整链路
 
+### 7.1 后端权限校验全链路
+
 ```
-用户登录 → 选择团队工作区 → 访问资源（团队/集合/请求/环境）
+用户登录 → 访问资源（GraphQL/REST）
     ↓
-提取资源ID → 定位所属团队 → 查询用户在该团队的角色
+提取资源标识符 → 判定资源存在性 → 定位所属团队
     ↓
-对比装饰器声明的角色要求 → 允许/拒绝访问
+查询用户在该团队的角色（TeamMember.role）
+    ↓
+对比 @RequiresTeamRole 声明的角色要求 → 允许/拒绝访问
 ```
 
-**关键洞察**：
-- 所有团队资源的权限都**派生自用户在团队中的角色**，而非资源本身的独立权限
-- 不同层级的守卫通过"资源 → 团队"的关联关系，实现了权限的隐式向下传播
-- 这种设计简化了权限管理，但也意味着无法对单个集合或请求设置独立权限
+### 7.2 创建操作的特殊链路
+
+```
+创建请求 → 提取 collectionID（父资源）
+    ↓
+查询 TeamCollection.teamID → 定位团队
+    ↓
+查询用户角色 → 验证 EDITOR/OWNER 权限
+    ↓
+允许创建请求
+
+创建环境 → 提取 teamID（直接参数）
+    ↓
+查询用户角色 → 验证 EDITOR/OWNER 权限
+    ↓
+允许创建环境
+```
+
+### 7.3 前端角色感知全链路
+
+```
+后端 myRole resolver → GraphQL GetMyTeams 查询
+    ↓
+TeamListAdapter 拉取团队列表（含 myRole）
+    ↓
+用户选择团队 → switchToTeamWorkspace(team)
+    ↓
+workspace.role = team.myRole → 保存到 WorkspaceService
+    ↓
+前端组件根据 workspace.role 控制 UI 显示
+```
+
+---
+
+### 7.4 关键洞察（修正版）
+
+1. **创建操作的守卫选择是关键**：资源创建时目标资源ID不存在，必须通过**父资源ID**或**直接teamID**进行权限验证：
+   - 创建请求 → 使用 `GqlCollectionTeamMemberGuard`（通过 collectionID）
+   - 创建环境 → 使用 `GqlTeamMemberGuard`（通过 teamID）
+
+2. **所有团队资源的权限都派生自团队角色**：权限并非在资源层面独立设置，而是通过"资源 → teamID → TeamMember.role"的关联链隐式向下传播。
+
+3. **协议层的守卫差异**：
+   - GraphQL 接口使用 `Gql*TeamMemberGuard` 系列，从 `gqlExecCtx.getArgs()` 提取参数
+   - REST 接口使用 `RESTTeamMemberGuard`，从 `request.params` 提取 URL 参数
+
+4. **myRole 是动态计算字段**：前端获得的角色信息并非直接存储的字段，而是后端根据当前登录用户动态计算的 resolver 结果。
+
+5. **前端权限控制仅为体验优化**：即使前端隐藏了某些按钮，后端守卫仍会对每个请求进行权限校验，确保安全性。
+
+6. **这种设计的局限性**：由于权限完全派生自团队角色，系统**不支持对单个集合、请求或环境设置独立的访问权限**。所有同团队内的资源权限级别一致。
