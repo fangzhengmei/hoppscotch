@@ -873,16 +873,178 @@ teams/Environment.vue 流程:
 | 保存失败导致的不一致 | ⚠️ 轻微 | 中 | 下次加载可能恢复旧值 |
 | 并发写入导致的冲突 | ⚠️ 轻微 | 中 | 后写入者生效 |
 
-#### 边界说明
+### 8.9 TEAM_ENV 选中态生命周期与 Stale 对象分析
 
-**残留记录何时会被清理？**
-- 应用重启重新加载时：如果环境 ID 已不存在于 environmentsStore，残留记录仍会被加载但永远不会被使用
-- 手动清理：无 UI 入口，只能通过清除浏览器数据或开发者工具删除
-- 自动清理：无自动垃圾回收机制
+#### selectedEnvironmentIndex 的三种类型
 
-**残留记录何时会造成实际问题？**
-- 极端情况：用户删除环境 A（ID: "abc123"），之后由于某种原因（如同步恢复）创建了新环境且恰好复用相同 ID "abc123"
-- 此时残留的 Secret 值会被"恢复"到新环境中，可能导致值错位
+**文件**: `packages/hoppscotch-common/src/newstore/environments.ts:18-26`
+
+```typescript
+export type SelectedEnvironmentIndex =
+  | { type: "NO_ENV_SELECTED" }
+  | { type: "MY_ENV"; index: number }
+  | {
+      type: "TEAM_ENV"
+      teamID: string
+      teamEnvID: string
+      environment: Environment    // ← 完整的环境对象快照
+    }
+```
+
+**关键差异**：
+- `MY_ENV`：只存储 `index`，运行时从 `environments[index]` 获取最新对象
+- `TEAM_ENV`：存储完整的 `environment` 对象快照，不与任何列表联动
+
+#### 团队环境选择时的快照捕获
+
+**文件**: `packages/hoppscotch-common/src/components/environments/index.vue:236-253`
+
+```typescript
+const handleEnvironmentChange = ({ index, env }: HandleEnvChangeProp) => {
+  if (env?.type === "team-environment") {
+    selectedEnvironmentIndex.value = {
+      type: "TEAM_ENV",
+      teamEnvID: env.environment.id,
+      teamID: env.environment.teamID,
+      environment: env.environment.environment,  // ← 此时捕获的快照
+    }
+  }
+}
+```
+
+**快照内容**：`environment` 包含当时的 `variables`、`name`、`id` 等完整数据。
+
+#### 团队环境删除后的联动路径
+
+**路径 1: 通过 teams/Environment.vue 删除** ✅ 清理本地记录但不重置选中态
+
+```
+用户点击删除按钮
+  → teams/Environment.vue: removeEnvironment()
+    → deleteTeamEnvironment API (服务端删除)
+    → 成功回调:
+      → secretEnvironmentService.deleteSecretEnvironment(id)
+      → currentEnvironmentValueService.deleteEnvironment(id)
+      → ⚠️ 未调用 setSelectedEnvironmentIndex({ type: "NO_ENV_SELECTED" })
+```
+
+**路径 2: 通过 index.vue "删除选中环境"删除** ⚠️ 不清理本地记录也不重置选中态
+
+```
+用户删除选中的团队环境
+  → index.vue: removeSelectedEnvironment()
+    → deleteTeamEnvironment(selectedEnvIndex.teamEnvID)
+    → 成功回调:
+      → toast.success()
+      → ⚠️ 未清理 Secret 记录
+      → ⚠️ 未清理 CurrentValue 记录
+      → ⚠️ 未重置 selectedEnvironmentIndex
+```
+
+**路径 3: 通过实时订阅删除（其他端删除）**
+
+```
+其他端删除团队环境
+  → TeamEnvironmentAdapter: teamEnvironmentDeleted$ 订阅触发
+    → this.deleteTeamEnvironment(envId)
+      → teamEnvironmentList$.next(filteredList)  // 更新列表
+      → ⚠️ 不通知 environmentsStore
+      → ⚠️ 不重置 selectedEnvironmentIndex
+```
+
+#### currentEnvironment$ 对 Stale 对象的处理
+
+**文件**: `packages/hoppscotch-common/src/newstore/environments.ts:398-415`
+
+```typescript
+export const currentEnvironment$: Observable<Environment | undefined> =
+  environmentsStore.subject$.pipe(
+    map(({ environments, selectedEnvironmentIndex }) => {
+      if (selectedEnvironmentIndex.type === "NO_ENV_SELECTED") {
+        return { name: "No environment", v: 2, id: "", variables: [] }
+      } else if (selectedEnvironmentIndex.type === "MY_ENV") {
+        return environments[selectedEnvironmentIndex.index]  // ✅ 动态获取
+      }
+      return selectedEnvironmentIndex.environment  // ❌ 直接返回快照，不检查有效性
+    }),
+    distinctUntilChanged()
+  )
+```
+
+**问题**：对于 `TEAM_ENV`，`currentEnvironment$` 直接返回存储的 `environment` 快照，不检查该环境是否仍然存在于 `teamEnvironmentList` 中。
+
+#### Stale TEAM_ENV 对请求变量解析的影响
+
+**影响路径**：
+
+```
+团队环境被删除
+  ↓
+selectedEnvironmentIndex 仍然是 { type: "TEAM_ENV", environment: staleSnapshot }
+  ↓
+currentEnvironment$ 发射 staleSnapshot
+  ↓
+aggregateEnvs$ / aggregateEnvsWithCurrentValue$ 订阅更新
+  ↓
+使用 staleSnapshot.variables 解析请求变量
+  ↓
+请求仍然使用已删除环境的变量值 ⚠️
+```
+
+**具体影响**：
+
+1. **变量解析**：`parseTemplateStringE` 仍然可以解析 `<<variable>>`，因为 stale 对象中保留了原始 `variables`
+2. **Secret 值恢复**：`SecretEnvironmentService` 中的值可能已被清理（如果通过 teams/Environment.vue 删除），导致 secret 值恢复失败
+3. **UI 显示**：环境选择器中不再显示该环境，但请求仍在使用它
+4. **持久化**：`setupSelectedEnvPersistence` 会将 stale TEAM_ENV 保存到 LocalStorage
+
+#### 对比个人环境的保护机制
+
+**个人环境删除** (`environments.ts:142-176`)：
+
+```typescript
+deleteEnvironment(store, { envIndex }) {
+  let newCurrEnvIndex = selectedEnvironmentIndex
+
+  // ✅ 如果删除的是当前选中环境，自动回退
+  if (selectedEnvironmentIndex.type === "MY_ENV" &&
+      envIndex === selectedEnvironmentIndex.index) {
+    newCurrEnvIndex = { type: "NO_ENV_SELECTED" }
+  }
+
+  // ✅ 如果删除的环境在选中环境之前，自动调整索引
+  if (selectedEnvironmentIndex.type === "MY_ENV" &&
+      envIndex < selectedEnvironmentIndex.index) {
+    newCurrEnvIndex = { type: "MY_ENV", index: selectedEnvironmentIndex.index - 1 }
+  }
+
+  return {
+    environments: environments.filter((_, index) => index !== envIndex),
+    selectedEnvironmentIndex: newCurrEnvIndex,  // ✅ 同步更新
+  }
+}
+```
+
+**团队环境删除**：无类似保护机制。
+
+#### Stale 对象的清理时机
+
+| 清理触发点 | 是否清理 | 说明 |
+|-----------|---------|------|
+| 工作区切换 (watch workspace) | ✅ 是 | index.vue:162-189，检测到 TEAM_ENV 的 teamID 变化时重置 |
+| 应用重启 | ✅ 是 | 重新加载时从服务端获取最新列表，但选中态可能恢复 |
+| 用户主动选择其他环境 | ✅ 是 | handleEnvironmentChange 会覆盖旧值 |
+| 团队环境列表更新 | ❌ 否 | TeamEnvironmentAdapter 不通知 environmentsStore |
+| 环境删除 API 成功回调 | ❌ 否 | 未调用 setSelectedEnvironmentIndex |
+
+#### 风险结论
+
+| 风险场景 | 影响程度 | 发生概率 | 说明 |
+|---------|---------|---------|------|
+| 删除当前选中的团队环境后立即发请求 | ⚠️ 中 | 中 | 仍使用旧变量，但 Secret 值可能已丢失 |
+| 其他端删除当前选中的团队环境 | ⚠️ 中 | 低 | 实时订阅更新列表，但选中态不变 |
+| 持久化的 stale TEAM_ENV 被恢复 | ⚠️ 低 | 低 | 应用重启后可能恢复到无效环境 |
+| Secret 值与 stale 对象不一致 | ⚠️ 低 | 低 | 如果 Secret 已清理但对象仍引用 |
 
 ---
 
