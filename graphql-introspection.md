@@ -12,18 +12,18 @@
                                             ▼
                                       getSchema()  ◀── 轮询 (7s)
                                         │
-                                        ▼
-                              POST getIntrospectionQuery()
-                                        │
-                                        ▼
-                              buildClientSchema(response.data)
-                                        │
-                                        ▼
-                              connection.schema (reactive)
-                                        │
-                          ┌─────────────┼─────────────┐
-                          ▼             ▼             ▼
-                    queryFields   mutationFields   subscriptionFields
+                              ┌─────────┤
+                              │ 成功    │ 失败
+                              ▼         ▼
+                    buildClientSchema   state = "ERROR"
+                              │         disconnect() 抛错
+                              ▼         schema 不变！
+                    connection.schema   轮询终止
+                    (reactive)              │
+                              │             ▼
+                          ┌───┤        state 停留在 "ERROR"
+                          ▼   ▼        恢复依赖手动重试
+                    queryFields  mutationFields  subscriptionFields
                     graphqlTypes  schemaString  ... (computed)
                           │
                           ▼
@@ -193,7 +193,7 @@ const getSchema = async (options: ConnectionRequestOptions) => {
 - **`getIntrospectionQuery()`**：来自 `graphql` 库，生成完整的 GraphQL introspection 查询字符串（查询 `__schema` 的所有类型、字段、参数等）。
 - **`buildClientSchema()`**：同样来自 `graphql` 库，将 introspection 响应的 JSON 数据转换为客户端可操作的 `GraphQLSchema` 对象。
 - **认证透传**：introspection 请求会携带与普通 GraphQL 请求相同的 auth headers（Basic、Bearer、OAuth2、API Key、AWS Signature），确保需要认证的 endpoint 也能完成 introspection。
-- **错误传播**：任何异常都会调用 `disconnect()` 重置连接状态。
+- **错误传播**：任何异常都会进入 `getSchema()` 的 catch 块并调用 `disconnect()`。但注意：失败路径中 `disconnect()` 因前置条件检查不通过而抛错，**实际上不会成功重置连接状态或清空 schema**（详见 §2.5）。
 
 ### 2.4 disconnect() — 断开与清理
 
@@ -217,7 +217,15 @@ export const reset = () => {
 }
 ```
 
-**注意**：`disconnect()` 有前置条件检查——只有当 `connection.state === "CONNECTED"` 时才能正常调用，否则抛出错误。这一细节对理解失败恢复至关重要。
+**注意**：`disconnect()` 有前置条件检查——只有当 `connection.state === "CONNECTED"` 时才能正常调用，否则抛出错误。这意味着：
+
+| 调用场景 | `connection.state` | `disconnect()` 行为 | `schema` 是否被清空 |
+|---------|-------------------|--------------------|--------------------|
+| 用户点击 Disconnect（正常断开） | `"CONNECTED"` | 正常执行：`state = "DISCONNECTED"`，`schema = null` | **是** |
+| 页面卸载时（`graphql.vue` `onBeforeUnmount`） | `"CONNECTED"` | 同上（有 `if (state === "CONNECTED")` 守卫） | **是** |
+| `getSchema()` 失败后调用 | `"ERROR"`（已被 `E.isLeft` 分支设置） | 抛出 `Error("No connections are running...")` | **否** |
+
+**关于 `reset()`**：`reset()` 无条件设置 `state = "DISCONNECTED"` 和 `schema = null`，不受前置条件限制。但在当前代码库中，**`reset()` 从未被任何组件调用**——它是一个已定义但未使用的导出函数。
 
 ### 2.5 失败恢复机制
 
@@ -432,8 +440,14 @@ export const graphqlTypes = computed(() => {
 | 缓存粒度 | 全局单一 schema（per 连接） |
 | 更新触发 | 7 秒轮询 `getSchema()` |
 | 更新方式 | 直接赋值 `connection.schema = schemaData`，利用 Vue reactivity 自动传播 |
-| 失效条件 | `disconnect()` 时置 `null`；网络错误时 `disconnect()` 并置 `null` |
+| 成功时 | `connection.schema = schemaData`，`connection.error = null` |
+| 正常断开时（用户点击 Disconnect / 页面卸载） | `disconnect()` 正常执行 → `connection.schema = null`，`connection.state = "DISCONNECTED"` |
+| 网络错误时 | `disconnect()` 抛错 → **`connection.schema` 不变**（保留旧值或保持 null），`connection.state = "ERROR"` |
 | 多 tab 共享 | 所有 tab 共享同一 `connection` 对象，切换 tab 时 schema 不变 |
+
+**关键澄清**：网络错误时 schema **不会被清空**。这是因为 `getSchema()` 的 `E.isLeft` 分支先设置 `state = "ERROR"`，再 throw 进 catch，catch 中调用 `disconnect()` 时因 `state !== "CONNECTED"` 而抛错，`disconnect()` 内部的 `schema = null` 不会执行。**当前代码库中，schema 被清空的唯一场景是用户主动断开连接**（`disconnect()` 正常执行时 `state === "CONNECTED"`）。
+
+> 注：`connection.ts` 中定义了 `reset()` 函数（无条件清空 schema 和设置 `state = "DISCONNECTED"`），但在当前代码库中从未被调用。
 
 ---
 
@@ -1126,7 +1140,7 @@ export const runSubscription = (options: RunQueryOptions, headers?) => {
 
 8. **二次错误抛出陷阱**：`getSchema()` catch 中调用 `disconnect()` 时，由于 `connection.state` 已被设置为 `"ERROR"`，`disconnect()` 的前置检查 `state === "CONNECTED"` 不通过，会再次抛出错误。这个二次错误被 `poll()` 的 catch 捕获。
 
-9. **失败分支中 schema 永不修改**：`getSchema()` 失败路径中，`disconnect()` 抛出异常，因此 `disconnect()` 内部的 `connection.schema = null` 不会被执行。如果是首次连接，schema 保持 `null`；如果是轮询失败，schema 保留之前的缓存值且仍可正常浏览。
+9. **失败分支中 schema 永不修改**：`getSchema()` 失败路径中，`disconnect()` 抛出异常，因此 `disconnect()` 内部的 `connection.schema = null` 不会被执行。如果是首次连接，schema 保持 `null`；如果是轮询失败，schema 保留之前的缓存值且仍可正常浏览。当前代码库中 schema 被清空的唯一场景是用户主动断开连接。
 
 10. **轮询停止的充要条件**：只要 `poll()` 的 catch 块被执行（无论什么原因），就不会执行 `setTimeout(poll, 7000)`，轮询终止。没有例外。
 
