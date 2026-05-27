@@ -397,9 +397,10 @@ type CollectionFolder = {
 ```
 rawEnvVars (从响应中取)
    │
-   ├─ 为空 / 为 null → 跳过，parsedEnvironmentVariables = []
+   ├─ 为 null / undefined / 空字符串 → if (rawEnvVars) 条件不成立，不执行任何赋值，
+   │                                    parsedEnvironmentVariables 保持上一次的值
    │
-   └─ 非空
+   └─ 非空（含空数组 []）
         ├─ 为字符串 → JSON.parse → Array.isArray ?
         │                                 ├─ 是 → map + translateToNewEnvironmentVariables + currentValue 兜底
         │                                 └─ 否 → parsedEnvironmentVariables = []
@@ -407,6 +408,7 @@ rawEnvVars (从响应中取)
         └─ 已是对象 → 同上
 ```
 
+- **`rawEnvVars` 为 falsy（null/undefined/空字符串）**：**不做任何赋值**，`parsedEnvironmentVariables` 保持上一次版本切换前的值（存在跨版本泄漏风险，详见第八章）；
 - **JSON 解析失败**：`try/catch` 兜底到 `parsedEnvironmentVariables = []`，仅 `console.error`，不抛错；
 - **非数组**：同样兜底到 `[]`；
 - **条目规范化失败**：`translateToNewEnvironmentVariables` 返回的对象可能缺少 `currentValue`，代码显式兜底：`currentValue: normalized.currentValue || normalized.initialValue`。
@@ -438,14 +440,15 @@ env.variables = [
 
 | 故障场景 | 公开页表现 | 可见的占位符 |
 | --- | --- | --- |
-| 未绑定环境 | 正常渲染 | `<<name>>` 原样显示 |
-| 环境绑定但 JSON 解析失败 | 正常渲染 | `<<name>>` 原样显示 |
+| 未绑定环境（首次加载） | 正常渲染，`parsedEnvironmentVariables = []` | `<<name>>` 原样显示 |
+| 未绑定环境（从有环境版本切换而来） | 初始正常渲染；若用户手动开启环境开关，**会泄漏上一版本的环境变量值**（详见第八章） | 开关开启后 `<<name>>` 可能被替换为旧版本的值 |
+| 环境绑定但 JSON 解析失败 | 正常渲染，`parsedEnvironmentVariables = []` | `<<name>>` 原样显示 |
 | 环境绑定但值缺失 | 正常渲染 | 未命中的 `<<name>>` 原样显示 |
 | 环境被删除且版本是 snapshot | 正常渲染（snapshot 中的变量仍存在，但已过期） | 可能显示过期值 |
 | 环境被删除且版本是 live | 显示 `documentation.publish.not_found` 错误页 | — |
 | 环境跨 workspace（越权） | 同 live 版本环境被删除 | — |
 
-这意味着“环境变量注入失败”时系统以 **功能降级而非可用性降级** 为主：页面仍可访问、集合结构与描述完整，仅动态 URL 中的占位符无法被替换。若需要公开页不泄露占位符文本，可在发布时用 snapshot 模式并确保环境当时已绑定。
+这意味着"环境变量注入失败"时系统以 **功能降级而非可用性降级** 为主：页面仍可访问、集合结构与描述完整，仅动态 URL 中的占位符无法被替换。**但需要特别注意跨版本切换场景下的环境变量泄漏风险**——若从一个绑定了环境的版本切换到未绑定环境的版本，旧版本的环境变量仍保留在内存中，用户手动开启环境开关后会被错误地使用。若需要公开页不泄露占位符文本，可在发布时用 snapshot 模式并确保环境当时已绑定。
 
 ---
 
@@ -475,7 +478,7 @@ watch(
 4. 重置 `environmentEnabled.value = !!environmentName.value`（`pages/view/_id/_version.vue:271`）；
 5. 重置 `environmentVariables.value` 为新的解析结果。
 
-这意味着：**环境变量解析结果每次版本切换都会完全重置**，旧版本的解析值不会保留。
+这意味着：**环境变量解析结果在新版本有数据时会被重置**，但如果新版本没有环境变量数据（`rawEnvVars` 为 falsy），则不会主动清零旧值，存在跨版本泄漏风险（详见下文残留分析）。
 
 #### 跨版本数据残留的触发条件
 
@@ -484,11 +487,29 @@ watch(
 | 状态变量 | 重置策略 | 残留风险 |
 | --- | --- | --- |
 | `availableVersions` | 仅在 `availableVersions.value.length === 0` 时赋值（`pages/view/_id/_version.vue:265-267`） | ✅ **残留：** 首次进入页面时填充后，后续版本切换不会更新。若不同版本的后端返回 `versions` 字段有差异（例如新创建的版本在旧版本的 `versions` 列表中不存在），版本下拉框会始终显示首次加载时的列表。 |
-| `parsedEnvironmentVariables` | 每次 `fetchDocs` 都会重新赋值 | ❌ 无残留 |
-| `environmentEnabled` | 每次 `fetchDocs` 都会重置为 `!!environmentName` | ⚠️ **间接残留：** 用户手动关闭环境开关后切换版本，开关会被重置为新版本的 `environmentName` 是否存在，而非保持用户的上一次选择。 |
+| `parsedEnvironmentVariables` | **仅在 `rawEnvVars` 为 truthy 时才赋值**（`pages/view/_id/_version.vue:245`） | ✅ **严重残留：** 当新版本 `environmentVariables` 为 `null`/`undefined`/空字符串时，`if (rawEnvVars)` 条件不成立，变量不会被显式清零，保持上一次的值。 |
+| `environmentEnabled` | 每次 `fetchDocs` 都会重置为 `!!environmentName`（`pages/view/_id/_version.vue:271`） | ⚠️ **间接残留：** 用户手动关闭环境开关后切换版本，开关会被重置为新版本的 `environmentName` 是否存在，而非保持用户的上一次选择。 |
 | `collectionData` | 每次 `fetchDocs` 都会重新 `collectionFolderToHoppCollection` | ❌ 无残留 |
 
-**典型残留场景**：用户先访问版本 A（有 3 个历史版本），再切换到版本 B（该 slug 下实际已有 5 个历史版本）。由于 `availableVersions` 仅在首次填充，版本下拉框仍只显示 3 个版本，用户无法切换到新增的另外 2 个版本，除非刷新页面。
+**典型残留场景 1（versions 列表）**：用户先访问版本 A（有 3 个历史版本），再切换到版本 B（该 slug 下实际已有 5 个历史版本）。由于 `availableVersions` 仅在首次填充，版本下拉框仍只显示 3 个版本，用户无法切换到新增的另外 2 个版本，除非刷新页面。
+
+**典型残留场景 2（环境变量泄漏）**：
+- 前置条件：版本 A 绑定环境 envA（`environmentName: "envA"`, `environmentVariables: [{key: "HOST", value: "a.com"}]`）；版本 B 未绑定环境（`environmentName: null`, `environmentVariables: null`）。
+- 触发路径：访问 `/view/<slug>/A` → 环境变量正常显示为 `HOST=a.com` → 通过下拉切换到版本 B。
+- 代码执行：
+  ```
+  rawEnvVars = null → if (rawEnvVars) 不成立 → parsedEnvironmentVariables 仍为 [{key:"HOST",...}]
+  environmentName = null → environmentEnabled = !!null = false
+  environmentVariables = false ? [] : []  →  此时显示为空
+  ```
+- 进一步触发：用户在版本 B 中点击环境下拉框，手动选择开启环境。`handleEnvironmentToggle(true)` 执行：
+  ```ts
+  environmentVariables.value = true ? parsedEnvironmentVariables.value : []
+  ```
+  此时 `parsedEnvironmentVariables.value` 仍为版本 A 的 `HOST=a.com`，**版本 B 会错误地使用版本 A 的环境变量替换 URL 占位符**。
+- 可观察现象：
+  - 版本 B 的页面上环境开关状态从"无环境"切换为开启后，原本显示为 `<<HOST>>/api/users` 的 URL 突然变成 `a.com/api/users`（来自版本 A 的值）。
+  - 刷新页面后，`parsedEnvironmentVariables` 被初始化为空数组，该现象消失。
 
 ---
 
