@@ -705,6 +705,155 @@ public async resetAuthKey(): Promise<void> {
 
 ---
 
+### 注册成功链路的异常状态一致性
+
+`verify_registration()` 函数的成功路径涉及多个独立的状态变更，这些变更并非原子性的，存在部分成功部分失败的风险。
+
+#### 成功链路的 5 个独立步骤
+
+**文件**: `packages/hoppscotch-agent/src-tauri/src/controller.rs:115-182`
+
+```rust
+pub async fn verify_registration(...) -> AgentResult<Json<AuthKeyResponse>> {
+    // 步骤 1: 验证 OTP（读操作，无副作用）
+    if !state.validate_registration(...).await {
+        return Err(AgentError::InvalidRegistration);
+    }
+
+    // 步骤 2: 生成密钥（纯计算，无副作用）
+    let auth_key = Uuid::new_v4().to_string();
+    let secret_key = EphemeralSecret::random();
+    let shared_secret = secret_key.diffie_hellman(&their_public_key);
+
+    // 步骤 3: 更新注册（内存 + 磁盘）
+    state.update_registrations(app_handle.clone(), |regs| {
+        regs.insert(auth_key_copy, Registration { ... });
+    })?;  // ← 如果这里失败，前面的都回滚了
+
+    // 步骤 4: emit "authenticated" 事件（通知 Agent 前端 UI）
+    app_handle.emit("authenticated", &auth_payload)?;  // ← 如果这里失败？
+
+    // 步骤 5: 清除 active_registration_code（内存）
+    let _ = state.clear_active_registration().await;  // ← 忽略错误！
+
+    Ok(Json(AuthKeyResponse { ... }))
+}
+```
+
+#### 异常场景 1：`update_registrations` 失败（步骤 3）
+
+`update_registrations()` 内部有 3 个可能的失败点：
+
+**文件**: `packages/hoppscotch-agent/src-tauri/src/state.rs:83-130`
+
+```rust
+pub fn update_registrations(&self, app_handle, update_func) -> Result<(), AgentError> {
+    update_func(&self.registrations);  // 1. 更新内存 → 总能成功
+
+    let store = app_handle.store(AGENT_STORE)?;  // 2. 访问 store → 可能失败
+
+    if store.has(REGISTRATIONS) {
+        store.delete(REGISTRATIONS)?;  // 3. 删除旧的 → 可能失败
+    }
+
+    store.set(REGISTRATIONS, serde_json::to_value(...)?)?;  // 4. 设置新值 → 可能失败
+    store.save()?;  // 5. 持久化到磁盘 → 可能失败
+
+    Ok(())
+}
+```
+
+**不一致风险**：
+- `update_func(&self.registrations)` **总是先执行**，内存已被修改
+- 后续步骤（`store.delete` / `store.set` / `store.save`）**任何一个失败**，都会导致：
+  - ✅ **内存**：已更新（新注册已加入）
+  - ❌ **磁盘**：未更新（`app_data.bin` 仍为旧值）
+- 函数返回 `Err` 给调用者，但内存状态已经改变
+- **Agent 重启后，内存状态丢失，新注册消失**
+
+#### 异常场景 2：`emit("authenticated")` 失败（步骤 4）
+
+**文件**: `packages/hoppscotch-agent/src-tauri/src/controller.rs:169-172`
+
+```rust
+if let Err(e) = app_handle.emit("authenticated", &auth_payload) {
+    tracing::error!("Failed to emit authenticated event: {:?}", e);
+    return Err(AgentError::InternalServerError);  // ← 返回错误
+}
+```
+
+**不一致风险**：
+- 步骤 3（`update_registrations`）已成功：✅ 内存 + ✅ 磁盘 都有新注册
+- 步骤 4 emit 失败：返回 `Err(InternalServerError)`
+- 步骤 5（`clear_active_registration`）**不会执行**
+- 结果：
+  - ✅ 新注册已持久化
+  - ❌ `active_registration_code` 仍保留（阻止新的注册发起）
+  - ❌ Agent 前端窗口不会自动隐藏（因为没收到 `authenticated` 事件）
+  - ❌ HTTP 返回 500 给前端，前端**不会保存 auth_key**
+- **最终状态**：后端有注册记录，但前端没有凭证，这个注册永久"孤儿化"
+
+#### 异常场景 3：`clear_active_registration` 失败（步骤 5）
+
+```rust
+let _ = state.clear_active_registration().await;  // 错误被忽略！
+```
+
+**不一致风险**：
+- 即使清除失败，`_` 忽略了错误，函数仍返回 `Ok`
+- 结果：
+  - ✅ 注册已成功创建
+  - ✅ 前端已收到 auth_key
+  - ❌ `active_registration_code` 仍保留（阻止新的注册发起）
+- 但这个风险较低：`clear_active_registration()` 只是获取 `RwLock` 写锁然后设为 `None`，几乎不会失败
+
+#### 前端侧的异常处理
+
+**文件**: `packages/hoppscotch-common/src/platform/std/kernel-interceptors/agent/store.ts:230-258`
+
+```typescript
+public async verifyRegistration(otp: string): Promise<void> {
+  const response = await axios.post("/verify-registration", { ... })
+  // ← 如果 HTTP 请求失败（网络错误、500 等），直接抛出异常
+
+  const { auth_key: newAuthKey, agent_public_key_b16 } = response.data
+
+  if (typeof newAuthKey !== "string")
+    throw new Error("Invalid auth key received")  // ← 验证失败
+
+  // 计算共享密钥...
+
+  this.authKey.value = newAuthKey                // ← 只有全部成功才写入内存
+  this.sharedSecretB16.value = sharedSecretB16
+  await this.persistStore()                      // ← 写入 Kernel Store
+}
+```
+
+前端处理是**原子性的**：要么全部成功，要么全部不写入。
+
+#### AgentSubtitle 中的 catch-all
+
+**文件**: `packages/hoppscotch-common/src/components/settings/AgentSubtitle.vue:121-133`
+
+```typescript
+const register = async () => {
+  store.isRegistering.value = true
+  try {
+    await store.verifyRegistration(store.registrationOTP.value)
+    await updateMaskedAuthKey()
+    toast.success(...)
+  } catch (_e) {
+    // 静默失败，不做任何清理！
+  } finally {
+    store.isRegistering.value = false
+  }
+}
+```
+
+**catch (_e)** 吞掉了所有异常，包括后端状态不一致的情况。用户只会看到 spinner 消失，但不知道后端可能留下了孤儿注册。
+
+---
+
 ### 删除注册接口的访问控制边界
 
 **文件**: `packages/hoppscotch-agent/src-tauri/src/controller.rs:184-202`
@@ -755,7 +904,170 @@ Authorization: Bearer aaa   ← 请求者是 A
 
 ---
 
-## 五、请求转发实现
+## 五、请求取消机制的并发风险分析
+
+### 取消机制的两层架构
+
+取消机制实际分为**两层独立的实现**，分别位于不同的代码库：
+
+| 层级 | 存储位置 | 实现方式 | 用途 |
+|------|----------|----------|------|
+| Layer 1: AppState | `AppState.cancellation_tokens: DashMap<usize, CancellationToken>` | Agent 端内部 | **未实际使用** |
+| Layer 2: relay crate | `ACTIVE_REQUESTS: DashMap<i64, Arc<AtomicBool>>` | relay 全局静态 | **实际生效** |
+
+⚠️ **重要发现**：`AppState.cancellation_tokens` 虽然有 `add_cancellation_token()` 和 `remove_cancellation_token()` 方法，但**在整个代码库中从未被调用过**！实际生效的是 relay crate 中的 `ACTIVE_REQUESTS`。
+
+### Layer 2: relay 中的取消实现
+
+**文件**: `packages/hoppscotch-desktop/plugin-workspace/relay/src/relay.rs:22-175`
+
+```rust
+lazy_static::lazy_static! {
+    static ref ACTIVE_REQUESTS: DashMap<i64, Arc<AtomicBool>> = DashMap::new();
+}
+
+pub async fn execute(request: Request) -> Result<Response> {
+    let request_id = request.id;
+    let cancelled = Arc::new(AtomicBool::new(false));
+
+    ACTIVE_REQUESTS.insert(request_id, Arc::clone(&cancelled));  // ← 加入活跃请求表
+
+    let cancel_token = CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+    let cancelled_clone = Arc::clone(&cancelled);
+
+    // 派生一个 OS 线程执行阻塞的 curl 操作
+    let handle = std::thread::spawn(move || {
+        let result = execute_request(&request, &cancel_token);
+        if cancel_token_clone.is_cancelled() {
+            cancelled_clone.store(true, Ordering::SeqCst);
+        }
+        result
+    });
+
+    let result = match handle.join() { ... };  // ← 等待线程结束
+
+    ACTIVE_REQUESTS.remove(&request_id);  // ← 从活跃请求表移除
+    result
+}
+
+pub async fn cancel(request_id: i64) -> Result<()> {
+    if let Some(cancelled) = ACTIVE_REQUESTS.get(&request_id) {
+        cancelled.store(true, Ordering::SeqCst);  // ← 只设置标志位！
+        Ok(())
+    } else {
+        Err(RelayError::Network { message: "Request not found".into(), cause: None })
+    }
+}
+```
+
+### 并发风险 1：取消机制的"软取消"问题
+
+**关键发现**：`cancel()` 函数**只设置 `AtomicBool` 标志位，并不实际调用 `CancellationToken::cancel()`**！
+
+```rust
+// cancel() 只做这件事：
+cancelled.store(true, Ordering::SeqCst);
+
+// 但 CancellationToken 的取消需要显式调用：
+// cancel_token.cancel()  ← 从未被调用！
+```
+
+**影响**：
+- `execute_request()` 中的 `transfer_handler.handle_transfer(&mut handle, cancel_token)` 监听的是 `cancel_token`，而不是 `cancelled` 标志
+- 取消请求实际上**不会中断正在进行的 HTTP 传输**
+- `cancelled` 标志只在**线程结束后**检查，用于决定返回值是成功还是取消
+- **用户体验问题**：点击"取消"按钮后，网络传输可能还在继续，只是最终结果被标记为取消
+
+### 并发风险 2：request_id 生成的竞态条件
+
+**文件**: `packages/hoppscotch-common/src/platform/std/kernel-interceptors/agent/index.ts:82`
+
+```typescript
+public execute(request: RelayRequest): ExecutionResult {
+  const reqID = Date.now()  // ← 毫秒级时间戳作为 request_id
+  const cancelToken = axios.CancelToken.source()
+  // ...
+}
+```
+
+**问题**：`Date.now()` 的精度只有 **1 毫秒**。
+
+**竞态场景**：
+1. 时间 T: 用户快速连续点击发送按钮两次
+2. 两次请求都在同一毫秒内执行
+3. 两个请求获得**相同的 reqID**（例如 `1716800000000`）
+4. 第一次请求加入 `ACTIVE_REQUESTS`，key 为 `1716800000000`
+5. 第二次请求加入 `ACTIVE_REQUESTS`，**覆盖**了第一次的条目
+6. 用户尝试取消第一个请求 → 找到的是第二个请求的 `AtomicBool`
+7. 第一个请求的取消令牌**永久丢失**，无法取消
+
+**影响范围**：
+- 短时间内快速发送多个请求（自动化测试、脚本、快速点击）
+- 所有请求都使用相同的 `auth_key`（同一浏览器）
+- 取消操作可能取消错误的请求，或者根本无法取消
+
+### 并发风险 3：ACTIVE_REQUESTS 的内存泄漏
+
+`ACTIVE_REQUESTS` 是一个全局 `DashMap`，但：
+- **没有清理过期条目的机制**
+- **没有最大容量限制**
+- 如果请求线程崩溃或 `join()` 失败，条目可能永远留在 map 中
+
+**代码证据**：`execute()` 中 `ACTIVE_REQUESTS.remove(&request_id)` 只在正常路径调用，如果 `handle.join()` 发生 panic 或 `Err(_)`，remove 可能不会执行。
+
+### 并发风险 4：跨客户端取消
+
+**文件**: `packages/hoppscotch-agent/src-tauri/src/controller.rs:286-304`
+
+```rust
+pub async fn cancel(
+    State((state, _app_handle)): State<(Arc<AppState>, AppHandle)>,
+    TypedHeader(auth_header): TypedHeader<Authorization<Bearer>>,  // 请求者的 auth_key
+    Path(request_id): Path<usize>,                                // 要取消的 request_id
+) -> AgentResult<Json<serde_json::Value>> {
+    if !state.validate_access(auth_header.token()) {  // 只验证请求者是否已注册
+        return Err(AgentError::Unauthorized);
+    }
+
+    if let Ok(()) = relay::cancel(request_id.try_into().unwrap()).await {
+        Ok(Json(json!({"message": "Request cancelled successfully"})))
+    } else {
+        Err(AgentError::RequestNotFound)
+    }
+}
+```
+
+**访问控制分析**：
+- 与 DELETE API 有同样的问题：**只验证请求者是否已注册，不验证请求者是否是 request_id 的所有者**
+- `ACTIVE_REQUESTS` 是全局的，不区分哪个 auth_key 发起的请求
+- **任何已注册客户端都可以取消任何（包括其他客户端的）请求**
+
+**攻击场景**：
+1. 客户端 A 发起一个大文件下载请求（req_id = 12345）
+2. 客户端 B（已注册）恶意调用 `POST /cancel/12345`
+3. 客户端 A 的下载被意外中断
+
+### 前端取消的双重机制
+
+**文件**: `packages/hoppscotch-common/src/platform/std/kernel-interceptors/agent/index.ts:86-88`
+
+```typescript
+cancel: async () => {
+  cancelToken.cancel()              // ← 机制 1: 取消 Axios HTTP 连接（浏览器 → Agent）
+  await this.store.cancelRequest(reqId)  // ← 机制 2: 通知 Agent 取消实际请求
+},
+```
+
+前端有两层取消：
+1. **Axios CancelToken**：取消浏览器到 Agent 的 HTTP 连接
+2. **POST /cancel/:reqId**：通知 Agent 取消实际转发的请求
+
+但机制 2 存在上述的竞态和跨客户端问题。
+
+---
+
+## 六、请求转发实现
 
 ### 完整请求链路
 
@@ -870,11 +1182,17 @@ public async decryptResponse(nonceB16, encryptedResponse): Promise<PluginRespons
 }
 ```
 
-### 请求取消
+### 请求取消（旧描述已废弃）
 
-浏览器端支持取消请求（`cancel`），有两种途径：
-1. Axios 的 `CancelToken`：直接取消 HTTP 连接。
-2. Agent 端的 `/cancel/:req_id`：通过 Agent 的 `CancellationToken` 取消正在执行的 relay 请求。
+详见**第五节 "请求取消机制的并发风险分析"**。
+
+⚠️ **已废弃的旧理解**："Agent 端的 `/cancel/:req_id`：通过 Agent 的 `CancellationToken` 取消正在执行的 relay 请求。"
+
+**实际正确机制**：
+- 取消分为两层独立实现，`AppState.cancellation_tokens` 实际上**未被使用**
+- 实际生效的是 relay crate 中全局的 `ACTIVE_REQUESTS: DashMap<i64, Arc<AtomicBool>>`
+- `cancel()` 只设置 `AtomicBool` 标志位，**不调用 `CancellationToken::cancel()`**，不会中断正在传输的 HTTP 请求
+- 存在 request_id 竞态、内存泄漏、跨客户端取消等并发风险
 
 ### Cookie 处理
 
@@ -954,7 +1272,26 @@ Agent 拦截器支持按域名配置安全/代理/高级选项（类似 Native �
 | （未提及） | **任何已注册客户端都能删除任意（包括其他客户端的）注册** |
 | （未提及安全影响） | 存在跨客户端删除风险，特别是同机多浏览器场景 |
 
-### 6. 拦截器持久化恢复
+### 6. 请求取消机制
+
+| 之前错误 | 正确理解 |
+|-----------|----------|
+| 取消通过 Agent 的 `CancellationToken` 实现 | `AppState.cancellation_tokens` 实际上**从未被调用**，是死代码 |
+| （未提及取消机制分层） | 实际取消机制在 relay crate 中，用全局 `ACTIVE_REQUESTS` DashMap |
+| （未提及软取消问题） | `cancel()` 只设置 `AtomicBool` 标志，**不调用 `CancellationToken::cancel()`**，不会中断正在传输的 HTTP 请求 |
+| （未提及竞态条件） | `reqID = Date.now()` 只有毫秒精度，快速发送请求时会产生**相同 request_id**，导致取消令牌覆盖丢失 |
+| （未提及访问控制） | 与 DELETE API 一样，**任何已注册客户端都能取消任意（包括其他客户端的）请求** |
+
+### 7. 注册成功链路的异常状态一致性
+
+| 之前错误 | 正确理解 |
+|-----------|----------|
+| （假设原子性） | 注册成功链路有 5 个独立步骤，**非原子性**，存在部分成功部分失败的风险 |
+| （未提及持久化失败场景） | `update_registrations()` 先改内存再写磁盘，**磁盘写入失败时内存已修改**，重启后新注册丢失 |
+| （未提及 emit 失败场景） | `emit("authenticated")` 失败时，**后端注册已持久化但前端无凭证**，产生"孤儿注册" |
+| （未提及前端 catch-all） | `AgentSubtitle.vue` 中 `catch (_e)` **吞掉所有异常**，用户感知不到后端状态不一致 |
+
+### 8. 拦截器持久化恢复
 
 | 之前错误 | 正确理解 |
 |-----------|----------|
@@ -981,6 +1318,12 @@ Agent 拦截器支持按域名配置安全/代理/高级选项（类似 Native �
 | `hoppscotch-agent/src-tauri/src/tray.rs` | 系统托盘菜单（Clear Registrations、Show Registrations 等） |
 | `hoppscotch-agent/src-tauri/src/error.rs` | AgentError 枚举与 HTTP 状态码映射 |
 | `hoppscotch-agent/src/App.vue` | Agent 前端主页面（OTP 显示、注册列表） |
+
+### Relay 库（Rust）
+
+| 文件 | 职责 |
+|------|------|
+| `hoppscotch-desktop/plugin-workspace/relay/src/relay.rs` | HTTP 请求执行与取消的核心实现（ACTIVE_REQUESTS、execute、cancel） |
 
 ### 前端（TypeScript/Vue）
 
