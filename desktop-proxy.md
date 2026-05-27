@@ -413,57 +413,244 @@ pub async fn verify_registration(...) -> AgentResult<Json<AuthKeyResponse>> {
 
 ---
 
-## 四、注册失效探测与注销
+## 四、注册生命周期
 
-### 注册失效探测
+### 注册的两阶段状态
 
-**文件**: `packages/hoppscotch-agent/src-tauri/src/controller.rs:264-284`
+Agent 中的注册分为两个不同的阶段和状态，生命周期完全不同：
 
-`/registered-handshake` 端点**存在**，用于已注册客户端验证连接有效性：
+| 状态 | 存储位置 | 生命周期 | 持久化 |
+|------|----------|----------|--------|
+| `active_registration_code`（进行中的 OTP） | `AppState.active_registration_code: RwLock<Option<String>>` | **短暂**：从生成到验证成功或窗口关闭 | **不持久化**，仅内存 |
+| `registrations`（已完成的注册） | `AppState.registrations: DashMap<String, Registration>` | **持久**：直到被显式删除 | **持久化**到 `app_data.bin` |
+
+### 阶段一：active_registration_code 的生命周期
+
+`active_registration_code` 是一个"正在进行的注册"标记，同一时刻只能有一个。
+
+#### 生成时机
+
+**文件**: `packages/hoppscotch-agent/src-tauri/src/controller.rs:53-83`
+
+当浏览器 POST `/receive-registration` 时，Agent 调用 `generate_otp()` 生成 6 位 OTP 并存入 `active_registration_code`。同时通过 `app_handle.emit("registration-received", otp)` 通知 Agent 前端窗口显示 OTP。
+
+如果已有一个 `active_registration_code` 存在（即另一个注册正在进行），Agent 拒绝新注册请求：
 
 ```rust
-pub async fn registered_handshake(...) -> AgentResult<EncryptedJson<...>> {
-    // 如果 auth_key 有效，返回加密的 true
-    // 如果无效，返回 401 Unauthorized
+if !active_registration_code.is_none() {
+    return Ok(Json(json!({ "message": "There is already an existing registration happening" })));
 }
 ```
 
-⚠️ **但是**，**前端代码中**没有调用这个端点**！
+#### 清除时机（三处）
 
-### 实际失效探测发生在：
+1. **验证成功时**（`controller.rs:174`）：
 
-1. **`fetchRegistrationInfo()` 调用 `/registration` 时**：
-   ```typescript
-   public async fetchRegistrationInfo(): Promise<...>> {
-     try {
-       const response = await axios.get("http://localhost:9119/registration", {
-         headers: { Authorization: `Bearer ${this.authKey.value} },
-         responseType: "arraybuffer",
-       })
-       // 解密返回
-     } catch (error) {
-       if (axios.isAxiosError(error)) {
-         if (error.response?.status === 401) {
-           this.authKey.value = null  // 401 时自动清除
-           await this.persistStore()
-         }
+   `verify_registration()` 成功后显式调用：
+   ```rust
+   let _ = state.clear_active_registration().await;
+   ```
+   同时 emit `"authenticated"` 事件，Agent 窗口收到后自动隐藏。
+
+2. **Agent 窗口关闭时**（`lib.rs:220-225`）：
+
+   窗口关闭请求被拦截后，清除 `active_registration_code`：
+   ```rust
+   tauri::WindowEvent::CloseRequested { api, .. } => {
+       api.prevent_close();
+       window.hide();
+       let mut current_code = app_state.active_registration_code.blocking_write();
+       if current_code.is_some() {
+           *current_code = None;  // 清除进行中的注册
        }
-       throw error
-     }
+       window.emit("window-hidden", ());
    }
    ```
+   这意味着：**如果用户在注册完成前关闭了 Agent 窗口，OTP 会被清除，正在进行的注册流程将无法完成。**
 
-2. **每次执行请求时**：`/execute` 401 也会触发错误，但前端没有自动处理，只会报错。
+3. **Agent 重启时**：
 
-### 注销路径
+   `active_registration_code` 只存于内存（`RwLock<Option<String>>`），不持久化。Agent 重启后自动为 `None`。这意味着：**重启 Agent 会使进行中的注册流程作废。**
 
-#### 前端单方面注销
+#### 不清除的情况
+
+- 浏览器端超时或用户放弃注册，只要 Agent 窗口未关闭且 Agent 未重启，`active_registration_code` 就会一直保留，阻止新的注册发起。
+
+### 阶段二：registrations 的生命周期
+
+`registrations` 是已完成的注册列表，key 是 `auth_key`（UUID），value 是 `Registration`（含 `registered_at` 和 `shared_secret_b16`）。
+
+#### 创建时机
+
+**文件**: `packages/hoppscotch-agent/src-tauri/src/controller.rs:151-162`
+
+`verify_registration()` 成功后通过 `update_registrations()` 写入：
+```rust
+regs.insert(auth_key_copy, Registration {
+    registered_at: created_at,
+    shared_secret_b16: base16::encode_lower(shared_secret.as_bytes()),
+});
+```
+
+#### 持久化
+
+**文件**: `packages/hoppscotch-agent/src-tauri/src/state.rs:83-130`
+
+`update_registrations()` 不仅更新内存中的 DashMap，还同步写入 `tauri_plugin_store`（文件 `app_data.bin`，key `"registrations"`）：
+
+```rust
+pub fn update_registrations(&self, app_handle, update_func) -> Result<(), AgentError> {
+    update_func(&self.registrations);  // 更新内存
+
+    let store = app_handle.store(AGENT_STORE)?;
+    if store.has(REGISTRATIONS) {
+        store.delete(REGISTRATIONS)?;  // 先清旧的
+    }
+    store.set(REGISTRATIONS, serde_json::to_value(self.registrations.clone())?);
+    store.save()?;  // 写盘
+}
+```
+
+**关键设计**：此方法绕过 `store.reload()`，以内存中的 `self.registrations` 为唯一真相来源，避免磁盘上的过期数据覆盖最新变更。
+
+#### 加载时机
+
+**文件**: `packages/hoppscotch-agent/src-tauri/src/state.rs:30-65`
+
+Agent 启动时 `AppState::new()` 从持久化存储恢复：
+```rust
+let registrations = store
+    .get(REGISTRATIONS)
+    .and_then(|val| serde_json::from_value(val.clone()).ok())
+    .unwrap_or_else(|| DashMap::new());
+```
+
+**结论：已完成的注册在 Agent 重启后依然有效。**
+
+#### 删除时机（三处）
+
+1. **DELETE `/registrations/:auth_key` API**（`controller.rs:185-202`）：
+
+   通过 HTTP 接口删除单个注册（需要 Bearer Token 认证 + auth_key 路径参数）。前端**当前未调用**此接口。
+
+2. **系统托盘 "Clear Registrations" 菜单项**（`tray.rs:83-89`）：
+
+   ```rust
+   "clear_registrations" => {
+       let app_state = app.state::<Arc<AppState>>();
+       app_state.clear_registrations(app.clone())
+           .expect("Invariant violation: Failed to clear registrations");
+   }
+   ```
+   调用 `state.rs:134` 的 `clear_registrations()`，清空**所有**注册：
+   ```rust
+   pub fn clear_registrations(&self, app_handle) -> Result<(), AgentError> {
+       self.update_registrations(app_handle, |regs| regs.clear())?;
+   }
+   ```
+   这是 Agent 端**唯一可用的注册删除入口**，但它会删除全部注册，不支持删除单个。
+
+3. **卸载/删除 Agent 应用数据**：直接删除 `app_data.bin` 文件。
+
+#### 不存在过期机制
+
+`Registration` 结构只有 `registered_at` 和 `shared_secret_b16` 两个字段，**没有 TTL 或过期时间**。注册一旦创建，永远不会自动过期失效。
+
+---
+
+### 注册失效探测
+
+#### 方式一：`/registered-handshake` 端点（存在但前端未使用）
+
+**文件**: `packages/hoppscotch-agent/src-tauri/src/controller.rs:264-284`
+
+```rust
+pub async fn registered_handshake(
+    TypedHeader(auth_header): TypedHeader<Authorization<Bearer>>,
+) -> AgentResult<EncryptedJson<serde_json::Value>> {
+    match state.get_registration(auth_header.token()) {
+        Some(reg) => Ok(EncryptedJson { key_b16: reg.shared_secret_b16, data: json!(true) }),
+        None => Err(AgentError::Unauthorized),  // → HTTP 401
+    }
+}
+```
+
+此端点用共享密钥加密响应 `true`，客户端需要同时拥有有效 auth_key 和 shared_secret 才能验证成功。**但前端代码从未调用此端点。**
+
+#### 方式二：`fetchRegistrationInfo()` 调用 `/registration` 时（实际生效）
+
+**文件**: `packages/hoppscotch-common/src/platform/std/kernel-interceptors/agent/store.ts:260-287`
+
+```typescript
+public async fetchRegistrationInfo(): Promise<{ registered_at: Date; auth_key_hash: string }> {
+  try {
+    const response = await axios.get("http://localhost:9119/registration", {
+      headers: { Authorization: `Bearer ${this.authKey.value}` },
+      responseType: "arraybuffer",
+    })
+    return await this.decryptResponse(nonceB16, response.data)
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.response?.status === 401) {
+      this.authKey.value = null       // 清除内存中的 authKey
+      await this.persistStore()        // 持久化清除结果
+    }
+    throw error
+  }
+}
+```
+
+此方法在 `AgentSubtitle.vue` 的 `onMounted` 和注册成功后调用（`updateMaskedAuthKey`），是前端感知注册是否有效的唯一途径。当返回 401 时，前端自动清除本地凭证。
+
+#### 方式三：`/execute` 请求时（被动感知）
+
+每次执行代理请求时，如果 auth_key 在 Agent 端已不存在，`/execute` 返回 401。但前端 `executeRequest()` 没有像 `fetchRegistrationInfo()` 那样对 401 做特殊处理，只会抛出错误显示给用户。
+
+---
+
+### 注销路径（完整对比）
+
+注销涉及两个独立的数据存储，清理路径不对称：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    注销路径全景                               │
+│                                                             │
+│   前端 Kernel Store              Agent 后端 DashMap + disk  │
+│   (interceptors.agent.v1)        (app_data.bin)             │
+│                                                             │
+│   ┌─────────────────┐            ┌──────────────────────┐  │
+│   │ auth.key         │            │ registrations[ak_A]  │  │
+│   │ auth.sharedSecret│            │ registrations[ak_B]  │  │
+│   │ domains          │            │ registrations[ak_C]  │  │
+│   └────────┬─────────┘            └──────────┬───────────┘  │
+│            │                                  │              │
+│   路径 A: 前端"注销"按钮           路径 C: 托盘               │
+│   resetAuthKey()                   "Clear Registrations"    │
+│   → auth.key = null               → regs.clear()           │
+│   → auth.sharedSecret = null      → persist to disk         │
+│   → persistStore()                                          │
+│            │                                  │              │
+│            │                        路径 D: DELETE API       │
+│            │                        /registrations/:auth_key │
+│            │                        (前端未调用)              │
+│            │                        → regs.remove(&ak)       │
+│            │                        → persist to disk         │
+│            │                                  │              │
+│            ▼                                  ▼              │
+│   ✅ 前端凭证清除                    ✅ 后端注册清除           │
+│   ❌ 后端注册保留                    ❌ 前端凭证保留           │
+│   (下次发请求会 401)               (前端凭残留凭证            │
+│                                    发请求仍会 401)           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 路径 A：前端"注销"按钮（只清前端）
 
 **文件**: `packages/hoppscotch-common/src/components/settings/AgentSubtitle.vue:135-141`
 
 ```typescript
 const resetRegistration = async () => {
-  await store.resetAuthKey()  // 只清前端本地的！
+  await store.resetAuthKey()  // → authKey = null, sharedSecretB16 = null
   store.maskedAuthKey.value = ""
   store.registrationOTP.value = ""
   store.hasInitiatedRegistration.value = false
@@ -471,27 +658,100 @@ const resetRegistration = async () => {
 }
 ```
 
-⚠️ **只清除了前端的 authKey 和 sharedSecret，**没有调用后端删除接口**！
+`resetAuthKey()` 实现（`store.ts:129-133`）：
+```typescript
+public async resetAuthKey(): Promise<void> {
+  this.authKey.value = null
+  this.sharedSecretB16.value = null
+  await this.persistStore()
+}
+```
 
-#### 后端删除接口（前端未调用）
+`persistStore()` 将 `auth.key: null, auth.sharedSecret: null` 写入 Kernel Store，但**域名设置 `domains` 被保留**。
+
+**效果**：前端丢失凭证，但 Agent 后端的注册记录仍然存在。前端无法再发请求（authKey 为 null），但 auth_key 在 Agent 端仍占一个注册槽位。
+
+#### 路径 C：Agent 托盘 "Clear Registrations"（只清后端，且清全部）
+
+**文件**: `packages/hoppscotch-agent/src-tauri/src/tray.rs:83-89`
+
+```rust
+"clear_registrations" => {
+    let app_state = app.state::<Arc<AppState>>();
+    app_state.clear_registrations(app.clone())
+        .expect("Invariant violation: Failed to clear registrations");
+}
+```
+
+**效果**：Agent 后端清空所有注册（内存 + 磁盘），但前端的 Kernel Store 仍保留 `auth.key` 和 `auth.sharedSecret`。前端下次尝试发请求时，Agent 返回 401 → 前端不会自动清除凭证，只显示错误。
+
+#### 路径 D：DELETE `/registrations/:auth_key` API（只清后端，删单个，前端未调用）
 
 **文件**: `packages/hoppscotch-agent/src-tauri/src/controller.rs:185-202`
 
+此接口的访问控制存在一个重要细节，详见下方"删除接口访问控制边界"。
+
+#### 综合结论：注销是不对称的
+
+| 操作 | 前端 Kernel Store | Agent 后端注册 | 域名设置 |
+|------|-------------------|---------------|----------|
+| 前端"注销"按钮 | ✅ 清除 auth | ❌ 保留 | ✅ 保留 |
+| 托盘 "Clear Registrations" | ❌ 保留 auth | ✅ 清除全部 | — |
+| DELETE API（未调用） | ❌ 保留 auth | ✅ 删除指定 | — |
+
+**没有一条路径能同时清理前端和后端**。要完全注销，需要两步操作：
+1. 前端点击"注销"清除本地凭证
+2. Agent 托盘点击 "Clear Registrations" 清除后端记录（但会清除所有注册）
+
+---
+
+### 删除注册接口的访问控制边界
+
+**文件**: `packages/hoppscotch-agent/src-tauri/src/controller.rs:184-202`
+
 ```rust
-pub async fn delete_registration(...) -> AgentResult<Json<...>> {
-    if !state.validate_access(auth_header.token()) {
+pub async fn delete_registration(
+    State((state, app_handle)): State<(Arc<AppState>, AppHandle)>,
+    TypedHeader(auth_header): TypedHeader<Authorization<Bearer>>,  // 请求者的 token
+    Path(auth_key): Path<String>,                                  // 要删除的 auth_key
+) -> AgentResult<Json<serde_json::Value>> {
+    if !state.validate_access(auth_header.token()) {  // 只验证请求者自己是否已注册
         return Err(AgentError::Unauthorized);
     }
     state.update_registrations(app_handle.clone(), |regs| {
-        regs.remove(&auth_key);  // 从后端删除
+        regs.remove(&auth_key);  // 删除路径参数指定的 auth_key
     })?;
 }
 ```
 
-**当前状态**：
-- 前端"注销"是**单向的**：前端清除自己的凭证，但后端还保留注册记录
-- Agent 端的注册列表页面也**没有删除按钮**，只能查看不能删除
--  `/registered-handshake` 端点存在但前端没使用
+#### 访问控制分析
+
+认证逻辑**只检查请求者（`auth_header.token()`）是否是已注册的客户端**，不检查请求者是否有权删除目标 `auth_key`。这意味着：
+
+**任何已注册的客户端都可以删除任意（包括其他客户端的）注册。**
+
+```
+客户端 A（auth_key = "aaa"）
+客户端 B（auth_key = "bbb"）
+
+DELETE /registrations/bbb
+Authorization: Bearer aaa   ← 请求者是 A
+
+→ validate_access("aaa") → true  ← A 是已注册的，通过验证
+→ regs.remove("bbb")              ← B 的注册被 A 删除了！
+```
+
+#### 安全影响
+
+由于 Agent 仅监听 `127.0.0.1:9119`，只有本机进程能访问。但以下场景仍有风险：
+
+1. **同机多浏览器/多用户**：如果同一台机器上有多个浏览器实例分别注册了不同的 auth_key，任何一个都可以删除其他的。
+2. **恶意本地程序**：任何能访问 `localhost:9119` 的本地程序，只要获得任一 auth_key，就能删除所有注册。
+3. **XSS 攻击**：如果 Hoppscotch Web 前端存在 XSS 漏洞，攻击者可以从 `Kernel Store` 读取 auth_key，然后调用 DELETE API 删除其他客户端的注册。
+
+#### 改进方向（代码现状未实现）
+
+合理的访问控制应该是：**请求者只能删除自己的注册**，即 `auth_header.token() == auth_key`。当前代码未做此限制。
 
 ---
 
@@ -652,29 +912,49 @@ Agent 拦截器支持按域名配置安全/代理/高级选项（类似 Native �
 
 ## 七、关键错误总结（修正点）
 
-### 1. **OTP 生成位置
+### 1. OTP 生成位置
 
 | 之前错误 | 正确理解 |
 |-----------|----------|
-| 浏览器生成 OTP 发给 Agent | **Agent 自己生成 OTP！浏览器生成的 OTP 被完全忽略 |
+| 浏览器生成 OTP 发给 Agent | **Agent 自己生成 OTP！浏览器生成的 OTP 被完全忽略** |
 | 浏览器知道 OTP 值 | 浏览器不知道 OTP，必须由用户从 Agent 窗口复制粘贴 |
 
-### 2. 注册失效探测
+### 2. 注册生命周期的两阶段
+
+| 之前错误 | 正确理解 |
+|-----------|----------|
+| （未区分两阶段） | `active_registration_code`（进行中 OTP）和 `registrations`（已完成注册）是两个独立状态，生命周期完全不同 |
+| （未提及 OTP 清除时机） | OTP 有三处清除：验证成功、窗口关闭、Agent 重启。窗口关闭会中断进行中的注册 |
+| （未提及注册持久化） | 已完成注册持久化到磁盘，Agent 重启后仍然有效 |
+| （未提及过期机制） | 注册**没有 TTL**，永不过期，只能显式删除 |
+
+### 3. 注册失效探测
 
 | 之前错误 | 正确理解 |
 |-----------|----------|
 | （未提及） | `/registered-handshake` 存在但前端**未使用** |
 | （未提及） | 实际靠 `/registration` 返回 401 时自动清除前端 authKey |
+| （未提及） | `/execute` 返回 401 时前端**不会**自动清除凭证，只报错 |
 
-### 3. 注销路径
+### 4. 注销路径（不对称）
 
 | 之前错误 | 正确理解 |
 |-----------|----------|
-| （未提及后端删除） | 前端"注销"是**单向**的，只清前端凭证，后端还保留注册 |
-| （未提及） | 后端有 DELETE 接口但前端**从未调用 |
-| （未提及） | Agent 注册列表页**没有删除按钮 |
+| （未提及后端删除） | 前端"注销"是**单向的**，只清前端凭证，后端还保留注册 |
+| （未提及托盘清注册） | Agent 系统托盘有 "Clear Registrations" 菜单项，清全部后端注册但不清前端 |
+| （未提及 DELETE API） | 后端有 DELETE 接口但前端**从未调用** |
+| （未提及域名设置保留） | 前端"注销"保留域名设置（`domains`），只清除 auth 凭证 |
+| （未提及完全注销需要两步） | **没有一条路径能同时清理前端和后端**，完全注销需两步操作 |
 
-### 4. 拦截器持久化恢复
+### 5. 删除注册接口的访问控制边界
+
+| 之前错误 | 正确理解 |
+|-----------|----------|
+| （未分析访问控制） | DELETE API 只验证请求者是否已注册，**不验证是否有权删除目标 auth_key** |
+| （未提及） | **任何已注册客户端都能删除任意（包括其他客户端的）注册** |
+| （未提及安全影响） | 存在跨客户端删除风险，特别是同机多浏览器场景 |
+
+### 6. 拦截器持久化恢复
 
 | 之前错误 | 正确理解 |
 |-----------|----------|
@@ -698,6 +978,8 @@ Agent 拦截器支持按域名配置安全/代理/高级选项（类似 Native �
 | `hoppscotch-agent/src-tauri/src/util.rs` | EncryptedJson 响应加密、工具函数 |
 | `hoppscotch-agent/src-tauri/src/global.rs` | 全局常量（NONCE 头名、存储 key） |
 | `hoppscotch-agent/src-tauri/src/command.rs` | Tauri 命令（get_otp、list_registrations） |
+| `hoppscotch-agent/src-tauri/src/tray.rs` | 系统托盘菜单（Clear Registrations、Show Registrations 等） |
+| `hoppscotch-agent/src-tauri/src/error.rs` | AgentError 枚举与 HTTP 状态码映射 |
 | `hoppscotch-agent/src/App.vue` | Agent 前端主页面（OTP 显示、注册列表） |
 
 ### 前端（TypeScript/Vue）
