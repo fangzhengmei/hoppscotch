@@ -729,24 +729,101 @@ watchSecretEnvironments 触发:
   // varIndex 重新计算，旧的 secret1 记录被覆盖掉 ✅
 ```
 
-#### 潜在残留场景
+#### 环境删除时的清理流程对比
 
-**场景 4: 环境被删除但 Secret 记录未清理**
+**个人环境删除 (my/Environment.vue:224-234)** ✅ 完整清理
+
+```typescript
+const removeEnvironment = async () => {
+  const isValidToken = await handleTokenValidation()
+  if (!isValidToken) return
+  if (props.environmentIndex === null) return
+  if (!isGlobalEnvironment.value) {
+    // 1. 删除元数据
+    deleteEnvironment(props.environmentIndex as number, props.environment.id)
+    // 2. 删除 Secret 记录
+    secretEnvironmentService.deleteSecretEnvironment(props.environment.id)
+    // 3. 删除当前值记录
+    currentEnvironmentValueService.deleteEnvironment(props.environment.id)
+  }
+  toast.success(`${t("state.deleted")}`)
+}
+```
+
+**团队环境删除 (teams/Environment.vue:208-222)** ✅ 完整清理
+
+```typescript
+const removeEnvironment = () => {
+  pipe(
+    deleteTeamEnvironment(props.environment.id),  // API 调用
+    TE.match(
+      (err: GQLError<string>) => { console.error(err) },
+      () => {
+        toast.success(`${t("team_environment.deleted")}`)
+        // 成功后清理本地记录
+        secretEnvironmentService.deleteSecretEnvironment(props.environment.id)
+        currentEnvironmentValueService.deleteEnvironment(props.environment.id)
+      }
+    )
+  )()
+}
+```
+
+**删除选中环境 (index.vue:297-318)** ⚠️ 不完整清理
+
+```typescript
+const removeSelectedEnvironment = () => {
+  const selectedEnvIndex = getSelectedEnvironmentIndex()
+  if (selectedEnvIndex?.type === "NO_ENV_SELECTED") return
+
+  if (selectedEnvIndex?.type === "MY_ENV") {
+    // ❌ 只删除元数据，不清理 Secret 和 CurrentValue
+    deleteEnvironment(selectedEnvIndex.index)
+    toast.success(`${t("state.deleted")}`)
+  }
+
+  if (selectedEnvIndex?.type === "TEAM_ENV") {
+    pipe(
+      deleteTeamEnvironment(selectedEnvIndex.teamEnvID),
+      TE.match(
+        (err: GQLError<string>) => { console.error(err) },
+        () => {
+          toast.success(`${t("team_environment.deleted")}`)
+          // ❌ 团队环境删除时也没有清理本地记录！
+        }
+      )
+    )()
+  }
+}
+```
+
+#### 删除入口与清理行为矩阵
+
+| 删除入口 | 个人环境清理 Secret | 个人环境清理 CurrentValue | 团队环境清理 Secret | 团队环境清理 CurrentValue |
+|---------|-------------------|-------------------------|-------------------|-------------------------|
+| my/Environment.vue 删除按钮 | ✅ 是 | ✅ 是 | - | - |
+| teams/Environment.vue 删除按钮 | - | - | ✅ 是 | ✅ 是 |
+| index.vue "删除选中环境" | ❌ 否 | ❌ 否 | ❌ 否 | ❌ 否 |
+
+#### 潜在残留场景（修正后）
+
+**场景 4: 通过 index.vue 删除环境时 Secret 记录未清理**
 
 ```
-用户操作: 删除整个环境
-  environmentsStore.deleteEnvironment(envIndex)
-  
-  // 但 deleteEnvironment 只更新 environmentsStore
-  // SecretEnvironmentService 中的记录不会自动删除！
-  
+用户操作: 选中环境后点击"删除选中环境"
+  removeSelectedEnvironment()
+    → deleteEnvironment(selectedEnvIndex.index)  // 仅删除元数据
+    → ❌ 未调用 secretEnvironmentService.deleteSecretEnvironment
+    → ❌ 未调用 currentEnvironmentValueService.deleteEnvironment
+
 残留状态:
   SecretEnvironmentService["envId"] 仍然存在
-  
+  CurrentValueService["envId"] 仍然存在
+
 影响评估:
-  - 不会影响恢复：因为该环境 ID 不再在 environmentsStore 中
+  - 不会影响正常恢复：因为该环境 ID 不再在 environmentsStore 中
   - 占用存储空间：LocalStorage 中残留数据
-  - 潜在风险：如果未来创建相同 ID 的环境，可能恢复旧值
+  - 潜在风险：如果未来创建相同 ID 的环境，可能意外恢复旧值
 ```
 
 **场景 5: 保存失败导致的不一致**
@@ -761,22 +838,51 @@ watchSecretEnvironments 触发:
   - SecretEnvironmentService 已更新
   - CurrentValueService 已更新
   - environmentsStore 未更新
-  
+
 结果:
   - Secret 值与元数据不一致
   - 下次加载时可能恢复到旧状态
 ```
 
-#### 残留记录对恢复的影响矩阵
+**场景 6: 团队环境 API 删除成功但本地清理失败**
+
+```
+teams/Environment.vue 流程:
+  1. deleteTeamEnvironment API 调用成功
+  2. toast.success()
+  3. secretEnvironmentService.deleteSecretEnvironment()
+  4. currentEnvironmentValueService.deleteEnvironment()
+
+如果步骤 3 或 4 因异常中断:
+  - 服务端环境已删除
+  - 本地 Secret 记录残留
+
+发生概率: 低（都是同步内存操作）
+```
+
+#### 残留记录对恢复的影响矩阵（修正后）
 
 | 残留场景 | 是否影响恢复 | 影响程度 | 说明 |
 |---------|------------|---------|------|
 | 取消 secret 后残留空数组 | ❌ 不影响 | 无 | watch 会清理 |
 | 删除所有 secret 后残留空数组 | ❌ 不影响 | 无 | watch 会清理 |
 | 删除部分 secret 后残留旧记录 | ❌ 不影响 | 无 | addSecretEnvironment 覆盖 |
-| 环境删除后 Secret 记录未清理 | ⚠️ 轻微 | 低 | 占用空间，无功能影响 |
+| my/Environment.vue 删除环境 | ❌ 不影响 | 无 | 完整清理 |
+| teams/Environment.vue 删除环境 | ❌ 不影响 | 无 | 完整清理 |
+| index.vue 删除选中环境 | ⚠️ 轻微 | 低 | 残留但不影响功能 |
 | 保存失败导致的不一致 | ⚠️ 轻微 | 中 | 下次加载可能恢复旧值 |
 | 并发写入导致的冲突 | ⚠️ 轻微 | 中 | 后写入者生效 |
+
+#### 边界说明
+
+**残留记录何时会被清理？**
+- 应用重启重新加载时：如果环境 ID 已不存在于 environmentsStore，残留记录仍会被加载但永远不会被使用
+- 手动清理：无 UI 入口，只能通过清除浏览器数据或开发者工具删除
+- 自动清理：无自动垃圾回收机制
+
+**残留记录何时会造成实际问题？**
+- 极端情况：用户删除环境 A（ID: "abc123"），之后由于某种原因（如同步恢复）创建了新环境且恰好复用相同 ID "abc123"
+- 此时残留的 Secret 值会被"恢复"到新环境中，可能导致值错位
 
 ---
 
