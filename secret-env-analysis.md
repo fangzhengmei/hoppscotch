@@ -235,25 +235,290 @@ hopp.env.setInitial(key, value, options)
 
 ---
 
-## 8. 关键设计决策总结
+## 8. 持久化加载与运行时恢复链路
 
-### 8.1 安全性设计
+### 8.1 应用启动时的加载顺序
+
+**文件**: `packages/hoppscotch-common/src/services/persistence/index.ts`
+
+应用启动时 `PersistenceService` 按以下顺序初始化：
+
+```
+1. setupEnvironmentsPersistence()      → 加载环境元数据到 environmentsStore
+2. setupSecretEnvironmentsPersistence() → 加载 secret 值到 SecretEnvironmentService
+3. setupCurrentEnvironmentValuePersistence() → 加载当前值到 CurrentValueService
+4. setupSelectedEnvPersistence()       → 恢复选中的环境索引
+```
+
+**Secret 环境加载流程** (`setupSecretEnvironmentsPersistence`, 727-771行):
+
+```typescript
+// 1. 从本地存储读取
+const loadResult = await Store.get(STORE_NAMESPACE, STORE_KEYS.SECRET_ENVIRONMENTS)
+
+// 2. Schema 验证
+const result = SECRET_ENVIRONMENT_VARIABLE_SCHEMA.safeParse(loadResult.right)
+
+// 3. 加载到服务
+if (result.success) {
+  this.secretEnvironmentService.loadSecretEnvironmentsFromPersistedState(result.data)
+}
+```
+
+**加载方法** (`loadSecretEnvironmentsFromPersistedState`):
+
+```typescript
+public loadSecretEnvironmentsFromPersistedState(
+  secretEnvironments: Record<string, SecretVariable[]>
+) {
+  if (secretEnvironments) {
+    this.secretEnvironments.clear()  // 先清空
+    Object.entries(secretEnvironments).forEach(([id, secretVars]) => {
+      this.addSecretEnvironment(id, secretVars)
+    })
+  }
+}
+```
+
+### 8.2 varIndex 对齐机制
+
+**核心设计**：Secret 值通过 `varIndex`（数组索引）与环境元数据中的变量位置对齐。
+
+**数据结构对应关系**：
+
+```
+environmentsStore.variables[0]  ←→  SecretEnvironmentService["envId"][0].varIndex = 0
+environmentsStore.variables[1]  ←→  SecretEnvironmentService["envId"][1].varIndex = 1
+environmentsStore.variables[2]  ←→  SecretEnvironmentService["envId"][2].varIndex = 2
+```
+
+**恢复时的索引查找** (`resolveEnvVars`, RequestRunner.ts:1044-1062):
+
+```typescript
+const resolveEnvVars = (envID: string, vars: Environment["variables"]) =>
+  vars.map((v, index) => {
+    const secretMeta = v.secret
+      ? getSecretEnvironmentVariableValue(envID, index)  // 用 index 查找
+      : null
+    return {
+      ...v,
+      currentValue: v.secret ? secretMeta?.value : ...,
+      initialValue: v.secret ? secretMeta?.initialValue : ...,
+    }
+  })
+```
+
+### 8.3 运行时值恢复的触发点
+
+#### 触发点 1: 请求执行前 (captureInitialEnvironmentState)
+
+**文件**: `packages/hoppscotch-common/src/helpers/RequestRunner.ts:118-153`
+
+```typescript
+export const captureInitialEnvironmentState = (): InitialEnvironmentState => {
+  // 解析 Global 变量的 secret 值
+  const initialGlobalEnvs = resolveEnvVars("Global", cloneDeep(getGlobalVariables()))
+  
+  // 解析选中环境的 secret 值
+  const initialSelectedEnvs = resolveEnvVars(initialEnvID, initialEnvVariables)
+  
+  // 合并所有变量（包含 secret 真实值）
+  const initialEnvs = getCombinedEnvVariables()
+  // ...
+}
+```
+
+#### 触发点 2: 环境切换时 (aggregateEnvsWithCurrentValue$)
+
+**文件**: `packages/hoppscotch-common/src/newstore/environments.ts:619-700`
+
+当 `currentEnvironment$` 或 `globalEnv$` 变化时，自动重新聚合：
+
+```typescript
+export const aggregateEnvsWithCurrentValue$ = combineLatest([currentEnvironment$, globalEnv$]).pipe(
+  map(([selectedEnv, globalEnv]) => {
+    // 遍历选中环境的变量，对 secret 变量从 SecretEnvironmentService 恢复真实值
+    selectedEnv?.variables.map((x, index) => {
+      if (x.secret) {
+        currentValue = secretEnvironmentService
+          .getSecretEnvironmentVariableValue(selectedEnv.id, index)?.value ?? ""
+      }
+      // ...
+    })
+  })
+)
+```
+
+#### 触发点 3: 编辑器悬停提示 (HoppEnvironment Plugin)
+
+**文件**: `packages/hoppscotch-common/src/helpers/editor/extensions/HoppEnvironment.ts:410-448`
+
+```typescript
+watch(() => restTabs.currentActiveTab.value, (currentTab) => {
+  // 重新计算 requestAndCollVars
+  // 触发 compartment.reconfigure，重新应用 cursorTooltipField
+  // 悬停时实时查询 secret 值并遮蔽显示
+}, { immediate: true, deep: true })
+```
+
+### 8.4 环境切换时的数据流转
+
+```
+用户切换环境
+    ↓
+environmentsStore.selectedEnvironmentIndex 变更
+    ↓
+currentEnvironment$ 发射新值
+    ↓
+aggregateEnvsWithCurrentValue$ 重新计算
+    ↓
+┌─────────────────────────────────────────────┐
+│ 遍历新环境的 variables (按 index)            │
+│   ↓                                         │
+│ if (variable.secret)                        │
+│   → SecretEnvironmentService.getSecret...   │
+│     (envId, varIndex)                       │
+│   → 恢复真实值                              │
+│ else                                        │
+│   → CurrentValueService.get...              │
+│     (envId, varIndex)                       │
+│   → 恢复当前值                              │
+└─────────────────────────────────────────────┘
+    ↓
+编辑器插件 / UI 组件订阅更新
+    ↓
+显示遮蔽后的值 (******)
+```
+
+---
+
+## 9. 导出策略深度分析
+
+### 9.1 单环境导出的安全机制
+
+**文件**: `packages/hoppscotch-common/src/helpers/import-export/export/environment.ts`
+
+```typescript
+export const transformEnvironmentVariables = ({ id, v, name, variables }: Environment) => {
+  return {
+    id, v, name,
+    variables: variables.map((variable) => ({
+      key: variable.key,
+      secret: variable.secret,
+      initialValue: variable.initialValue,
+      currentValue: variable.secret ? "" : (variable.currentValue ?? "")  // Secret 清空
+    })),
+  }
+}
+```
+
+**安全保证**：
+1. Secret 变量的 `currentValue` 被强制清空为 `""`
+2. `initialValue` 保留（但服务端同步的环境中，Secret 的 initialValue 本身就是空的）
+
+### 9.2 批量导出的安全分析
+
+**文件**: `packages/hoppscotch-common/src/helpers/import-export/export/environments.ts`
+
+```typescript
+export const environmentsExporter = (myEnvironments: Environment[]) => {
+  return JSON.stringify(myEnvironments, null, 2)
+}
+```
+
+**调用位置**: `packages/hoppscotch-common/src/components/environments/ImportExport.vue:75-83`
+
+```typescript
+const environmentJson = computed(() => {
+  if (isTeamEnvironment.value && props.teamEnvironments) {
+    return props.teamEnvironments.map(({ environment }) =>
+      transformEnvironmentVariables(environment)  // ✅ 先转换
+    )
+  }
+  return myEnvironments.value.map(transformEnvironmentVariables)  // ✅ 先转换
+})
+```
+
+### 9.3 批量导出不泄露 Secret 的前提条件
+
+**前提 1：调用链必须经过 `transformEnvironmentVariables`**
+
+- ✅ ImportExport.vue 中使用 `computed` 先转换再导出
+- ✅ Team 环境导出也经过转换
+
+**前提 2：环境元数据本身不包含 Secret 真实值**
+
+- `environmentsStore` 存储的环境元数据中，Secret 变量的 `currentValue` 和 `initialValue` 都是 `""`
+- 真实值仅存在于 `SecretEnvironmentService`（本地内存，不参与导出）
+
+**前提 3：服务端同步的环境不含 Secret 值**
+
+- V1→V2 迁移时清空 Secret 值
+- 服务端 API 返回的环境数据中 Secret 值为空
+
+### 9.4 批量导出的失效范围（潜在泄露风险）
+
+**风险场景 1：直接调用 `environmentsExporter` 而不经过 `transformEnvironmentVariables`**
+
+```typescript
+// ❌ 危险：如果 myEnvironments 包含本地修改过的 Secret 值
+const json = environmentsExporter(myEnvironments)
+```
+
+**风险场景 2：脚本或插件直接访问 `environmentsStore` 数据**
+
+```typescript
+// ⚠️ 注意：environmentsStore 中的 Secret 变量 currentValue 通常为空
+// 但如果有代码路径将真实值写入了 environmentsStore，就会泄露
+const data = environmentsStore.value.environments
+JSON.stringify(data)
+```
+
+**风险场景 3：运行时内存对象被序列化**
+
+- `getCombinedEnvVariables()` 返回的对象包含 Secret 真实值
+- 如果此对象被意外序列化并导出，将泄露 Secret
+
+**风险场景 4：LocalStorage 直接读取**
+
+- `secretEnvironments` key 存储在 LocalStorage
+- 恶意脚本或浏览器扩展可直接读取
+
+### 9.5 导出安全矩阵
+
+| 导出方式 | Secret 值来源 | 是否经过转换 | 安全状态 |
+|---------|-------------|------------|---------|
+| UI 单环境导出 | environmentsStore | ✅ transformEnvironmentVariables | ✅ 安全 |
+| UI 批量导出 | environmentsStore | ✅ transformEnvironmentVariables | ✅ 安全 |
+| 直接 environmentsExporter | 取决于传入 | ❌ 无转换 | ⚠️ 取决于数据 |
+| 直接 JSON.stringify(environmentsStore) | environmentsStore | ❌ 无转换 | ✅ 通常安全（值为空） |
+| JSON.stringify(getCombinedEnvVariables()) | SecretEnvironmentService | ❌ 无转换 | ❌ 泄露风险 |
+
+---
+
+## 10. 关键设计决策总结
+
+### 10.1 安全性设计
 1. **服务端零知识**：Secret 值永不离开浏览器
 2. **本地隔离存储**：与普通环境变量分开存储
 3. **UI 遮蔽**：所有显示场景均对 secret 值做脱敏处理
+4. **导出时清空**：单环境导出时清空 Secret 的 currentValue
 
-### 8.2 运行时恢复机制
+### 10.2 运行时恢复机制
 1. 通过 `varIndex` 索引匹配，确保值与变量正确对应
-2. 请求执行前通过 `unWrapEnvironments` 注入真实值
-3. 脚本沙箱可访问完整解析后的值
+2. 请求执行前通过 `resolveEnvVars` 注入真实值
+3. 环境切换时通过 `aggregateEnvsWithCurrentValue$` 自动恢复
+4. 脚本沙箱可访问完整解析后的值
 
-### 8.3 导出安全边界
+### 10.3 导出安全边界
 - 单环境导出时清空 secret 的 currentValue
+- 批量导出依赖 `transformEnvironmentVariables` 的前置转换
+- 真实值仅存在于 `SecretEnvironmentService`，不参与标准导出流程
 - 避免意外导出敏感数据
 
 ---
 
-## 9. 相关文件索引
+## 11. 相关文件索引
 
 | 功能 | 文件路径 |
 |------|---------|
