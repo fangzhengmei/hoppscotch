@@ -335,9 +335,98 @@ getSchema(options) → 请求失败
 | `timeoutSubscription` | `<有效timer ID>` | `<有效timer ID>` | 旧的 timer 已触发，新的 timer 不会设置 |
 | 轮询 | 运行中 | 已终止 | 不会再有下一次轮询 |
 
-**重要结论**：已连接后某次轮询失败，**旧的 schema 不会被清除**，仍然可以正常浏览 schema 和生成查询，只是不会再收到 schema 更新。
+**重要结论**：已连接后某次轮询的 **HTTP 请求失败**（E.isLeft 错误），旧的 schema 不会被清除，仍然可以正常浏览 schema 和生成查询，只是不会再收到 schema 更新。但如果是 **HTTP 成功但响应无效**（JSON / Schema 错误），`disconnect()` 会正常执行，schema 会被置 `null`（详见 §2.5.3）。
 
-#### 2.5.3 恢复过程——手动重试
+#### 2.5.3 E.isLeft 错误 vs JSON 解析 / Schema 构建错误
+
+`getSchema()` 中存在**两类性质完全不同的错误**，它们的处理路径有微妙但重要的区别：
+
+| 错误类型 | 发生时机 | 触发条件 | 触发前 `connection.state` | 是否设置 `connection.error` |
+|----------|----------|----------|---------------------------|----------------------------|
+| **A. E.isLeft 错误** | HTTP 请求阶段 | 网络错误、401、404、500、取消等 | 在 `E.isLeft` 分支中**主动设置为 `"ERROR"`** | **是**，保存错误详情 |
+| **B. JSON / Schema 错误** | 响应解析阶段 | HTTP 200 但响应不是有效 JSON、或 schema 无效 | 保持进入 `getSchema()` 时的值（`"CONNECTING"` 或 `"CONNECTED"`） | **否**，`connection.error` 保持不变 |
+
+**两类错误的完整处理路径对比**：
+
+**A. E.isLeft 错误路径（HTTP 失败）**：
+
+```
+connection.state = "CONNECTING" （首次连接） 或 "CONNECTED" （轮询）
+    │
+    ▼
+getSchema()
+    │
+    ├─ 发送 HTTP 请求 → 失败（404 / 网络超时等）
+    │
+    ├─ E.isLeft(res) → true
+    │   ├─ connection.state = "ERROR"   ← 先改 state！
+    │   ├─ connection.error = { type, message, component }   ← 保存错误详情
+    │   └─ throw new Error(error.message)   ← Error A
+    │
+    └─ catch (e) 捕获 Error A
+         ├─ console.error(e)
+         └─ disconnect()
+              │
+              ├─ 检查 connection.state !== "CONNECTED" → 当前是 "ERROR"，成立
+              └─ throw new Error("No connections...")   ← Error B
+
+    ↓（Error B 冒泡到 poll() catch）
+    ↓ poll() catch: connection.state = "ERROR"（重复赋值）
+    ↓ 轮询终止
+```
+
+**B. JSON.parse / buildClientSchema 错误路径（HTTP 成功但响应无效）**：
+
+```
+connection.state = "CONNECTING" （首次连接） 或 "CONNECTED" （轮询）
+    │
+    ▼
+getSchema()
+    │
+    ├─ 发送 HTTP 请求 → 成功（200 OK）
+    │
+    ├─ E.isRight(res) → true
+    │   ├─ const data = res.right
+    │   ├─ responseText = decoder.decode(data.body.body)
+    │   ├─ JSON.parse(responseText) → 失败（响应不是有效 JSON）
+    │   │     或
+    │   └─ buildClientSchema(...) → 失败（schema 无效）
+    │          ↓ throw SyntaxError 或 Error   ← Error A'
+    │
+    └─ catch (e) 捕获 Error A'
+         ├─ console.error(e)
+         └─ disconnect()
+              │
+              ├─ 检查 connection.state !== "CONNECTED"
+              │   ├─ 首次连接：当前是 "CONNECTING"，成立
+              │   └─ 轮询中：当前是 "CONNECTED"，不成立！
+              │
+              ├─ 如果是首次连接：throw Error B'
+              └─ 如果是轮询中：正常执行 disconnect()
+                         ↓
+                         connection.state = "DISCONNECTED"
+                         connection.schema = null   ← schema 被清空了！
+                         clearTimeout(timeoutSubscription)
+
+    ↓（如果是首次连接，Error B' 冒泡到 poll() catch）
+    ↓ poll() catch: connection.state = "ERROR"
+    ↓ 轮询终止
+```
+
+**两类错误在轮询中失败的关键差异**：
+
+| 维度 | E.isLeft 错误（HTTP 失败） | JSON / Schema 错误（HTTP 成功但响应无效） |
+|------|--------------------------|----------------------------------------|
+| `connection.state` 在调用 `disconnect()` 前 | `"ERROR"`（被 `E.isLeft` 分支主动修改） | `"CONNECTED"`（E.isRight 分支中未修改） |
+| `disconnect()` 抛错？ | 是（`state !== "CONNECTED"`） | **否**（`state === "CONNECTED"`，正常执行） |
+| `connection.schema` 最终 | 保留旧值（不变） | **被置 `null`**（`disconnect()` 正常执行） |
+| `connection.state` 最终 | `"ERROR"`（poll catch 设置） | `"DISCONNECTED"`（disconnect 正常设置） |
+| `connection.error` 最终 | `{ type, message, component }` | `null`（E.isRight 分支未设置，disconnect 也未设置） |
+| 轮询 | 终止 | 终止（`clearTimeout` 正常执行） |
+
+**关键发现**：当连接已建立（`state = "CONNECTED"`）后，某次轮询的 HTTP 请求成功但响应无法解析为有效 schema 时，**`disconnect()` 会正常执行**，**`connection.schema` 会被置 `null`**！这是 `disconnect()` 正常执行的唯一"非用户主动"场景。
+
+#### 2.5.4 恢复过程——手动重试
 
 失败后没有自动重试，恢复依赖**用户手动再次点击 Connect 按钮**：
 
@@ -347,7 +436,7 @@ getSchema(options) → 请求失败
 4. 重新开始完整的连接流程（`state = "CONNECTING"` → 立即 `poll()` → ...）
 5. 如果这次成功：`state = "CONNECTED"`，`schema` 更新为新值，`error = null`，轮询恢复
 
-#### 2.5.4 `isRunGQLOperation` 标志的精确行为
+#### 2.5.5 `isRunGQLOperation` 标志的精确行为
 
 当 `runGQLOperation()` 自动调用 `connect()` 时，传入 `isRunGQLOperation = true`：
 
@@ -442,10 +531,25 @@ export const graphqlTypes = computed(() => {
 | 更新方式 | 直接赋值 `connection.schema = schemaData`，利用 Vue reactivity 自动传播 |
 | 成功时 | `connection.schema = schemaData`，`connection.error = null` |
 | 正常断开时（用户点击 Disconnect / 页面卸载） | `disconnect()` 正常执行 → `connection.schema = null`，`connection.state = "DISCONNECTED"` |
-| 网络错误时 | `disconnect()` 抛错 → **`connection.schema` 不变**（保留旧值或保持 null），`connection.state = "ERROR"` |
+| HTTP 失败时（E.isLeft 错误：网络错误 / 401 / 404 / 500） | `disconnect()` 抛错 → **`connection.schema` 不变**（保留旧值或保持 null），`connection.state = "ERROR"` |
+| HTTP 成功但响应无效时（JSON.parse / buildClientSchema 错误） | 轮询中：`disconnect()` 正常执行 → `connection.schema = null`，`connection.state = "DISCONNECTED"`；首次连接：`disconnect()` 抛错 → `connection.schema` 保持 null，`connection.state = "ERROR"` |
 | 多 tab 共享 | 所有 tab 共享同一 `connection` 对象，切换 tab 时 schema 不变 |
 
-**关键澄清**：网络错误时 schema **不会被清空**。这是因为 `getSchema()` 的 `E.isLeft` 分支先设置 `state = "ERROR"`，再 throw 进 catch，catch 中调用 `disconnect()` 时因 `state !== "CONNECTED"` 而抛错，`disconnect()` 内部的 `schema = null` 不会执行。**当前代码库中，schema 被清空的唯一场景是用户主动断开连接**（`disconnect()` 正常执行时 `state === "CONNECTED"`）。
+**关键澄清**：
+
+- **网络错误时 schema 不会被清空**：因为 `getSchema()` 的 `E.isLeft` 分支先设置 `state = "ERROR"`，再 throw 进 catch，catch 中调用 `disconnect()` 时因 `state !== "CONNECTED"` 而抛错，`disconnect()` 内部的 `schema = null` 不会执行。
+- **响应无效时 schema 可能被清空**：当连接已建立（`state = "CONNECTED"`）后，某次轮询的 HTTP 请求成功但响应无法解析为有效 schema 时，`disconnect()` 会正常执行，`schema` 被置 `null`。这是唯一的"非用户主动"导致 schema 被清空的场景。
+
+**当前代码库中，`connection.schema` 被置 `null` 的充要条件**（所有场景穷尽）：
+
+| 场景 | `state` 调用 disconnect() 时 | `disconnect()` 抛错？ | `schema` 被置 `null`？ |
+|------|-----------------------------|----------------------|-----------------------|
+| 用户主动点击 Disconnect | `"CONNECTED"` | 否 | **是** ✅ |
+| 页面卸载 `onBeforeUnmount` | `"CONNECTED"`（有守卫检查） | 否 | **是** ✅ |
+| 轮询中 HTTP 成功但响应无效（JSON/Schema 错误） | `"CONNECTED"` | 否 | **是** ✅ |
+| 首次连接 HTTP 失败 | `"ERROR"` | 是 | **否** ❌ |
+| 轮询中 HTTP 失败 | `"ERROR"` | 是 | **否** ❌ |
+| 首次连接响应无效（JSON/Schema 错误） | `"CONNECTING"` | 是 | **否** ❌ |
 
 > 注：`connection.ts` 中定义了 `reset()` 函数（无条件清空 schema 和设置 `state = "DISCONNECTED"`），但在当前代码库中从未被调用。
 
@@ -1136,22 +1240,24 @@ export const runSubscription = (options: RunQueryOptions, headers?) => {
 
 6. **认证一致性**：introspection 请求与普通请求使用相同的认证逻辑（`generateAuthHeader`），确保 introspection 能通过认证网关。
 
-7. **失败无自动重试**：无论是首次连接失败还是轮询过程中失败，`getSchema()` 中的异常都会导致 `disconnect()` 因状态检查不通过而二次抛出，最终进入 `poll()` 的 catch 块，**不会设置下一次 `setTimeout`**，因此没有自动重试。恢复依赖用户手动再次点击 Connect 按钮。
+7. **失败无自动重试**：无论是首次连接失败还是轮询过程中失败，错误最终都会进入 `poll()` 的 catch 块，**不会设置下一次 `setTimeout`**，因此没有自动重试。恢复依赖用户手动再次点击 Connect 按钮。
 
-8. **二次错误抛出陷阱**：`getSchema()` catch 中调用 `disconnect()` 时，由于 `connection.state` 已被设置为 `"ERROR"`，`disconnect()` 的前置检查 `state === "CONNECTED"` 不通过，会再次抛出错误。这个二次错误被 `poll()` 的 catch 捕获。
+8. **E.isLeft 错误与 JSON/Schema 错误的关键差异**：E.isLeft 错误（HTTP 失败）在 throw 前先设置 `state = "ERROR"`，导致后续 `disconnect()` 抛错，schema 保留；JSON/Schema 错误（HTTP 成功但响应无效）在轮询中发生时 `state` 仍为 `"CONNECTED"`，`disconnect()` 正常执行，**schema 被置 `null`**。
 
-9. **失败分支中 schema 永不修改**：`getSchema()` 失败路径中，`disconnect()` 抛出异常，因此 `disconnect()` 内部的 `connection.schema = null` 不会被执行。如果是首次连接，schema 保持 `null`；如果是轮询失败，schema 保留之前的缓存值且仍可正常浏览。当前代码库中 schema 被清空的唯一场景是用户主动断开连接。
+9. **`disconnect()` 抛错的充要条件**：`disconnect()` 第一行检查 `if (connection.state !== "CONNECTED")`，只要不是 `CONNECTED` 状态就抛错。E.isLeft 错误触发时 `state` 已被设为 `"ERROR"`，必然抛错；JSON/Schema 错误在轮询中触发时 `state` 仍为 `"CONNECTED"`，不会抛错。
 
 10. **轮询停止的充要条件**：只要 `poll()` 的 catch 块被执行（无论什么原因），就不会执行 `setTimeout(poll, 7000)`，轮询终止。没有例外。
 
-11. **`connect()` 永不向外抛异常**：因为 `poll()` 内部有 try-catch 消化所有错误，无论成功失败，`await connect()` 都会正常返回。`isRunGQLOperation = true` 时只额外跳过 toast。
+11. **`connection.schema` 被清空的充要条件**：只有当 `disconnect()` 正常执行（不抛错）时，`schema` 才会被置 `null`。这发生在三种场景：① 用户主动点击 Disconnect；② 页面卸载且 `state === "CONNECTED"`；③ 轮询中 HTTP 成功但响应无效（JSON/Schema 错误）。
 
-12. **Variables 延迟解析**：用户在编辑器中输入的 variables 始终以字符串形式存储和传递，直到 `GQLRequest.toRequest()` 的最后一步才通过 `JSON.parse()` 解析。空字符串会抛错，`null` 会返回 `undefined`。
+12. **`connect()` 永不向外抛异常**：因为 `poll()` 内部有 try-catch 消化所有错误，无论成功失败，`await connect()` 都会正常返回。`isRunGQLOperation = true` 时只额外跳过 toast。
 
-13. **Variables 只验 JSON 格式不验结构**：`parseVariables` 只检查是否能 `JSON.parse` 成功，**不检查解析结果是否为对象**。数组、字符串、数字等都会被正常放入请求体。
+13. **Variables 延迟解析**：用户在编辑器中输入的 variables 始终以字符串形式存储和传递，直到 `GQLRequest.toRequest()` 的最后一步才通过 `JSON.parse()` 解析。空字符串会抛错，`null` 会返回 `undefined`。
 
-14. **OperationName 后置注入**：`operationName` 不在 `GQLRequest.toRequest()` 内部处理，而是在 `toRequest()` 返回后，由 `runGQLOperation()` 直接修改 `kernelRequest.content.content.operationName`。
+14. **Variables 只验 JSON 格式不验结构**：`parseVariables` 只检查是否能 `JSON.parse` 成功，**不检查解析结果是否为对象**。数组、字符串、数字等都会被正常放入请求体。
 
-15. **多 Operation 选中规则**：单 operation 时自动选中（无论光标位置）；多 operation 时根据光标位置落在哪个 operation 的 `loc.start/end` 范围内来选中；光标不在范围内时 `selectedOperation = null`，Run 按钮隐藏。
+15. **OperationName 后置注入**：`operationName` 不在 `GQLRequest.toRequest()` 内部处理，而是在 `toRequest()` 返回后，由 `runGQLOperation()` 直接修改 `kernelRequest.content.content.operationName`。
 
-16. **匿名查询的特殊处理**：查询没有命名（`query { ... }`）时，`selectedOperation` 仍然存在，Run 按钮显示但 label 回退为 "Run"。此时 `operationName = undefined`，不会注入 operationName 字段。
+16. **多 Operation 选中规则**：单 operation 时自动选中（无论光标位置）；多 operation 时根据光标位置落在哪个 operation 的 `loc.start/end` 范围内来选中；光标不在范围内时 `selectedOperation = null`，Run 按钮隐藏。
+
+17. **匿名查询的特殊处理**：查询没有命名（`query { ... }`）时，`selectedOperation` 仍然存在，Run 按钮显示但 label 回退为 "Run"。此时 `operationName = undefined`，不会注入 operationName 字段。
