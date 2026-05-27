@@ -400,18 +400,29 @@ rawEnvVars (从响应中取)
    ├─ 为 null / undefined / 空字符串 → if (rawEnvVars) 条件不成立，不执行任何赋值，
    │                                    parsedEnvironmentVariables 保持上一次的值
    │
-   └─ 非空（含空数组 []）
-        ├─ 为字符串 → JSON.parse → Array.isArray ?
-        │                                 ├─ 是 → map + translateToNewEnvironmentVariables + currentValue 兜底
-        │                                 └─ 否 → parsedEnvironmentVariables = []
+   └─ 非空（含空数组 []、非数组对象 {}）
+        ├─ 为字符串 → JSON.parse → 成功 → Array.isArray ?
+        │                               ├─ 是 → map + translateToNewEnvironmentVariables + currentValue 兜底
+        │                               └─ 否 → 不赋值，保持旧值
+        │                → 失败 → catch → parsedEnvironmentVariables = []
         │
-        └─ 已是对象 → 同上
+        └─ 已是对象 → Array.isArray ?
+                        ├─ 是 → map + translateToNewEnvironmentVariables + currentValue 兜底
+                        └─ 否 → 不赋值，保持旧值
 ```
 
 - **`rawEnvVars` 为 falsy（null/undefined/空字符串）**：**不做任何赋值**，`parsedEnvironmentVariables` 保持上一次版本切换前的值（存在跨版本泄漏风险，详见第八章）；
-- **JSON 解析失败**：`try/catch` 兜底到 `parsedEnvironmentVariables = []`，仅 `console.error`，不抛错；
-- **非数组**：同样兜底到 `[]`；
+- **`rawEnvVars` 为非数组对象（`{...}`）**：`Array.isArray(parsed)` 返回 `false`，**不进入赋值分支，也不抛错**，`parsedEnvironmentVariables` 保持上一次的值；
+- **`rawEnvVars` 为字符串但 JSON 解析失败**：`try/catch` 兜底到 `parsedEnvironmentVariables = []`，仅 `console.error`，不抛错；
+- **`rawEnvVars` 为字符串但解析结果不是数组**（如 `"{}"`）：不进入赋值分支，保持旧值；
 - **条目规范化失败**：`translateToNewEnvironmentVariables` 返回的对象可能缺少 `currentValue`，代码显式兜底：`currentValue: normalized.currentValue || normalized.initialValue`。
+
+**非数组对象导致旧值保留的最小复现路径**：
+1. 版本 A 绑定环境 envA，`environmentVariables: [{key: "HOST", value: "a.com"}]`；
+2. 版本 B 通过某种方式（如直接修改数据库或后端 bug）返回 `environmentVariables: {"key": "HOST", "value": "b.com"}`（对象而非数组）；
+3. 访问版本 A → URL 中 `<<HOST>>` 被替换为 `a.com`；
+4. 切换到版本 B → `rawEnvVars` 是对象，`Array.isArray` 为 false，不赋值；
+5. 用户在版本 B 中手动开启环境开关 → URL 中的 `<<HOST>>` 被替换为 `a.com`（版本 A 的值），而非 `b.com`。
 
 ### 3. 使用阶段的回退（`RequestPreview.vue:207-260`）
 
@@ -586,20 +597,38 @@ const navigateToVersion = (ver: PublishedDocVersion) => {
 
 正则 `/\/view\/([^/]+)/` 的问题在于：**它只匹配到 `/view/<slug>`，不捕获后续的 `/<version>`**。`[^/]+` 匹配到第一个 `/` 就停止。
 
-触发 `new URL` 异常并进入 fallback 分支的可能场景：
+**`new URL` 异常的边界验证**：
 
-1. **`ver.url` 格式异常**：后端返回的 `url` 字段不是合法 URL（例如缺少协议、包含未编码的特殊字符）；
-2. **`ver.url` 为相对路径**：某些部署环境下 `VITE_BASE_URL` 配置缺失或为空，`cast` 生成的 `url` 形如 `/view/<slug>/<version>` 但没有协议前缀；
-3. **`ver.url` 包含 Unicode 字符未编码**：如版本名中包含中文、emoji 等字符且未做 URI 编码。
+`new URL(ver.url, window.location.origin)` 的第二个参数 `base` 使得相对路径也能被正确解析。以下是可验证的边界结论：
+
+| `ver.url` 示例 | 是否抛异常 | 说明 |
+| --- | --- | --- |
+| `/view/slug/v1` | ❌ 不抛错 | 绝对路径，正常解析为 `origin/view/slug/v1` |
+| `view/slug/v1` | ❌ 不抛错 | 相对路径，正常解析为 `origin/view/slug/v1` |
+| `https://hoppscotch.io/view/slug/v1` | ❌ 不抛错 | 完整 URL，正常解析 |
+| `//hoppscotch.io/view/slug/v1` | ❌ 不抛错 | 协议相对 URL，正常解析 |
+| `/view/slug/v1?x=1&y=2` | ❌ 不抛错 | 带 query，正常解析 |
+| `/view/slug/v1#section` | ❌ 不抛错 | 带 hash，正常解析 |
+| `http://[invalid` | ✅ 抛错 | 非法 URL 字符 |
+| `/view/slug/v%2` | ✅ 抛错 | 不完整的 percent 编码 |
+| `javascript:alert(1)` | ❌ 不抛错 | 但 `pathname` 为空，后续逻辑可能失败 |
+
+触发 `new URL` 异常并进入 fallback 分支的**实际场景**：
+
+1. **`ver.url` 包含非法 URL 字符**：如未编码的中文、emoji、空格（`/view/slug/版本 1` 中的空格）、不完整的 percent 编码（`%2`）、无效的 IPv6 地址（`[invalid`）等；
+2. **`ver.url` 为非 HTTP(S) scheme**：如 `javascript:`、`data:` 等，虽不抛错但 `pathname` 为空，后续 `router.push('')` 可能静默失败；
+3. **`ver.url` 为空字符串**：`new URL('', origin)` 正常解析为 `origin`，但 `pathname` 为 `/`，会导航到首页而非目标文档。
+
+> **重要修正**：`ver.url` 为相对路径（如 `/view/<slug>/<version>`）**不会**触发异常，因为 `window.location.origin` 作为 base 可以正确解析。
 
 #### 影响
 
 1. **跳转目标错误**：fallback 分支会导航到 `/view/<slug>` 而不是 `/view/<slug>/<version>`；
 2. **版本自动回退到最新**：后端 `getPublishedDocBySlugPublic` 在 `version` 为 `null` 时会返回 `allVersions[0].version`（按 `autoSync desc, createdOn desc` 排序，即最新版本），用户点击旧版本却看到最新版本的内容；
-3. **状态不一致**：URL 中缺少 version 参数，导致浏览器历史记录、书签、分享链接都指向“当前最新版本”而非用户实际选择的版本；
+3. **状态不一致**：URL 中缺少 version 参数，导致浏览器历史记录、书签、分享链接都指向"当前最新版本"而非用户实际选择的版本；
 4. **无错误提示**：整个过程静默失败，用户只会看到页面内容变化但不知道版本被替换。
 
-**防护建议**：后端 `cast` 方法应确保 `url` 是合法的绝对 URL；前端 fallback 正则应补全 version 捕获（例如 `/\/view\/([^/]+)(?:\/([^/]+))?/`），在无法解析时给出提示而非静默降级。
+**防护建议**：后端 `cast` 方法应确保 `url` 是合法的绝对 URL 并对 version 做 URI 编码；前端 fallback 正则应补全 version 捕获（例如 `/\/view\/([^/]+)(?:\/([^/]+))?/`），在无法解析时给出提示而非静默降级。
 
 ---
 
@@ -618,13 +647,15 @@ const navigateToVersion = (ver: PublishedDocVersion) => {
 
 ---
 
-## 九、关键细节与注意点
+## 十、关键细节与注意点
 
 1. **孤儿文档清理**：`cleanupOrphanedPublishedDocs` 在列表查询时会剔除并删除那些 `collectionID` 指向已不存在集合的记录，避免用户看到 404 的发布链接。
 2. **并发安全**：创建时对 `[slug, version]` 唯一冲突做了最多 2 次重试；前端 `fetchRequestId` 计数器用于取消旧的拉取请求，避免竞态覆盖。
 3. **环境安全**：UI 明确提示 `sensitive_data_warning`，但实际仍把 `environmentVariables` 作为 JSON 存入 Prisma 并通过公开 REST 返回，使用时须自行评估敏感数据暴露风险。
-4. **权限层级**：创建/更新/删除要求 OWNER 或 EDITOR；团队列表 VIEWER 即可；对外 REST 无鉴权但限流。
-5. **版本语义**：
+4. **环境变量解析盲点**：`rawEnvVars` 为 falsy 或非数组对象时，`parsedEnvironmentVariables` 不会被清零，存在跨版本泄漏风险（详见第八章）。
+5. **版本切换 fallback 盲点**：`new URL` 仅在 `ver.url` 包含非法字符时才会抛异常，相对路径可正常解析；fallback 正则只捕获 slug 丢失 version（详见第八章）。
+6. **权限层级**：创建/更新/删除要求 OWNER 或 EDITOR；团队列表 VIEWER 即可；对外 REST 无鉴权但限流。
+7. **版本语义**：
    - `CURRENT` 只是一个标识，真正是否 live 由 `autoSync` 决定；
    - 同一 slug 可以有多个 version，一个集合下只能有一个 slug；
    - UI 对非 live 版本默认以 snapshot 视图模式打开，不允许编辑。
