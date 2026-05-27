@@ -449,7 +449,140 @@ env.variables = [
 
 ---
 
-## 八、数据持久化
+## 八、异常路径与盲点分析
+
+### 1. 版本切换时环境变量解析结果重置的逻辑与跨版本数据残留
+
+#### 重置逻辑
+
+`pages/view/_id/_version.vue:297-304` 监听路由参数变化触发 `fetchDocs`：
+
+```ts
+watch(
+  () => [route.params.id, route.params.version],
+  ([newId, newVersion], [oldId, oldVersion]) => {
+    if (newId !== oldId || newVersion !== oldVersion) {
+      fetchDocs(newId as string, newVersion as string)
+    }
+  }
+)
+```
+
+`fetchDocs` 每次调用会：
+1. `loading.value = true`、`error.value = null`（`pages/view/_id/_version.vue:208-209`）；
+2. 重新调用 `getPublishedDocBySlugREST` 获取新版本数据；
+3. 重新解析 `rawEnvVars` 并赋值给 `parsedEnvironmentVariables`（`pages/view/_id/_version.vue:244-263`）；
+4. 重置 `environmentEnabled.value = !!environmentName.value`（`pages/view/_id/_version.vue:271`）；
+5. 重置 `environmentVariables.value` 为新的解析结果。
+
+这意味着：**环境变量解析结果每次版本切换都会完全重置**，旧版本的解析值不会保留。
+
+#### 跨版本数据残留的触发条件
+
+并非所有状态都会重置，存在两处残留风险：
+
+| 状态变量 | 重置策略 | 残留风险 |
+| --- | --- | --- |
+| `availableVersions` | 仅在 `availableVersions.value.length === 0` 时赋值（`pages/view/_id/_version.vue:265-267`） | ✅ **残留：** 首次进入页面时填充后，后续版本切换不会更新。若不同版本的后端返回 `versions` 字段有差异（例如新创建的版本在旧版本的 `versions` 列表中不存在），版本下拉框会始终显示首次加载时的列表。 |
+| `parsedEnvironmentVariables` | 每次 `fetchDocs` 都会重新赋值 | ❌ 无残留 |
+| `environmentEnabled` | 每次 `fetchDocs` 都会重置为 `!!environmentName` | ⚠️ **间接残留：** 用户手动关闭环境开关后切换版本，开关会被重置为新版本的 `environmentName` 是否存在，而非保持用户的上一次选择。 |
+| `collectionData` | 每次 `fetchDocs` 都会重新 `collectionFolderToHoppCollection` | ❌ 无残留 |
+
+**典型残留场景**：用户先访问版本 A（有 3 个历史版本），再切换到版本 B（该 slug 下实际已有 5 个历史版本）。由于 `availableVersions` 仅在首次填充，版本下拉框仍只显示 3 个版本，用户无法切换到新增的另外 2 个版本，除非刷新页面。
+
+---
+
+### 2. 缺少稳定 ID 时 section 深链不会写入 URL 的原因与刷新影响
+
+#### 深链写入的前置条件
+
+`components/documentation/Content.vue:116-141` 中 `handleRequestSelect/handleFolderSelect` 的逻辑：
+
+```ts
+const requestId = request.id || (request as any)._ref_id
+if (requestId) {
+  scrollToItem(requestId)
+  if (props.updateUrlOnSelect) {
+    router.replace({ query: { ...route.query, section: requestId } })
+  }
+} else {
+  scrollToItemByName(request.name, "request")  // 不写 URL
+}
+```
+
+**只有当 `id` 或 `_ref_id` 任一存在时，才会将 `section` 写入 URL query**；否则仅通过 `scrollToItemByName` 做本地滚动，不修改 URL。
+
+#### 不写入 URL 的设计原因
+
+`scrollToItemByName` 使用 `name` 作为查找键（`Content.vue:178-188`）：
+
+```ts
+const item = props.allItems.find(
+  (item) => item.item.name === name && item.type === type
+)
+```
+
+`name` 在集合中**不保证唯一性**，同一层级下可能出现重名的 folder/request，无法作为稳定的 URL 锚点。如果强行把 `name` 写入 URL，刷新后可能定位到错误的同名条目。
+
+#### 刷新后的定位变化
+
+当请求/文件夹缺少稳定 ID 时：
+1. **点击侧边栏**：页面会滚动到目标位置，但 URL 不变化（无 `?section=`）；
+2. **刷新页面**：URL 中无 `section` 参数，`onMounted` 中的 `scrollToItem(route.query.section)` 不会执行（`Content.vue:218-225`），页面停留在顶部；
+3. **用户体验**：刷新后需要重新在侧边栏中手动查找之前浏览的位置，深链失效。
+
+此外，即使有 ID，但 ID 在不同版本间发生变化（例如重新导入集合导致 `_ref_id` 重新生成），旧版本的深链在新版本中也会失效，`scrollToItem` 找不到对应元素时仅 `console.error`，不做回退滚动。
+
+---
+
+### 3. 版本切换链接在 fallback 分支中丢失 version 的触发条件与影响
+
+#### 正常分支与 fallback 分支
+
+`components/documentation/Header.vue:219-233` 的 `navigateToVersion`：
+
+```ts
+const navigateToVersion = (ver: PublishedDocVersion) => {
+  if (ver.version === props.publishedDoc?.version) return
+
+  try {
+    const url = new URL(ver.url, window.location.origin)
+    router.push(url.pathname)
+  } catch {
+    // Fallback: use regex to extract the path
+    const match = ver.url.match(/\/view\/([^/]+)/)
+    if (match) {
+      router.push(match[0])
+    }
+  }
+}
+```
+
+- **正常分支**：`new URL(ver.url, window.location.origin)` 解析成功，取 `url.pathname`（包含完整的 `/view/<slug>/<version>`）。
+- **Fallback 分支**：`new URL` 抛出异常时，用正则 `/\/view\/([^/]+)/` 匹配。
+
+#### version 丢失的触发条件
+
+正则 `/\/view\/([^/]+)/` 的问题在于：**它只匹配到 `/view/<slug>`，不捕获后续的 `/<version>`**。`[^/]+` 匹配到第一个 `/` 就停止。
+
+触发 `new URL` 异常并进入 fallback 分支的可能场景：
+
+1. **`ver.url` 格式异常**：后端返回的 `url` 字段不是合法 URL（例如缺少协议、包含未编码的特殊字符）；
+2. **`ver.url` 为相对路径**：某些部署环境下 `VITE_BASE_URL` 配置缺失或为空，`cast` 生成的 `url` 形如 `/view/<slug>/<version>` 但没有协议前缀；
+3. **`ver.url` 包含 Unicode 字符未编码**：如版本名中包含中文、emoji 等字符且未做 URI 编码。
+
+#### 影响
+
+1. **跳转目标错误**：fallback 分支会导航到 `/view/<slug>` 而不是 `/view/<slug>/<version>`；
+2. **版本自动回退到最新**：后端 `getPublishedDocBySlugPublic` 在 `version` 为 `null` 时会返回 `allVersions[0].version`（按 `autoSync desc, createdOn desc` 排序，即最新版本），用户点击旧版本却看到最新版本的内容；
+3. **状态不一致**：URL 中缺少 version 参数，导致浏览器历史记录、书签、分享链接都指向“当前最新版本”而非用户实际选择的版本；
+4. **无错误提示**：整个过程静默失败，用户只会看到页面内容变化但不知道版本被替换。
+
+**防护建议**：后端 `cast` 方法应确保 `url` 是合法的绝对 URL；前端 fallback 正则应补全 version 捕获（例如 `/\/view\/([^/]+)(?:\/([^/]+))?/`），在无法解析时给出提示而非静默降级。
+
+---
+
+## 九、数据持久化
 
 后端 Prisma 模型（可从 `published-docs.service.ts` 反推）字段：
 
@@ -477,7 +610,7 @@ env.variables = [
 
 ---
 
-## 十、涉及的核心文件清单
+## 十一、涉及的核心文件清单
 
 | 区域 | 文件 |
 | --- | --- |
