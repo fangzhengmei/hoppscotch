@@ -221,9 +221,9 @@ export const reset = () => {
 
 ### 2.5 失败恢复机制
 
-#### 2.5.1 首次连接失败的完整状态流转
+#### 2.5.1 首次连接失败的完整状态流转（精确时序）
 
-当用户点击 Connect 但首次 introspection 请求失败时，状态流转如下：
+当用户点击 Connect 但首次 introspection 请求失败时，**精确的代码执行时序**如下：
 
 ```
 用户点击 Connect
@@ -231,92 +231,135 @@ export const reset = () => {
     ▼
 connect(options, isRunGQLOperation = false)
     │
-    ├─ connection.state = "CONNECTING"
+    ├─ ① connection.state = "CONNECTING"    ← 初始状态
     │
     ▼
-poll()
+poll() 立即执行（await poll()）
     │
-    ▼
-getSchema(options)
+    ├─ try {
+    │    ├─ await getSchema(options)
+    │    │     │
+    │    │     ├─ try {
+    │    │     │    ├─ 发送 POST introspection 请求 → 失败（网络错误/401/404/500）
+    │    │     │    │
+    │    │     │    ├─ ② E.isLeft(res) → true
+    │    │     │    │   ├─ ③ connection.state = "ERROR"
+    │    │     │    │   ├─ ④ connection.error = { type, message, component }
+    │    │     │    │   └─ ⑤ throw new Error(error.message)   ← Error A
+    │    │     │    │
+    │    │     │    └─（成功路径不会执行）
+    │    │     │       connection.schema = schemaData
+    │    │     │       connection.error = null
+    │    │     │
+    │    │     └─ catch (e: any)   ← ⑥ 捕获 Error A
+    │    │          ├─ console.error(e)
+    │    │          └─ ⑦ disconnect()
+    │    │                │
+    │    │                ├─ ⑧ 检查：connection.state !== "CONNECTED"
+    │    │                │      （当前是 "ERROR"，条件成立）
+    │    │                └─ ⑨ throw new Error("No connections are running to be disconnected")   ← Error B
+    │    │
+    │    └─（Error B 从 getSchema 向上冒泡，未被 getSchema catch 捕获）
     │
-    ├─ 发送 POST introspection 请求 → 失败（网络错误 / 401 / 404 / 500 等）
-    │
-    ├─ E.isLeft(res) → true
-    │   ├─ connection.state = "ERROR"
-    │   ├─ connection.error = { type, message, component }
-    │   └─ throw new Error(error.message)
-    │
-    └─ catch (e) 捕获抛出的错误
-        ├─ console.error(e)
-        └─ disconnect()
-            │
-            ├─ ❌ 检查 connection.state !== "CONNECTED"（当前是 "ERROR"）
-            └─ 抛出 Error("No connections are running to be disconnected")
-                │
-                ▼
-        poll() 的 catch 捕获这个二次错误
-            ├─ connection.state = "ERROR"
-            ├─ !isRunGQLOperation → toast.error("连接失败")
-            └─ console.error(error)
-                │
-                ▼
-        connect() 返回，轮询终止（未设置下一次 setTimeout）
+    └─ catch (error)   ← ⑩ poll() 的 catch 捕获 Error B
+         ├─ ⑪ connection.state = "ERROR"   （已是 ERROR，重复赋值）
+         ├─ ⑫ !isRunGQLOperation → toast.error("连接失败")
+         └─ ⑬ console.error(error)
+
+         ← ⑭ poll() 执行完毕，不会执行到 setTimeout(poll, 7000)
+         ← ⑮ 轮询终止！
 ```
 
-**核心要点**：
+**各变量的最终状态**：
 
-1. **二次错误抛出**：`getSchema()` catch 中调用 `disconnect()` 时，由于 `connection.state` 已是 `"ERROR"` 而非 `"CONNECTED"`，`disconnect()` 会再次抛出错误。
-2. **轮询终止**：错误进入 `poll()` 的 catch 块，**不会执行到 `setTimeout(poll, 7000)`**，因此首次失败后**没有自动重试**。
-3. **状态停留**：最终 `connection.state = "ERROR"`，`connection.error` 保存了错误详情供 UI 展示。
-4. **Schema 保留？**：`disconnect()` 抛出异常，因此 `connection.schema = null` **不会被执行**。如果之前已有缓存的 schema，会保留下来但不再刷新。
+| 变量 | 初始值 | 变化点 | 最终值 | 说明 |
+|------|--------|--------|--------|------|
+| `connection.state` | `"DISCONNECTED"` | ① → `"CONNECTING"`；③ → `"ERROR"`；⑪ → `"ERROR"` | `"ERROR"` | 在 E.isLeft 分支已设置为 ERROR，poll catch 中重复设置 |
+| `connection.schema` | `null` | **无任何变化** | `null`（首次连接）或旧值（重连失败） | 只有成功路径才会赋值 `connection.schema = schemaData`；失败路径中 `disconnect()` 抛错，`schema = null` 不会执行 |
+| `connection.error` | `null` | ④ → `{ type, message, component }` | `{ type, message, component }` | 保存了错误详情供 UI 展示 |
+| `timeoutSubscription` | `undefined` | **无任何变化** | `undefined` | 从未设置 setTimeout |
+| 轮询 | 未开始 | ⑮ 终止 | 已终止 | 不会有自动重试 |
+
+**核心要点（修正后）**：
+
+1. **二次错误抛出路径**：`getSchema()` 内部 catch 捕获 `E.isLeft` throw 的 Error A → 调用 `disconnect()` → `disconnect()` 因 `state !== "CONNECTED"` 抛出 Error B → Error B 从 `getSchema()` 函数**向上冒泡** → 被 `poll()` 的 catch 捕获。
+2. **`connection.schema` 永不修改**：失败路径中，`disconnect()` 抛出异常，因此 `disconnect()` 内部的 `connection.schema = null` **不会被执行**。如果是首次连接，schema 保持 `null`；如果是重连失败，schema 保留之前成功连接时的缓存值。
+3. **轮询停止的充要条件**：只要 `poll()` 的 catch 块被执行（无论什么原因），就不会执行 `setTimeout(poll, 7000)`，轮询终止。没有例外。
+4. **`disconnect()` 抛错的充要条件**：`disconnect()` 第一行检查 `if (connection.state !== "CONNECTED")`，只要不是 `CONNECTED` 状态就抛错。失败路径中 `state` 已被设为 `"ERROR"`，所以必然抛错。
 
 #### 2.5.2 已连接后某次轮询失败的状态流转
 
-当连接已建立（`state = "CONNECTED"`），后续某次轮询的 introspection 请求失败：
+当连接已建立（`state = "CONNECTED"`，有有效 schema），后续某次轮询的 introspection 请求失败：
 
 ```
-已连接状态（state = "CONNECTED"）
+state = "CONNECTED"，schema = <有效对象>
     │
     ▼
-poll() 被 setTimeout 触发
+setTimeout 触发 poll()
     │
     ▼
 getSchema(options) → 请求失败
     │
     ├─ E.isLeft(res) → true
-    │   ├─ connection.state = "ERROR"
-    │   └─ throw new Error(...)
+    │   ├─ ① connection.state = "ERROR"    ← 先设为 ERROR！
+    │   └─ ② throw new Error(...)           ← Error A
     │
     └─ catch (e)
-        ├─ console.error(e)
-        └─ disconnect()
-            │
-            ├─ ✅ connection.state 当前是 "ERROR"？不——等一下！
-            │
-            ▼
-    重新审视：E.isLeft 时先设置 connection.state = "ERROR"，再 throw
-    所以 disconnect() 检查时 state 已经是 "ERROR"，仍然会抛出！
-    最终效果同首次失败：轮询终止，state = "ERROR"
+         ├─ console.error(e)
+         └─ ③ disconnect()
+              │
+              ├─ ④ 检查：connection.state !== "CONNECTED"（当前是 "ERROR"！）
+              └─ ⑤ throw new Error("No connections...")   ← Error B
+
+    ↓（冒泡到 poll() catch）
+    ↓ 轮询终止
 ```
 
-**注意**：无论首次失败还是后续轮询失败，只要 `getSchema()` 中走了 `E.isLeft` 分支，都会先设置 `state = "ERROR"` 再 throw，导致后续 `disconnect()` 检查失败，轮询终止。
+**注意**：无论首次失败还是轮询中失败，只要进入 `E.isLeft` 分支，**总是先设置 `state = "ERROR"` 再 throw**。因此后续 `disconnect()` 检查时 `state` 已不是 `"CONNECTED"`，必然抛错。
+
+**各变量的最终状态（轮询失败）**：
+
+| 变量 | 失败前值 | 最终值 | 说明 |
+|------|----------|--------|------|
+| `connection.state` | `"CONNECTED"` | `"ERROR"` | 被 E.isLeft 分支修改 |
+| `connection.schema` | `<有效GraphQLSchema>` | `<有效GraphQLSchema>` | **完全不变**！既不会更新为新值，也不会被置 null |
+| `connection.error` | `null` | `{ type, message, component }` | 保存了本次失败的详情 |
+| `timeoutSubscription` | `<有效timer ID>` | `<有效timer ID>` | 旧的 timer 已触发，新的 timer 不会设置 |
+| 轮询 | 运行中 | 已终止 | 不会再有下一次轮询 |
+
+**重要结论**：已连接后某次轮询失败，**旧的 schema 不会被清除**，仍然可以正常浏览 schema 和生成查询，只是不会再收到 schema 更新。
 
 #### 2.5.3 恢复过程——手动重试
 
 失败后没有自动重试，恢复依赖**用户手动再次点击 Connect 按钮**：
 
-1. 用户看到按钮显示 "Connect"（因为 state 是 "ERROR" 或 "DISCONNECTED"）
+1. 用户看到按钮显示 "Connect"（`state === "ERROR"` 时 UI 按钮文字切换回 Connect）
 2. 再次点击 → 调用 `gqlConnect()` → `connect()`
-3. `connect()` 检查 `connection.state === "CONNECTED"` → 否（当前是 "ERROR"），允许继续
-4. 重新开始完整的连接流程
+3. `connect()` 第一行检查 `connection.state === "CONNECTED"` → 否（当前是 `"ERROR"`），允许继续
+4. 重新开始完整的连接流程（`state = "CONNECTING"` → 立即 `poll()` → ...）
+5. 如果这次成功：`state = "CONNECTED"`，`schema` 更新为新值，`error = null`，轮询恢复
 
-#### 2.5.4 `isRunGQLOperation` 标志的作用
+#### 2.5.4 `isRunGQLOperation` 标志的精确行为
 
 当 `runGQLOperation()` 自动调用 `connect()` 时，传入 `isRunGQLOperation = true`：
 
-- **失败时不弹 toast**：`poll()` catch 中检查 `if (!isRunGQLOperation)` 才弹 toast
-- **查询仍然会尝试执行**：`connect()` 失败后不会抛出异常（错误被 catch 消化），`runGQLOperation()` 继续执行后续的请求发送逻辑
-- **适用场景**：用户跳过手动 Connect，直接点击 Run 按钮，此时即使 introspection 失败，也尝试发送查询请求
+```ts
+// connection.ts:337-348
+if (connection.state !== "CONNECTED") {
+  await connect({ url, request, inheritedHeaders, inheritedAuth }, true)
+}
+// 无论 connect 成功失败，都会继续执行后续代码！
+```
+
+**行为差异**：
+
+| | `isRunGQLOperation = false`（用户点击 Connect） | `isRunGQLOperation = true`（runGQLOperation 自动调用） |
+|---|---|---|
+| 失败时是否弹 toast | 是（`poll()` catch 中 `toast.error()`） | 否（`if (!isRunGQLOperation)` 跳过） |
+| `connect()` 是否抛异常给调用者 | **否**（错误在 `poll()` catch 中被消化） | **否**（同上，错误在 `poll()` catch 中被消化） |
+| 后续查询是否执行 | 不适用（用户只是点击 Connect） | **是**！`await connect()` 返回后继续执行请求发送 |
+
+**关键澄清**：`connect()` 本身**永远不会向外抛出异常**，因为 `poll()` 内部有 try-catch 消化所有错误。无论成功失败，`await connect()` 都会正常返回。
 
 ---
 
@@ -717,7 +760,7 @@ export const GQLRequest = {
 | 响应处理 | `buildClientSchema()` → 存入 `connection.schema` | `GQLResponse.toResponse()` → 存入 tab response |
 | 传输方式 | HTTP POST（通过 KernelInterceptor） | HTTP POST / WebSocket（subscription） |
 
-#### 4.2.5 Variables 组装细节
+#### 4.2.5 Variables 组装细节与边界条件
 
 Variables 在 3 个不同阶段被处理，最终以解析后的 JSON 对象形式出现在请求体中：
 
@@ -738,11 +781,14 @@ export const getDefaultGQLRequest = (): HoppGQLRequest => ({
 
 **阶段 2：RequestOptions → runGQLOperation — 透传字符串**
 
-**`RequestOptions.vue:139-155`**
+**`RequestOptions.vue:132-158`**
 
 ```ts
-const runQuery = async (definition) => {
+const runQuery = async (definition: gql.OperationDefinitionNode | null = null) => {
+  const runURL = clone(url.value)
+  const runQuery = clone(request.value.query)
   const runVariables = clone(request.value.variables)   // ← 仍然是字符串
+
   await runGQLOperation({
     ...
     variables: runVariables,   // ← 字符串透传
@@ -753,7 +799,7 @@ const runQuery = async (definition) => {
 
 **阶段 3：GQLRequest.toRequest — JSON 解析**
 
-**`helpers/kernel/gql/request.ts:12-19, 81, 91`**
+**`helpers/kernel/gql/request.ts:12-19, 33, 42-44`**
 
 ```ts
 const parseVariables = async (variables: string | null): Promise<unknown> => {
@@ -761,7 +807,7 @@ const parseVariables = async (variables: string | null): Promise<unknown> => {
   try {
     return JSON.parse(variables)      // ← 字符串 → 对象
   } catch {
-    throw new Error("Invalid JSON")
+    throw new Error("Invalid JSON")   // ← 解析失败抛错
   }
 }
 
@@ -777,7 +823,25 @@ return {
 }
 ```
 
-**Variables 的完整处理链路**：
+**阶段 4：runGQLOperation — 解析异常处理**
+
+**`connection.ts:496-506`**
+
+```ts
+} catch (error: any) {
+  gqlMessageEvent.value = {
+    type: "error",
+    error: {
+      type: "network_error",
+      message: error.message || "An unknown error occurred",
+    },
+  }
+
+  throw error   // ← 继续抛出，被 RequestOptions.runQuery catch
+}
+```
+
+**Variables 处理的完整链路（含异常路径）**：
 
 ```
 用户在 Variables 编辑器输入 JSON 字符串
@@ -787,7 +851,7 @@ return {
     ▼
 RequestOptions.runQuery()
     │
-    ├─ clone(request.value.variables) → 字符串
+    ├─ clone(request.value.variables) → string
     │
     ▼
 runGQLOperation({ variables: string })
@@ -797,32 +861,44 @@ runGQLOperation({ variables: string })
     ▼
 GQLRequest.toRequest()
     │
-    ├─ parseVariables(variables) → JSON.parse → object | undefined
+    ├─ parseVariables(variables)
+    │   ├─ 分支 1：!variables → return undefined
+    │   ├─ 分支 2：JSON.parse 成功 → return object
+    │   └─ 分支 3：JSON.parse 失败 → throw Error("Invalid JSON")
     │
-    ▼
-content.json({ query, variables: object | undefined })
-    │
-    ▼
-最终请求体：{ "query": "...", "variables": { "id": "1" } }
+    ├─ 正常路径：content.json({ query, variables: object|undefined })
+    └─ 异常路径：throw Error("Invalid JSON") → 冒泡到 runGQLOperation catch
+            ↓
+            gqlMessageEvent.value = { type: "error", ... }
+            throw error → RequestOptions.runQuery catch 捕获
+            ↓
+            completePageProgress()，console.error(e)
 ```
 
-**特殊情况处理**：
-- **空字符串** → `parseVariables("")` → `JSON.parse("")` 抛错 → `Error("Invalid JSON")`
-- **null** → `parseVariables(null)` → 返回 `undefined`
-- **非空但无效 JSON** → 抛错 `Error("Invalid JSON")`
-- **请求体序列化**：`variables: undefined` 时，JSON 序列化后仍然会保留 `variables` 键（值为 `undefined`），但在实际 HTTP 传输中 `content.json()` 会处理掉 undefined 值。
+**Variables 所有边界条件的精确行为**：
 
-#### 4.2.6 OperationName 组装细节
+| 输入值 | `parseVariables` 行为 | 返回值 / 抛出 | 最终请求体 | 对用户的可见影响 |
+|--------|----------------------|---------------|------------|-----------------|
+| `null` | `if (!variables)` 命中 | `return undefined` | `{ "query": "...", "variables": undefined }`（JSON 中无 variables 键） | 无提示，请求正常发送（不带 variables） |
+| 空字符串 `""` | `!""` 为 true？否 → `JSON.parse("")` | 抛 `SyntaxError` → 捕获后抛 `Error("Invalid JSON")` | 不发送请求 | 进度条完成，控制台报错，响应区显示 network_error |
+| 非空但无效 JSON（如 `{id:1}`） | `JSON.parse()` 失败 | 抛 `SyntaxError` → 捕获后抛 `Error("Invalid JSON")` | 不发送请求 | 同上 |
+| 有效 JSON 对象 `{"id": "1"}` | `JSON.parse()` 成功 | `return { id: "1" }` | `{ "query": "...", "variables": { "id": "1" } }` | 请求正常发送 |
+| 有效 JSON 数组 `[1, 2, 3]` | `JSON.parse()` 成功 | `return [1, 2, 3]` | `{ "query": "...", "variables": [1, 2, 3] }` | 请求正常发送（但 server 通常期望 object） |
+| 有效 JSON 标量 `"hello"` | `JSON.parse()` 成功 | `return "hello"` | `{ "query": "...", "variables": "hello" }` | 请求正常发送（但 server 通常期望 object） |
+
+**注意**：`parseVariables` 只检查是否能 `JSON.parse` 成功，**不检查解析结果是否为对象**。数组、字符串、数字等都会被正常放入请求体。
+
+#### 4.2.6 OperationName 组装细节与多 Operation 选择
 
 OperationName 的处理分为**解析**和**注入**两个独立阶段，且**不在 GQLRequest.toRequest 内部处理**。
 
-**阶段 1：Query 编辑器 → AST 解析 → 确定 operationName**
+**阶段 1：Query 编辑器 → AST 解析 → 确定 selectedOperation**
 
-**`Query.vue:153-182`**
+**`Query.vue:153-197`**
 
 ```ts
 const debouncedOnUpdateQueryState = debounce((update: ViewUpdate) => {
-  const selectedPos = update.state.selection.main.head
+  const selectedPos = update.state.selection.main.head  // ← 光标位置
   const queryString = update.state.doc.toJSON().join(update.state.lineBreak)
 
   try {
@@ -847,30 +923,59 @@ const debouncedOnUpdateQueryState = debounce((update: ViewUpdate) => {
         return selectedPos >= start && selectedPos <= end
       }) as OperationDefinitionNode) ?? null
   } catch (_error) {
-    // ...
+    if (queryString.trim() === "") {
+      operationDefinitions.value = []
+    }
   }
 }, 100)
+
+// 初始化时同样解析
+onMounted(() => {
+  try {
+    const ast = parse(gqlQueryString.value)
+    operationDefinitions.value = ast.definitions.filter(...)
+    if (ast.definitions.length) {
+      selectedOperation.value = ast.definitions[0] as OperationDefinitionNode
+    }
+  } catch (_error) {}
+})
 ```
 
-**选中逻辑**：
-1. 编辑器中只有 1 个 operation → 自动选中它
+**选中逻辑精确规则**：
+1. 编辑器中只有 1 个 operation → 自动选中它，**无论光标在哪里**
 2. 编辑器中有多个 operation → 根据当前光标位置落在哪个 operation 的 `loc.start` 和 `loc.end` 之间来选中
+3. 光标不在任何 operation 范围内 → `selectedOperation = null`
+4. 解析失败（语法错误）→ `selectedOperation` 保持上一次的值或 null
+5. 空字符串 → `operationDefinitions = []`，`selectedOperation` 保持 null
 
-**阶段 2：RequestOptions → runGQLOperation — 传入 operationName**
+**阶段 2：Run 按钮 → 传入 operationName**
 
-**`RequestOptions.vue:147-158`**
+**`Query.vue:23-36`** — Run 按钮渲染：
+
+```html
+<HoppButtonSecondary
+  v-if="selectedOperation && subscriptionState !== 'SUBSCRIBED'"
+  :label="`${selectedOperation.name?.value ?? t('request.run')}`"
+  :disabled="!selectedOperation"
+  @click="runQuery(selectedOperation)"   // ← 传入 selectedOperation
+/>
+```
+
+**`RequestOptions.vue:132-158`** — runQuery 接收并传入：
 
 ```ts
-await runGQLOperation({
-  ...
-  operationName: definition?.name?.value,    // ← 从 AST 节点 name 中获取
-  operationType: definition?.operation ?? "query",
-})
+const runQuery = async (definition: gql.OperationDefinitionNode | null = null) => {
+  await runGQLOperation({
+    ...
+    operationName: definition?.name?.value,    // ← 从 AST 节点 name 中获取
+    operationType: definition?.operation ?? "query",
+  })
+}
 ```
 
 **阶段 3：runGQLOperation → 后置注入 operationName**
 
-**`connection.ts:427-435`**
+**`connection.ts:426-435`**
 
 ```ts
 const kernelRequest = await GQLRequest.toRequest(gqlRequest)
@@ -897,13 +1002,18 @@ Query.vue: debouncedOnUpdateQueryState()
     │
     ├─ parse(queryString) → AST
     ├─ 过滤出 OperationDefinitionNode[]
-    └─ 根据光标位置选中一个 → selectedOperation
+    └─ 根据规则选中一个 → selectedOperation
+    │
+    ▼
+selectedOperation 决定 Run 按钮状态：
+    ├─ selectedOperation = null → 按钮隐藏（v-if 为 false），无法点击
+    └─ selectedOperation 存在 → 按钮显示，label 为 operation name
     │
     ▼
 用户点击 Run 按钮
     │
     ├─ definition = selectedOperation
-    ├─ operationName = definition?.name?.value   // 如 "Request", "GetUser"
+    ├─ operationName = definition?.name?.value   // 如 "GetUser", undefined（匿名查询）
     └─ operationType = definition?.operation ?? "query"
     │
     ▼
@@ -911,22 +1021,23 @@ runGQLOperation({ operationName, operationType, ... })
     │
     ├─ GQLRequest.toRequest(gqlRequest) → kernelRequest（只有 query 和 variables）
     │
-    └─ 后置注入：如果 operationName 存在
+    └─ 后置注入：如果 operationName 存在（truthy）
            kernelRequest.content.content.operationName = operationName
     │
     ▼
-最终请求体：{
-  "query": "query Request { ... }",
-  "variables": { ... },
-  "operationName": "Request"
-}
+最终请求体
 ```
 
-**特殊情况处理**：
-- **operationName 为 undefined**（查询没有命名，或未选中）→ 不注入 `operationName` 字段
-- **订阅（Subscription）**：operationName 直接传入 WebSocket payload，不经过 HTTP 注入
+**operationName 缺失的两种场景**：
 
-**`runSubscription` 中的 operationName**（`connection.ts:573-600`）：
+| 场景 | `selectedOperation` | Run 按钮状态 | `operationName` 参数 | 最终请求体 |
+|------|---------------------|-------------|---------------------|------------|
+| **匿名查询**（`query { method }`） | 存在（1 个 operation） | 显示，label 为 "Run"（因为 `name?.value` 为 undefined） | `undefined` | `{ "query": "query { method }", "variables": {...} }` （无 operationName 字段） |
+| **多 operation，光标不在任何范围内** | `null` | **隐藏**（`v-if="selectedOperation"` 为 false） | 无法点击 | 不发送请求 |
+
+**关键发现**：查询没有命名（匿名 operation）时，`selectedOperation` 仍然存在（因为 `ast.definitions.length === 1`），Run 按钮显示但 label 回退为 "Run"。此时 `operationName = undefined`，**不会注入 operationName 字段**。
+
+**Subscription 中的 operationName**（`connection.ts:573-600`）：
 
 ```ts
 export const runSubscription = (options: RunQueryOptions, headers?) => {
@@ -936,23 +1047,28 @@ export const runSubscription = (options: RunQueryOptions, headers?) => {
   connection.socket?.send(JSON.stringify({
     type: GQL.START,
     id: "1",
-    payload: { query, operationName },   // ← 直接透传
+    payload: { query, operationName },   // ← 直接透传，可能为 undefined
   }))
 }
 ```
 
-#### 4.2.7 不同执行路径下的请求体对比
+WebSocket 场景下 `operationName` 直接放入 payload，如果是 undefined 则 JSON 序列化后该字段被省略。
 
-| 场景 | operationName | variables | 请求体结构 |
-|------|--------------|-----------|------------|
-| **无命名查询**（`query { method }`） | `undefined`，不注入 | 解析后的 JSON 对象 | `{ "query": "query { method }", "variables": {...} }` |
-| **单命名查询**（`query GetUser { user { id } }`） | `"GetUser"`，注入 | 解析后的 JSON 对象 | `{ "query": "query GetUser { user { id } }", "variables": {...}, "operationName": "GetUser" }` |
-| **多 operation，光标在 GetUser 内** | `"GetUser"`，注入 | 解析后的 JSON 对象 | `{ ..., "operationName": "GetUser" }` |
-| **多 operation，光标在 CreateUser 内** | `"CreateUser"`，注入 | 解析后的 JSON 对象 | `{ ..., "operationName": "CreateUser" }` |
-| **variables 为空字符串** | 同上 | `parseVariables("")` 抛错 | 不发送，抛 `Error("Invalid JSON")` |
-| **variables 为 null** | 同上 | `undefined` | `{ ..., "variables": undefined }`（JSON 中会被省略） |
-| **Introspection 请求** | 无 operationName 字段 | 无 variables 字段 | `{ "query": "query IntrospectionQuery { __schema { ... } }" }` |
-| **Subscription** | 直接传入 WebSocket payload | 不经过 HTTP 请求体 | `{ "type": "start", "payload": { "query": "...", "operationName": "..." } }` |
+#### 4.2.7 不同执行路径下的请求体差异对比（完整）
+
+| 场景 | `selectedOperation` | `operationName` | `variables` | 最终请求体 |
+|------|---------------------|----------------|-------------|------------|
+| **单命名查询**<br>`query GetUser { user { id } }` | 存在 | `"GetUser"` | `{ "id": "1" }` | `{ "query": "query GetUser { user { id } }", "variables": { "id": "1" }, "operationName": "GetUser" }` |
+| **单匿名查询**<br>`query { user { id } }` | 存在 | `undefined`（不注入） | `{ "id": "1" }` | `{ "query": "query { user { id } }", "variables": { "id": "1" } }` |
+| **多 operation，光标在 GetUser 内**<br>`query GetUser {...} query GetPosts {...}` | `GetUser` 节点 | `"GetUser"` | `{}` | `{ "query": "...", "variables": {}, "operationName": "GetUser" }` |
+| **多 operation，光标在 GetPosts 内**<br>（同上） | `GetPosts` 节点 | `"GetPosts"` | `{}` | `{ "query": "...", "variables": {}, "operationName": "GetPosts" }` |
+| **多 operation，光标在两者之间** | `null` | - | - | **Run 按钮隐藏，无法发送** |
+| **variables 为空字符串** | 存在（如果语法正确） | 同上 | `parseVariables("")` 抛错 | **不发送**，catch 中设置 `gqlMessageEvent = error` |
+| **variables 为 `null`** | 存在 | 同上 | `undefined` | `{ "query": "...", "variables": undefined }` → JSON 中无 variables 键 |
+| **variables 为无效 JSON** | 存在 | 同上 | 抛 `Error("Invalid JSON")` | **不发送**，同上 |
+| **Introspection 请求** | - | 无 operationName 字段 | 无 variables 字段 | `{ "query": "query IntrospectionQuery { __schema { ... } }" }` |
+| **Subscription（命名）** | 存在 | `"SubscribeUser"` | `{}` | WebSocket payload: `{ "query": "...", "operationName": "SubscribeUser" }` |
+| **Subscription（匿名）** | 存在 | `undefined` | `{}` | WebSocket payload: `{ "query": "subscription { ... }" }`（无 operationName 字段） |
 
 ---
 
@@ -1010,6 +1126,18 @@ export const runSubscription = (options: RunQueryOptions, headers?) => {
 
 8. **二次错误抛出陷阱**：`getSchema()` catch 中调用 `disconnect()` 时，由于 `connection.state` 已被设置为 `"ERROR"`，`disconnect()` 的前置检查 `state === "CONNECTED"` 不通过，会再次抛出错误。这个二次错误被 `poll()` 的 catch 捕获。
 
-9. **Variables 延迟解析**：用户在编辑器中输入的 variables 始终以字符串形式存储和传递，直到 `GQLRequest.toRequest()` 的最后一步才通过 `JSON.parse()` 解析为对象。空字符串会抛错，`null` 会返回 `undefined`。
+9. **失败分支中 schema 永不修改**：`getSchema()` 失败路径中，`disconnect()` 抛出异常，因此 `disconnect()` 内部的 `connection.schema = null` 不会被执行。如果是首次连接，schema 保持 `null`；如果是轮询失败，schema 保留之前的缓存值且仍可正常浏览。
 
-10. **OperationName 后置注入**：`operationName` 不在 `GQLRequest.toRequest()` 内部处理，而是在 `toRequest()` 返回后，由 `runGQLOperation()` 直接修改 `kernelRequest.content.content.operationName`。解析阶段通过光标位置从多个 operation 中确定当前选中的 operation。
+10. **轮询停止的充要条件**：只要 `poll()` 的 catch 块被执行（无论什么原因），就不会执行 `setTimeout(poll, 7000)`，轮询终止。没有例外。
+
+11. **`connect()` 永不向外抛异常**：因为 `poll()` 内部有 try-catch 消化所有错误，无论成功失败，`await connect()` 都会正常返回。`isRunGQLOperation = true` 时只额外跳过 toast。
+
+12. **Variables 延迟解析**：用户在编辑器中输入的 variables 始终以字符串形式存储和传递，直到 `GQLRequest.toRequest()` 的最后一步才通过 `JSON.parse()` 解析。空字符串会抛错，`null` 会返回 `undefined`。
+
+13. **Variables 只验 JSON 格式不验结构**：`parseVariables` 只检查是否能 `JSON.parse` 成功，**不检查解析结果是否为对象**。数组、字符串、数字等都会被正常放入请求体。
+
+14. **OperationName 后置注入**：`operationName` 不在 `GQLRequest.toRequest()` 内部处理，而是在 `toRequest()` 返回后，由 `runGQLOperation()` 直接修改 `kernelRequest.content.content.operationName`。
+
+15. **多 Operation 选中规则**：单 operation 时自动选中（无论光标位置）；多 operation 时根据光标位置落在哪个 operation 的 `loc.start/end` 范围内来选中；光标不在范围内时 `selectedOperation = null`，Run 按钮隐藏。
+
+16. **匿名查询的特殊处理**：查询没有命名（`query { ... }`）时，`selectedOperation` 仍然存在，Run 按钮显示但 label 回退为 "Run"。此时 `operationName = undefined`，不会注入 operationName 字段。
