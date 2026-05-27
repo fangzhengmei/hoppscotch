@@ -258,7 +258,198 @@ GET /published-docs/:slug/:version  → 指定版本
 
 ---
 
-## 五、数据持久化
+## 五、documentTree 与页面展示区块的字段映射
+
+### 1. `documentTree` 的数据形状（`CollectionFolder`）
+
+后端 `documentTree` 存储的是一棵 `CollectionFolder` JSON 树（`helpers/backend/queries/PublishedDocs.ts:60-67`）：
+
+```ts
+type CollectionFolder = {
+  id?: string
+  name: string
+  folders: CollectionFolder[]
+  requests: any[]                         // 原始 HoppRESTRequest 序列化形态
+  data?: string                           // 字符串化 JSON：auth/headers/variables/description/preRequestScript/testScript
+}
+```
+
+其中 `data` 字段的典型内容为 `CollectionDataProps`：
+
+```ts
+{ auth, headers, variables, description, preRequestScript, testScript }
+```
+
+`data` 可能为 `null`/`""`，此时由 `parseCollectionDataFromString`（`queries/PublishedDocs.ts:95-124`）回落到“继承 auth + 空 headers/variables/空 scripts”的默认值。
+
+### 2. `collectionFolderToHoppCollection` 的反序列化链路
+
+`queries/PublishedDocs.ts:131-156` 展示了 `CollectionFolder → HoppCollection` 的映射：
+
+| `CollectionFolder` 字段 | `HoppCollection` 字段 | 备注 |
+| --- | --- | --- |
+| `name` | `name` | 直接映射 |
+| `id` | `id` | 可选，直接映射 |
+| `folders[]` | `folders[]` | 递归调用 `collectionFolderToHoppCollection` |
+| `requests[]` | `requests[]` | 每个元素经过 `translateToNewRequest` 规范化为 `HoppRESTRequest` |
+| `data.auth` | `auth` | 默认 `{ authType: "inherit", authActive: true }` |
+| `data.headers` | `headers` | 默认 `[]` |
+| `data.variables` | `variables` | 默认 `[]` |
+| `data.description` | `description` | 默认 `null` |
+| `data.preRequestScript` | `preRequestScript` | 默认 `""` |
+| `data.testScript` | `testScript` | 默认 `""` |
+
+### 3. 页面展示区块与字段的映射关系
+
+对外页（`pages/view/_id/_version.vue` + `components/documentation/Content.vue` + `RequestPreview.vue`）把 `collectionFolderToHoppCollection` 产出的 `HoppCollection` 经过 `flattenCollection` 扁平化为 `DocumentationItem[]`，再按固定顺序渲染。下表列出了展示区块到原始字段的溯源：
+
+| 区块 | 组件 | 数据来源 |
+| --- | --- | --- |
+| 左侧集合导航 | `CollectionsDocumentationCollectionStructure` | `collectionData.name`、`folders[].name`、`requests[].name` |
+| 集合描述 | `CollectionsDocumentationCollectionPreview` | `collectionData.description`（来自 `data.description`） |
+| 请求标题 + 方法标签 | `RequestPreview.vue` | `request.name`、`request.method` |
+| 最终 URL | `RequestPreview.vue` 中 `getFullEndpoint` | `request.url` + `params` + 环境/集合/请求变量（经 `getEffectiveRESTRequest` 替换） |
+| 请求 Markdown 描述 | `CollectionsDocumentationMarkdownEditor` | `request.description` |
+| cURL 视图 | `CollectionsDocumentationSectionsCurlView` | `request.method/url/headers/body/auth` + 继承属性 + `environmentVariables` |
+| Auth 区块 | `CollectionsDocumentationSectionsAuth` | `request.auth` + `inheritedProperties.auth`（由 `flattenCollection` 级联自祖先集合的 `data.auth`） |
+| Headers 区块 | `CollectionsDocumentationSectionsHeaders` | `request.headers` + `inheritedProperties.headers`（祖先集合 `data.headers` 合并） |
+| Parameters 区块 | `CollectionsDocumentationSectionsParameters` | `request.params` |
+| Variables 区块 | `CollectionsDocumentationSectionsVariables` | `request.requestVariables` |
+| Request Body 区块 | `CollectionsDocumentationSectionsRequestBody` | `request.body` |
+| Response 区块 | `CollectionsDocumentationSectionsResponse` | `request.responses`（示例 code/headers/body） |
+| 顶部 Header 标题、live 指示 | `DocumentationHeader`（`components/documentation/Header.vue`） | `publishedDoc.title / version / autoSync / environmentName` |
+
+注意：**Auth/Headers/Variables 区块展示的并非当前节点自身字段，而是 `flattenCollection` 递归级联后的“最终生效值”**，这在 `pages/view/_id/_version.vue:124-172` 中通过 `inheritedProperties` 累积实现——每访问一个 folder/request，都把自身字段 push 到数组里，使渲染层可以用“最近一次非空值”覆盖祖先。
+
+---
+
+## 六、请求顺序与锚点的稳定生成
+
+### 1. 请求顺序的来源与稳定性
+
+文档的渲染顺序由两处共同决定：
+
+1. **`documentTree` 自身的数组顺序**：后端在 `exportUserCollectionToJSONObject` / `exportCollectionToJSONObject` 时，按用户维护的集合数据顺序序列化 `folders`、`requests` 数组。因此，发布快照本身就是顺序的“事实来源”。
+2. **`flattenCollection` 的 DFS 顺序**：`pages/view/_id/_version.vue:174-199` 先遍历 `folders`（按数组索引），再遍历 `requests`。这是稳定的深度优先顺序——文件夹先于兄弟请求，子文件夹先于父文件夹的兄弟请求。
+
+同一份快照在不同客户端访问时，顺序必然一致。**live 版本（`autoSync=true`）每次访问会重新导出**，因此顺序随集合内容变化；若需要稳定顺序，应使用 snapshot 版本（`autoSync=false`）。
+
+### 2. 锚点的三级降级策略
+
+锚点在三处生成/消费：
+
+- **生成（`flattenCollection`）**：`pages/view/_id/_version.vue:177-194`
+  ```ts
+  id: folder.id || folder._ref_id || `folder-${folder.name}`
+  id: request.id || request._ref_id || `request-${request.name}`
+  ```
+  优先级依次为 `id` → `_ref_id` → 基于 `name` 的字符串兜底。团队集合通常有稳定 UUID；个人集合 `_ref_id` 由前端在创建时生成，迁移/导入后保持；最终兜底是 `request-<name>` / `folder-<name>`，若重名会冲突（见下方约束）。
+
+- **侧边栏键值（`CollectionStructure.vue`）**：`getFolderId/getRequestId` 使用 `generateFallbackId`（`CollectionStructure.vue:139-149`）：
+  ```ts
+  item.id || item._ref_id || `${prefix}-${name.replace(/\s+/g, "-").toLowerCase()}-${index}`
+  ```
+  兜底时把空白转 `-` 并小写化，再追加兄弟索引，保证同一层级内即使重名也不会冲突。
+
+- **渲染容器的锚点 id**：
+  - 文档弹窗（`Preview.vue:98-101`）：`id="doc-item-${item.id}"`
+  - 对外页（`Content.vue:38-41`）：`id="doc-item-${item.id}"`，并带 `scroll-mt-14` 以便浏览器原生锚点和 `scrollIntoView` 都能避开 sticky header。
+
+### 3. 锚点的消费路径
+
+1. **侧边栏点击 → URL → 滚动**（`Content.vue:116-141`）：选择请求或文件夹时若 `updateUrlOnSelect=true`，调用 `router.replace({ query: { ...route.query, section: id } })` 写入 URL。
+2. **页面加载 → 根据 `?section=` 滚动**（`Content.vue:218-225`）：`onMounted` 读取 `route.query.section` 后执行 `scrollToItem`。
+3. **`scrollToItem` 的安全查找**（`Content.vue:148-173`）：
+   - 100ms 延迟等待 Vue 渲染完成；
+   - 手动 `escapeId` 转义 CSS 选择器中的特殊字符（`!"#$%&'()*+,./:;<=>?@[\]^{|}~` 前加反斜杠）；
+   - 在 `mainContentRef` 容器内用 `querySelector` 查找，避免与页面其他 id 冲突；
+   - 用 `getBoundingClientRect` 计算相对滚动偏移并减去 14px 以匹配 `scroll-mt-14`。
+4. **兜底：按名称+类型查找**（`Content.vue:178-188` `scrollToItemByName`）：当 `id` 缺失时，在 `allItems` 中按 `name + type` 线性查找再滚动。
+
+### 4. 稳定性风险与约束
+
+| 场景 | 是否稳定 | 说明 |
+| --- | --- | --- |
+| 同一 snapshot 版本，重复访问 | ✅ | `documentTree` 固定，`id` 不变 |
+| live 版本，集合内容不变 | ✅ | 重新导出得到相同顺序和 id |
+| live 版本，集合重命名/移动 | ⚠️ | `name` 兜底锚点会变；有 `id/_ref_id` 时仍稳定 |
+| 两个同级请求同名且都无 id | ❌ | `request-<name>` 兜底会冲突；此时依赖 `CollectionStructure.vue` 的 `-index` 后缀策略，但该策略只用于侧边栏 key，未用于 `flattenCollection`，渲染层可能出现重复 `doc-item-*` |
+| 从不同入口（文档弹窗/对外页）打开 | ✅ | 都使用 `doc-item-${id}` |
+
+建议：对外分享锚点时，优先确保集合中的请求/文件夹有稳定 `id`（团队集合自动满足，个人集合 `_ref_id` 也会在首次创建时生成）。
+
+---
+
+## 七、环境变量注入失败或缺失的回退与降级
+
+公开页（`pages/view/_id/_version.vue` + `RequestPreview.vue` + `getEffectiveRESTRequest`）对环境变量做了多层降级处理，任一层失败都不会导致页面崩溃。
+
+### 1. 后端写入阶段的回退
+
+- **未绑定环境**（`environmentID` 为空或 `null`）：`published-docs.service.ts:591-604` 创建时 `environmentName = null`、`environmentVariables = null`，`cast` 时 `environmentName ?? null`（`published-docs.service.ts:89`）。
+- **环境已被删除或跨 workspace**：`fetchEnvironment`（`published-docs.service.ts:101-142`）返回 `TEAM_ENVIRONMENT_NOT_FOUND / USER_ENVIRONMENT_NOT_FOUND / PUBLISHED_DOCS_FORBIDDEN_ENVIRONMENT_ACCESS`，并以 Either left 向上传递：
+  - `createPublishedDoc`：直接返回 left，不写入记录；
+  - `updatePublishedDoc`（切换环境时）：直接返回 left，不更新；
+  - `getPublishedDocBySlugPublic`（live 版本重取）：直接返回 left，**对外返回错误而不是回退到快照中的旧变量**，因此公开页会进入 `fetchDocs` 的 error 分支，显示 `documentation.publish.not_found` 而非降级页面。
+
+### 2. 前端解析阶段的回退（`pages/view/_id/_version.vue:244-275`）
+
+```
+rawEnvVars (从响应中取)
+   │
+   ├─ 为空 / 为 null → 跳过，parsedEnvironmentVariables = []
+   │
+   └─ 非空
+        ├─ 为字符串 → JSON.parse → Array.isArray ?
+        │                                 ├─ 是 → map + translateToNewEnvironmentVariables + currentValue 兜底
+        │                                 └─ 否 → parsedEnvironmentVariables = []
+        │
+        └─ 已是对象 → 同上
+```
+
+- **JSON 解析失败**：`try/catch` 兜底到 `parsedEnvironmentVariables = []`，仅 `console.error`，不抛错；
+- **非数组**：同样兜底到 `[]`；
+- **条目规范化失败**：`translateToNewEnvironmentVariables` 返回的对象可能缺少 `currentValue`，代码显式兜底：`currentValue: normalized.currentValue || normalized.initialValue`。
+
+### 3. 使用阶段的回退（`RequestPreview.vue:207-260`）
+
+`getEffectiveRequest` 组装环境时按优先级拼接变量：
+
+```ts
+env.variables = [
+  ...requestVariables,                 // 1. 请求自身 requestVariables（active 才加入）
+  ...collectionVariables,              // 2. inheritedProperties.variables 级联（来自祖先集合 data.variables）
+  ...(props.environmentVariables || []) // 3. 发布时绑定的环境变量（props 为 undefined 时为空数组）
+]
+```
+
+- **`environmentVariables` 为空**：不添加任何条目，URL 中出现的 `<<variable>>` 占位符会原样保留（`getEffectiveRESTRequest` 对未命中的占位符不替换）；
+- **集合级变量注入失败**：`inheritedProperties` 为 `undefined` 时 `collectionVariables = []`；
+- **请求级变量激活过滤**：`requestVariable.active === false` 的条目替换为 `{}`（无 key），不参与查找；
+- **`getCurrentValue` 失败**：对 `secret` 环境变量若 `currentValue` 为空，兜底到 `initialValue`（`RequestPreview.vue:239-244`）。
+
+### 4. 顶部开关的语义
+
+- `environmentEnabled` 初始值：`!!environmentName`（`pages/view/_id/_version.vue:271`）——若后端没写 `environmentName`，开关默认关闭；
+- 用户关闭开关：`environmentVariables.value = []`，此时所有三级变量源里只有请求/集合变量生效；
+- 开关切换不重新请求后端，只切换前端是否把已解析的变量传给 `RequestPreview`。
+
+### 5. 最终行为总结
+
+| 故障场景 | 公开页表现 | 可见的占位符 |
+| --- | --- | --- |
+| 未绑定环境 | 正常渲染 | `<<name>>` 原样显示 |
+| 环境绑定但 JSON 解析失败 | 正常渲染 | `<<name>>` 原样显示 |
+| 环境绑定但值缺失 | 正常渲染 | 未命中的 `<<name>>` 原样显示 |
+| 环境被删除且版本是 snapshot | 正常渲染（snapshot 中的变量仍存在，但已过期） | 可能显示过期值 |
+| 环境被删除且版本是 live | 显示 `documentation.publish.not_found` 错误页 | — |
+| 环境跨 workspace（越权） | 同 live 版本环境被删除 | — |
+
+这意味着“环境变量注入失败”时系统以 **功能降级而非可用性降级** 为主：页面仍可访问、集合结构与描述完整，仅动态 URL 中的占位符无法被替换。若需要公开页不泄露占位符文本，可在发布时用 snapshot 模式并确保环境当时已绑定。
+
+---
+
+## 八、数据持久化
 
 后端 Prisma 模型（可从 `published-docs.service.ts` 反推）字段：
 
@@ -273,7 +464,7 @@ GET /published-docs/:slug/:version  → 指定版本
 
 ---
 
-## 六、关键细节与注意点
+## 九、关键细节与注意点
 
 1. **孤儿文档清理**：`cleanupOrphanedPublishedDocs` 在列表查询时会剔除并删除那些 `collectionID` 指向已不存在集合的记录，避免用户看到 404 的发布链接。
 2. **并发安全**：创建时对 `[slug, version]` 唯一冲突做了最多 2 次重试；前端 `fetchRequestId` 计数器用于取消旧的拉取请求，避免竞态覆盖。
@@ -286,7 +477,7 @@ GET /published-docs/:slug/:version  → 指定版本
 
 ---
 
-## 七、涉及的核心文件清单
+## 十、涉及的核心文件清单
 
 | 区域 | 文件 |
 | --- | --- |
