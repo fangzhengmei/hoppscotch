@@ -5,6 +5,7 @@
 Hoppscotch 的跨源请求方案由两层协作实现：
 
 1. **本地 Agent**（`packages/hoppscotch-agent`）：基于 Tauri 的桌面应用，在本地 `127.0.0.1:9119` 启动 HTTP 服务，接收浏览器端的加密请求并转发至目标服务器。
+
 2. **浏览器前端**（`packages/hoppscotch-common`）：运行在浏览器中的 Web 应用，通过"拦截器（Interceptor）"机制选择请求通道。Agent 拦截器将请求加密后发送到本地 Agent 服务。
 
 两者之间的通信采用端到端加密（AES-256-GCM），密钥通过 X25519 Diffie-Hellman 密钥交换在注册阶段协商。
@@ -49,7 +50,9 @@ Hoppscotch 的跨源请求方案由两层协作实现：
 Agent 是 Tauri 应用，入口函数 `run()` 在 `lib.rs:69`。启动流程如下：
 
 1. **WebView 初始化**（仅 Windows 便携版）：检查并安装 WebView2 运行时。
+
 2. **创建 CancellationToken**：用于优雅关闭服务。
+
 3. **构建 Tauri Builder**：
    - 注册 `tauri_plugin_single_instance`：确保只运行一个实例，重复启动时唤起已有窗口。
    - 注册 `tauri_plugin_store`：持久化存储（注册信息等）。
@@ -97,9 +100,9 @@ pub async fn run_server(state, cancellation_token, app_handle) {
 | `/handshake` | GET | 探测 Agent 是否在运行 |
 | `/receive-registration` | POST | 发起注册流程 |
 | `/verify-registration` | POST | 验证 OTP 并完成注册 |
-| `/registered-handshake` | GET | 已注册客户端验证连接有效性 |
+| `/registered-handshake` | GET | 已注册客户端验证连接有效性（前端未使用） |
 | `/registration` | GET | 获取当前注册信息（加密） |
-| `/registrations/:auth_key` | DELETE | 删除某个注册 |
+| `/registrations/:auth_key` | DELETE | 删除某个注册（前端未调用） |
 | `/execute` | POST | **执行代理请求**（核心） |
 | `/cancel/:req_id` | POST | 取消正在执行的请求 |
 | `/log-sink` | POST | 接收前端日志（加密） |
@@ -171,54 +174,110 @@ const PLATFORM_CONFIG = {
 - `current`：computed，当前选中的拦截器。
 - `available`：computed，所有已注册拦截器列表。
 
-拦截器选择通过 Vue 响应式 + 持久化设置同步：
-- 当用户切换拦截器时，`CURRENT_KERNEL_INTERCEPTOR_ID` 设置项自动保存。
-- 应用启动时，从设置恢复上次选中的拦截器。
+### 拦截器切换的持久化与恢复
 
-### Agent 探测流程
+**文件**: `packages/hoppscotch-common/src/modules/kernel-interceptors.ts`
 
-**文件**: `packages/hoppscotch-common/src/platform/std/kernel-interceptors/agent/store.ts`
+拦截器选择通过 Vue 响应式 + 持久化设置同步机制实现双向同步：
 
-`KernelInterceptorAgentStore` 管理 Agent 的状态和通信：
-
-#### 1. Agent 运行状态检测
-
+1. **保存（内存 → 存储）：
 ```typescript
-public async checkAgentStatus(): Promise<void> {
-  try {
-    const handshakeResponse = await axios.get("http://localhost:9119/handshake")
-    this.isAgentRunning.value =
-      handshakeResponse.data.status === "success" &&
-      handshakeResponse.data.__hoppscotch__agent__ === true
-  } catch {
-    this.isAgentRunning.value = false
-  }
+function syncServiceToSettings(service: KernelInterceptorService): void {
+  watch(
+    () => service.current.value?.id,
+    (id) => {
+      applySetting("CURRENT_KERNEL_INTERCEPTOR_ID",
+        id ?? platform.kernelInterceptors.default
+      )
+    }
+  )
 }
 ```
 
-前端通过 GET `/handshake` 探测 Agent 是否在运行。Agent 返回：
-```json
-{ "status": "success", "__hoppscotch__agent__": true, "agent_version": "0.1.17" }
+2. **恢复（存储 → 内存）：
+```typescript
+function syncSettingsToService(service: KernelInterceptorService): void {
+  const [setting] = useSettingStatic("CURRENT_KERNEL_INTERCEPTOR_ID")
+  watch(
+    setting,
+    () => {
+      const fallback = setting.value ?? platform.kernelInterceptors.default
+      service.setActive(fallback)
+    },
+    { immediate: true }  // 启动时立即恢复
+  )
+}
 ```
 
-#### 2. 注册流程（OTP 双因素验证）
+3. **有效性校验**：如果存储的拦截器不可用（例如切换平台后），自动回退：
+```typescript
+private setupInterceptorValidation(): void {
+  watchEffect(() => {
+    if (!this.state.currentId) return
+    const currentInterceptor = this.state.interceptors.get(this.state.currentId)
+    if (!this.validateCurrentInterceptor(currentInterceptor)) {
+      this.resetToSelectableInterceptor()  // 回退到第一个可用的
+    }
+  })
+}
+```
 
-用户在 Web 端选中 Agent 拦截器后，需要先与本地 Agent 完成注册：
+**完整恢复流程**：
+1. 应用启动 → 读取 `CURRENT_KERNEL_INTERCEPTOR_ID` 设置项
+2. 调用 `service.setActive(fallback)` 设置拦截器
+3. `watchEffect` 立即校验当前拦截器是否可用（`selectable.type === "selectable"`）
+4. 若不可用，自动回退到第一个可选拦截器
+
+---
+
+## 三、注册流程（OTP 双因素验证
+
+### ⚠️ 关键纠正：OTP 是 Agent 生成的
+
+**之前的错误理解**：浏览器生成 OTP 发送给 Agent。
+
+**正确理解**：**浏览器生成的 OTP 完全被忽略**！实际 OTP 是 **Agent 端生成的！
+
+**文件**: `packages/hoppscotch-agent/src-tauri/src/controller.rs:57`
+
+```rust
+pub async fn receive_registration(
+    State((state, app_handle)): State<(Arc<AppState>, AppHandle)>,
+) -> AgentResult<Json<serde_json::Value>> {
+    let otp = generate_otp();  // ← Agent 自己生成！
+    *active_registration_code = Some(otp.clone());  // 存自己生成的
+    app_handle.emit("registration-received", otp)  // 发给 Agent 前端显示
+}
+```
+
+浏览器端 `store.ts:215-228` 虽然也生成了一个 OTP，但这个 OTP 被 Agent 完全忽略，Agent 根本不读取请求体！
+
+---
+
+### 完整注册时序图
 
 ```
 ┌──────────┐                         ┌──────────┐
 │  浏览器   │                         │  Agent   │
 └─────┬────┘                         └─────┬────┘
       │  1. POST /receive-registration    │
+      │  (附带一个随机 OTP，但被忽略)        │
       │ ──────────────────────────────►   │
+      │                                   │
+      │                                   │  generate_otp() → 生成真实 OTP
+      │                                   │  存入 active_registration_code
       │     { message: "Registration received" }
       │ ◄──────────────────────────────   │
-      │                                   │  Agent 弹出窗口显示 OTP
-      │  2. 用户在浏览器输入 Agent 显示的 OTP │
+      │                                   │
+      │                                   │  emit("registration-received", otp)
+      │                                   │  Agent 窗口弹出，显示真实 OTP
+      │                                   │
+      │  2. 用户从 Agent 窗口复制 OTP  │
+      │     粘贴到浏览器输入框            │
       │                                   │
       │  3. POST /verify-registration     │
       │ ──────────────────────────────►   │
-      │     { registration: "123456",     │
+      │     { registration: "123456",           │
       │       client_public_key_b16: "…" }│
       │                                   │
       │     { auth_key: "uuid",           │
@@ -230,35 +289,213 @@ public async checkAgentStatus(): Promise<void> {
       └───────────────────────────────────┘
 ```
 
-**步骤详解**：
+### 注册流程详解
 
-1. **发起注册** (`initiateRegistration`)：
-   - 浏览器生成一个 6 位 OTP。
-   - POST `/receive-registration`，Agent 收到后弹出窗口显示 OTP 供用户确认。
+#### 1. 发起注册
 
-2. **验证注册** (`verifyRegistration`)：
-   - 用户在浏览器中输入 Agent 窗口显示的 OTP。
-   - 浏览器生成 X25519 临时密钥对，将公钥和 OTP 一起发送。
-   - Agent 验证 OTP 正确后，生成自己的 X25519 密钥对，计算共享密钥，返回 `auth_key` + Agent 公钥。
-   - 浏览器计算相同的共享密钥。
-   - 双方保存 `auth_key`（用作 Bearer Token）和 `shared_secret_b16`（用于 AES-256-GCM 加解密）。
+**文件**: `packages/hoppscotch-common/src/components/settings/AgentSubtitle.vue:90-103`
 
-3. **持久化**：注册凭证保存在浏览器的 Kernel Store 中（`interceptors.agent.v1`），下次访问无需重新注册。
+```typescript
+const handleAgentCheck = async () => {
+  try {
+    await store.checkAgentStatus()  // GET /handshake → 确认 Agent 在线
+    store.hasCheckedAgent.value = true
+    if (!store.isAgentRunning.value) {
+      await initiateRegistration()
+    }
+  } catch { ... }
+}
+```
 
-#### 3. AgentSubtitle 组件交互
+`initiateRegistration()` 调用后端生成一个 OTP 但它**，但这个 OTP 没用**，Agent 会自己生成新的。
 
-**文件**: `packages/hoppscotch-common/src/components/settings/AgentSubtitle.vue`
+#### 2. Agent 显示 OTP
 
-Agent 拦截器的副标题组件管理注册 UI：
+**文件**: `packages/hoppscotch-agent/src/App.vue:169-176`
 
-- 未注册且未检测 Agent：显示"注册 Agent"按钮 → 点击触发 `checkAgentStatus()` → 若 Agent 运行则自动进入注册流程。
-- Agent 未运行：显示错误提示"Agent not running"。
-- 正在注册：显示 OTP 输入框和确认按钮。
-- 已注册：显示 masked auth key hash 和"注销"按钮。
+```typescript
+const handleRegistrationReceived = (payload: string) => {
+  appState.value = {
+    ...state(),
+    view: "otp",
+    otp: O.some(payload),  // payload 是 Agent 生成的 OTP
+  }
+  getCurrentWindow().setFocus()
+}
+```
+
+Agent 窗口自动弹出并置顶，显示 6 位 OTP，用户需要把这个 OTP 复制粘贴回 Web 前端。
+
+#### 3. 验证注册
+
+**文件**: `packages/hoppscotch-common/src/components/settings/AgentSubtitle.vue:121-133`
+
+```typescript
+const register = async () => {
+  if (!store.registrationOTP.value) return  // 用户输入的 Agent 显示的 OTP
+  store.isRegistering.value = true
+  try {
+    await store.verifyRegistration(store.registrationOTP.value)  // 发送 OTP + 公钥
+    await updateMaskedAuthKey()
+    toast.success(t("settings.agent_registration_successful"))
+  } finally {
+    store.isRegistering.value = false
+  }
+}
+```
+
+**文件**: `packages/hoppscotch-common/src/platform/std/kernel-interceptors/agent/store.ts:230-258`
+
+```typescript
+public async verifyRegistration(otp: string): Promise<void> {
+  // 浏览器生成 X25519 密钥对
+  const myPrivateKey = crypto.getRandomValues(new Uint8Array(32))
+  const myPublicKey = x25519.getPublicKey(myPrivateKey))
+  const myPublicKeyB16 = base16.encode(myPublicKey)).toLowerCase()
+
+  const response = await axios.post(
+    "http://localhost:9119/verify-registration",
+    {
+      registration: otp,  // 用户输入的 Agent 生成的 OTP
+      client_public_key_b16: myPublicKeyB16,
+    }
+  )
+
+  // 计算共享密钥
+  const agentPublicKey = new Uint8Array(
+    base16.decode(agentPublicKeyB16.toUpperCase())
+  )
+  const sharedSecret = x25519.getSharedSecret(myPrivateKey, agentPublicKey))
+  const sharedSecretB16 = base16.encode(sharedSecret)).toLowerCase()
+
+  this.authKey.value = newAuthKey
+  this.sharedSecretB16.value = sharedSecretB16
+  await this.persistStore()
+}
+```
+
+#### 4. Agent 端验证
+
+**文件**: `packages/hoppscotch-agent/src-tauri/src/controller.rs:116-182`
+
+```rust
+pub async fn verify_registration(...) -> AgentResult<Json<AuthKeyResponse>> {
+    // 验证 OTP 是否匹配
+    if !state.validate_registration(&confirmed_registration.registration).await {
+        return Err(AgentError::InvalidRegistration);
+    }
+
+    // 生成 auth_key（UUID）
+    let auth_key = Uuid::new_v4().to_string();
+    
+    // Agent 也生成 X25519 密钥对
+    let secret_key = EphemeralSecret::random();
+    let public_key = PublicKey::from(&secret_key);
+
+    // 计算共享密钥
+    let their_public_key = PublicKey::from(...);
+    let shared_secret = secret_key.diffie_hellman(&their_public_key);
+
+    // 保存注册信息
+    state.update_registrations(...);
+
+    Ok(Json(AuthKeyResponse {
+        auth_key,
+        created_at,
+        agent_public_key_b16: base16::encode_lower(public_key.as_bytes()),
+    })
+}
+```
+
+#### 5. 持久化
+
+注册凭证保存在浏览器的 Kernel Store 中（`interceptors.agent.v1`），下次访问无需重新注册。
 
 ---
 
-## 三、请求转发实现
+## 四、注册失效探测与注销
+
+### 注册失效探测
+
+**文件**: `packages/hoppscotch-agent/src-tauri/src/controller.rs:264-284`
+
+`/registered-handshake` 端点**存在**，用于已注册客户端验证连接有效性：
+
+```rust
+pub async fn registered_handshake(...) -> AgentResult<EncryptedJson<...>> {
+    // 如果 auth_key 有效，返回加密的 true
+    // 如果无效，返回 401 Unauthorized
+}
+```
+
+⚠️ **但是**，**前端代码中**没有调用这个端点**！
+
+### 实际失效探测发生在：
+
+1. **`fetchRegistrationInfo()` 调用 `/registration` 时**：
+   ```typescript
+   public async fetchRegistrationInfo(): Promise<...>> {
+     try {
+       const response = await axios.get("http://localhost:9119/registration", {
+         headers: { Authorization: `Bearer ${this.authKey.value} },
+         responseType: "arraybuffer",
+       })
+       // 解密返回
+     } catch (error) {
+       if (axios.isAxiosError(error)) {
+         if (error.response?.status === 401) {
+           this.authKey.value = null  // 401 时自动清除
+           await this.persistStore()
+         }
+       }
+       throw error
+     }
+   }
+   ```
+
+2. **每次执行请求时**：`/execute` 401 也会触发错误，但前端没有自动处理，只会报错。
+
+### 注销路径
+
+#### 前端单方面注销
+
+**文件**: `packages/hoppscotch-common/src/components/settings/AgentSubtitle.vue:135-141`
+
+```typescript
+const resetRegistration = async () => {
+  await store.resetAuthKey()  // 只清前端本地的！
+  store.maskedAuthKey.value = ""
+  store.registrationOTP.value = ""
+  store.hasInitiatedRegistration.value = false
+  store.hasCheckedAgent.value = false
+}
+```
+
+⚠️ **只清除了前端的 authKey 和 sharedSecret，**没有调用后端删除接口**！
+
+#### 后端删除接口（前端未调用）
+
+**文件**: `packages/hoppscotch-agent/src-tauri/src/controller.rs:185-202`
+
+```rust
+pub async fn delete_registration(...) -> AgentResult<Json<...>> {
+    if !state.validate_access(auth_header.token()) {
+        return Err(AgentError::Unauthorized);
+    }
+    state.update_registrations(app_handle.clone(), |regs| {
+        regs.remove(&auth_key);  // 从后端删除
+    })?;
+}
+```
+
+**当前状态**：
+- 前端"注销"是**单向的**：前端清除自己的凭证，但后端还保留注册记录
+- Agent 端的注册列表页面也**没有删除按钮**，只能查看不能删除
+-  `/registered-handshake` 端点存在但前端没使用
+
+---
+
+## 五、请求转发实现
 
 ### 完整请求链路
 
@@ -315,7 +552,7 @@ public async encryptRequest(request, reqID): Promise<[string, ArrayBuffer]> {
   const reqJSON = JSON.stringify(fullRequest)
   const reqJSONBytes = new TextEncoder().encode(reqJSON)
   const nonce = window.crypto.getRandomValues(new Uint8Array(12))
-  const nonceB16 = base16.encode(nonce).toLowerCase()
+  const nonceB16 = base16.encode(nonce)).toLowerCase()
 
   const sharedSecretKey = await window.crypto.subtle.importKey(
     "raw", sharedSecretKeyBytes, "AES-GCM", true, ["encrypt", "decrypt"]
@@ -398,7 +635,7 @@ Agent 拦截器支持按域名配置安全/代理/高级选项（类似 Native �
 
 ---
 
-## 四、Desktop 平台 vs Web 平台的差异
+## 六、Desktop 平台 vs Web 平台的差异
 
 | 特性 | Web 平台 | Desktop 平台 |
 |------|----------|-------------|
@@ -413,7 +650,40 @@ Agent 拦截器支持按域名配置安全/代理/高级选项（类似 Native �
 
 ---
 
-## 五、关键文件索引
+## 七、关键错误总结（修正点）
+
+### 1. **OTP 生成位置
+
+| 之前错误 | 正确理解 |
+|-----------|----------|
+| 浏览器生成 OTP 发给 Agent | **Agent 自己生成 OTP！浏览器生成的 OTP 被完全忽略 |
+| 浏览器知道 OTP 值 | 浏览器不知道 OTP，必须由用户从 Agent 窗口复制粘贴 |
+
+### 2. 注册失效探测
+
+| 之前错误 | 正确理解 |
+|-----------|----------|
+| （未提及） | `/registered-handshake` 存在但前端**未使用** |
+| （未提及） | 实际靠 `/registration` 返回 401 时自动清除前端 authKey |
+
+### 3. 注销路径
+
+| 之前错误 | 正确理解 |
+|-----------|----------|
+| （未提及后端删除） | 前端"注销"是**单向**的，只清前端凭证，后端还保留注册 |
+| （未提及） | 后端有 DELETE 接口但前端**从未调用 |
+| （未提及） | Agent 注册列表页**没有删除按钮 |
+
+### 4. 拦截器持久化恢复
+
+| 之前错误 | 正确理解 |
+|-----------|----------|
+| （描述较简单） | 有双向同步（内存 ↔ 存储） |
+| （未提及） | 有有效性校验，无效时自动回退 |
+
+---
+
+## 八、关键文件索引
 
 ### Agent 端（Rust/Tauri）
 
@@ -428,6 +698,7 @@ Agent 拦截器支持按域名配置安全/代理/高级选项（类似 Native �
 | `hoppscotch-agent/src-tauri/src/util.rs` | EncryptedJson 响应加密、工具函数 |
 | `hoppscotch-agent/src-tauri/src/global.rs` | 全局常量（NONCE 头名、存储 key） |
 | `hoppscotch-agent/src-tauri/src/command.rs` | Tauri 命令（get_otp、list_registrations） |
+| `hoppscotch-agent/src/App.vue` | Agent 前端主页面（OTP 显示、注册列表） |
 
 ### 前端（TypeScript/Vue）
 
@@ -436,7 +707,7 @@ Agent 拦截器支持按域名配置安全/代理/高级选项（类似 Native �
 | `hoppscotch-common/src/platform/std/kernel-interceptors/agent/index.ts` | Agent 拦截器服务、请求执行主逻辑 |
 | `hoppscotch-common/src/platform/std/kernel-interceptors/agent/store.ts` | Agent 状态管理、加解密、注册、状态检测 |
 | `hoppscotch-common/src/services/kernel-interceptor.service.ts` | 拦截器注册与切换的核心服务 |
-| `hoppscotch-common/src/modules/kernel-interceptors.ts` | 拦截器模块初始化、设置同步 |
+| `hoppscotch-common/src/modules/kernel-interceptors.ts` | 拦截器模块初始化、设置双向同步 |
 | `hoppscotch-common/src/components/settings/Agent.vue` | Agent 设置 UI（域名设置、证书、代理） |
 | `hoppscotch-common/src/components/settings/AgentSubtitle.vue` | Agent 注册/状态 UI |
 | `hoppscotch-common/src/helpers/functional/process-request.ts` | 请求预处理（URL 参数编码、superjson 序列化） |
