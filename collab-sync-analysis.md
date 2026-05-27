@@ -290,8 +290,328 @@ Hoppscotch 选择了"最后写入者胜（last-write-wins）+ 不回滚本地"�
 | 前端 GQL 客户端、SubscriptionClient、reconnect、authExchange | `packages/hoppscotch-common/src/helpers/backend/GQLClient.ts` |
 | 业务层订阅注册、entityIDs 幂等、合并策略 | `packages/hoppscotch-common/src/services/team-collection.service.ts` |
 | 订阅的 .graphql 文档 | `packages/hoppscotch-common/src/helpers/backend/gql/subscriptions/` |
+| `moveCollection` 失败路径、锁顺序、死锁重试（`MAX_RETRIES`） | `hoppscotch-backend/src/team-collection/team-collection.service.ts:560-616, 747-867` |
+| `moveRequest` 失败路径、事务内"已被并发删除"静默空操作 | `hoppscotch-backend/src/team-request/team-request.service.ts:312-353, 423-516` |
+| 22 个订阅解绑、`changeTeamID` / `clearCollections` | `hoppscotch-common/src/services/team-collection.service.ts:202-255` |
+| `expandCollection` 错误兜底、`loadingCollections` 软锁 | `hoppscotch-common/src/services/team-collection.service.ts:1030-1071` |
+| `waitForCollectionLoading` 忙等待、`collectionLoadingWatcher` 延迟补偿 | `hoppscotch-common/src/services/team-collection.service.ts:179-196, 1247-1251` |
 
-## 6. 现状的边界（重要）
+## 6. `moveCollection` 与 `moveRequest` 失败路径的差异
+
+两者都是"写库 → 广播"，但失败时的处理粒度、重试策略、锁粒度并不对称。
+
+### 6.1 `TeamCollectionService.moveCollection`（集合移动）
+
+`packages/hoppscotch-backend/src/team-collection/team-collection.service.ts:747-867`：
+
+```ts
+async moveCollection(collectionID, destCollectionID) {
+  try {
+    return await this.prisma.$transaction(async (tx) => {
+      // (1) 查 collection；已在 root → TEAM_COL_ALREADY_ROOT
+      // (2) destCollectionID == null：只锁旧 parent，调 changeParentAndUpdateOrderIndex(tx, coll, null)
+      // (3) destCollectionID != null：
+      //     - ID 相同 → TEAM_COLL_DEST_SAME
+      //     - 目标 collection 不存在 → TEAM_COLL_NOT_FOUND
+      //     - 跨 team → TEAM_COLL_NOT_SAME_TEAM
+      //     - 是自己子孙 → TEAM_COLL_IS_PARENT_COLL（isParent 返回 O.none 表示冲突）
+      //     - srcParentID / destParentID 按字典序上锁，防双向 move 死锁
+      // (4) changeParentAndUpdateOrderIndex(tx, coll, destColl.id)
+      // (5) pubsub.publish(`team_coll/${teamID}/coll_moved`, updatedColl)
+    });
+  } catch (error) {
+    console.error('Error from TeamCollectionService.moveCollection', error);
+    return E.left(TEAM_COL_REORDERING_FAILED);   // ← 任何未分类错误都"折叠"成这一条
+  }
+}
+```
+
+注意点：
+- **整段 try/catch 只包一层**，事务里 Prisma 抛出的任何异常（死锁、唯一冲突、超时）都一律转成 `TEAM_COL_REORDERING_FAILED`。**没有单独的死锁重试**。
+- `changeParentAndUpdateOrderIndex`（`:651-688`）内部的 `updateMany(..., { orderIndex: { decrement: 1 } })` + `update({ orderIndex: last+1 })` 是在**同一事务里做的**，失败会整个回滚；但它不自己 catch，抛错走外层的 `TEAM_COL_REORDERING_FAILED`。
+- 相比之下，`deleteCollectionAndUpdateSiblingsOrderIndex`（`:555-616`）和 `updateOrderIndex` 才有 `MAX_RETRIES = 5` + `delay(retryCount * 100)` 的死锁重试循环，这些被 `updateCollectionOrder` / `deleteCollection` 复用，但**不被 `moveCollection` 复用**——即移动集合失败不会自动重试，由调用方决定。
+- `Resolver.moveCollection`（`team-collection.resolver.ts:302`）对 `E.Left` 直接 `throwErr(left)`，所以客户端看到的是一个 GraphQL 错误，错误消息是 `"TEAM_COL_REORDERING_FAILED"`。
+
+### 6.2 `TeamRequestService.moveRequest`（请求移动）
+
+`packages/hoppscotch-backend/src/team-request/team-request.service.ts:312-353`：
+
+```ts
+async moveRequest(srcCollID, requestID, destCollID, nextRequestID, callerFunction) {
+  // step 1: 校验 + 查出 request / nextRequest
+  const twoRequests = await this.findRequestAndNextRequest(...);
+  if (E.isLeft(twoRequests)) return E.left(twoRequests.left);   // ← 这里是"早返回"，不是 throw
+
+  // step 2: 事务
+  const updatedRequest = await this.reorderRequests(request, srcCollID, nextRequest, destCollID);
+  if (E.isLeft(updatedRequest)) return E.left(updatedRequest.left);
+
+  // step 3: 按 callerFunction 分 topic 广播
+  if (callerFunction === 'moveRequest') {
+    this.pubsub.publish(`team_req/${teamID}/req_moved`, teamReq);
+  } else if (callerFunction === 'updateLookUpRequestOrder') {
+    this.pubsub.publish(`team_req/${teamID}/req_order_updated`, {
+      request, nextRequest,
+    });
+  }
+  return E.right(teamReq);
+}
+```
+
+`reorderRequests`（`:423-516`）：
+
+```ts
+private async reorderRequests(...) {
+  try {
+    return await this.prisma.$transaction(async (tx) => {
+      await this.prisma.lockTeamRequestByCollections(tx, teamID, [srcCollID, destCollID]);   // ← 锁粒度是集合，不是 parent
+      request = await tx.teamRequest.findUnique(...);
+      nextRequest = nextRequest ? await tx.teamRequest.findUnique(...) : null;
+      if (!request) return;                 // ← 已被并发删除则"静默成功"，不抛错
+      // same collection：一次 updateMany 挪 orderIndex
+      // diff collection：源 collection 后面的 orderIndex 全部 -1，目标 collection 自 nextRequest.orderIndex 起全部 +1
+      // 最后 update({ collectionID: destCollID, orderIndex: newOrderIndex })
+    });
+  } catch (err) {
+    return E.left(TEAM_REQ_REORDERING_FAILED);   // ← 折叠
+  }
+}
+```
+
+对比 `moveCollection` 的关键差异：
+
+| 维度 | `moveCollection` | `moveRequest` |
+| --- | --- | --- |
+| 锁粒度 | `lockTeamCollectionByTeamAndParent(tx, teamID, parentID)`，按 **parentID** 字典序加两把锁防双向死锁 | `lockTeamRequestByCollections(tx, teamID, [srcCollID, destCollID])`，按 **collectionID 列表** 加锁，不排序 |
+| 业务校验（非数据库） | `ALREADY_ROOT / DEST_SAME / NOT_SAME_TEAM / IS_PARENT_COLL` 四种显式返回 | `TEAM_REQ_NOT_FOUND / TEAM_REQ_INVALID_TARGET_COLL_ID` 两种 |
+| 事务内"已被删除"分支 | 没处理；如果 collection 已被并发删除，`getCollection` 返回 `E.Left(NOT_FOUND)` 早返回 | `if (!request) return;` —— **静默空操作**，不视为失败 |
+| 死锁 / 唯一冲突重试 | **没有**，直接折成 `TEAM_COL_REORDERING_FAILED` | **没有**，直接折成 `TEAM_REQ_REORDERING_FAILED` |
+| 发布 Topic | 固定 `team_coll/${id}/coll_moved` | 由 `callerFunction` 决定：`req_moved` 或 `req_order_updated` |
+| Resolver 返回 | `TeamCollection` 对象 | `TeamRequest` 对象（`moveRequest`）或 `Boolean`（`updateLookUpRequestOrder`） |
+
+最重要的一点：**两者失败都不会自动重试**——只有 `updateCollectionOrder` / `updateRequestOrder` 那条路径（走 `updateOrderIndex` / `reorderRequests` 之外的专门实现）才会在 `deleteCollectionAndUpdateSiblingsOrderIndex` 里做 `MAX_RETRIES=5`。所以拖动（move）冲突时客户端看到的就是一个失败 toast，需要用户再拖一次。
+
+### 6.3 事务内"已被并发删除"的不同处理
+
+请求移动有一个很实用的细节（`team-request.service.ts:439-451`）：
+- 上锁后，再 `findUnique` 一次拿最新的 request/nextRequest；
+- 如果 request 已经不存在（比如被另一个人删了），**整个事务静默成功，不抛错，不发布任何订阅**。
+
+这避免了"我刚拖到一半被别人删了 → 事务抛错 → 客户端收到失败"这种噪声。`moveCollection` 没有同样的处理——如果集合被并发删除，`getCollection` 会返回 `TEAM_COLL_NOT_FOUND` 给上层，用户会看到失败。
+
+---
+
+## 7. 订阅解绑与状态清理
+
+### 7.1 客户端持有的资源
+
+`TeamCollectionsService`（`packages/hoppscotch-common/src/services/team-collection.service.ts:131-170`）里每个订阅都有两份引用：
+
+- **RxJS 订阅**：`teamCollectionAdded$ / Updated$ / Removed$ / Moved$ / OrderUpdated$` 等 11 个（加上 `teamRequest*` 共 20 个 `Subscription | null`），这些是对 urql 返回的流 `.subscribe(...)` 的产物。
+- **Wonka 订阅**：`teamCollectionAddedSub / UpdatedSub / ...` 共 11 个（`WSubscription | null`），来自 `runGQLSubscription` 的第二个返回值，`unsubscribe()` 会真正把 GQL Subscription 从 `SubscriptionClient` 上卸载。
+
+两种都要成对释放，否则：只关 RxJS 订阅会让 GQL Subscription 还在后台跑（服务器仍推），只关 Wonka 订阅会让 RxJS 侧出现永远收不到事件的悬挂流。
+
+### 7.2 触发清理的入口
+
+`changeTeamID(newTeamID)`（`:202-212`）：
+
+```ts
+public changeTeamID(newTeamID: string | null) {
+  this.teamID = newTeamID;
+  this.collections.value = [];         // 清空 vue ref
+  this.entityIDs.clear();              // 幂等 Set 清空
+  this.loadingCollections.value = [];  // 清空 loading 列表
+  this.unsubscribeSubscriptions();     // 关 22 个订阅
+  if (this.teamID) this.initialize();
+}
+```
+
+`clearCollections()`（`:217-223`）是登出 / 完全退出 team 时用的，比 `changeTeamID(null)` 多了一行 `this.teamID = null`（`changeTeamID` 也做了但写在参数里，`clearCollections` 显式强调）。两者都走同一个 `unsubscribeSubscriptions`。
+
+### 7.3 `unsubscribeSubscriptions` 的实现（`:229-255`）
+
+```ts
+unsubscribeSubscriptions() {
+  this.teamCollectionAdded$?.unsubscribe();
+  this.teamCollectionUpdated$?.unsubscribe();
+  this.teamCollectionRemoved$?.unsubscribe();
+  this.teamRequestAdded$?.unsubscribe();
+  this.teamRequestDeleted$?.unsubscribe();
+  this.teamRequestUpdated$?.unsubscribe();
+  this.teamRequestMoved$?.unsubscribe();
+  this.teamCollectionMoved$?.unsubscribe();
+  this.teamRequestOrderUpdated$?.unsubscribe();
+  this.teamCollectionOrderUpdated$?.unsubscribe();
+  this.teamRootCollectionSorted$?.unsubscribe();
+  this.teamChildCollectionSorted$?.unsubscribe();
+
+  this.teamCollectionAddedSub?.unsubscribe();
+  this.teamCollectionUpdatedSub?.unsubscribe();
+  this.teamCollectionRemovedSub?.unsubscribe();
+  this.teamRequestAddedSub?.unsubscribe();
+  this.teamRequestDeletedSub?.unsubscribe();
+  this.teamRequestUpdatedSub?.unsubscribe();
+  this.teamRequestMovedSub?.unsubscribe();
+  this.teamCollectionMovedSub?.unsubscribe();
+  this.teamRequestOrderUpdatedSub?.unsubscribe();
+  this.teamCollectionOrderUpdatedSub?.unsubscribe();
+  this.teamRootCollectionSortedSub?.unsubscribe();
+  this.teamChildCollectionSortedSub?.unsubscribe();
+}
+```
+
+注意：
+- 只负责"停掉订阅"，**不负责置回 null**。`changeTeamID` 之后立刻调 `initialize → registerSubscriptions` 会把这些字段覆盖赋值；如果没有调 `initialize`，字段还挂着旧的 `Subscription` 对象（已经 `unsubscribe` 过，变成 closed 状态），但不会影响后续新订阅。
+- 没有 `finalize`/`error` 回调。每个 `subscribe` 里都写了 `if (E.isLeft(result)) throw new Error(...)`——也就是说订阅收流到 `E.Left` 时会直接 throw，RxJS 会把这个错误上报到全局（`onError`），但**不会停止该订阅对应的 WebSocket 订阅**（Wonka 那边依然活着）。要处理这类错误必须 `unsubscribeSubscriptions` 手动关。
+- 清理后 `entityIDs` 也被 `.clear()`，保证下一次 `initialize` 后 `loadRootCollections` 可以把同一条 collection 重新加回来——如果忘了清，重新拉出来的集合会被 `addCollection` 的幂等判断直接跳过。
+
+### 7.4 客户端销毁链路
+
+整体链路是：
+1. 用户切换 team → `TeamCollectionsService.changeTeamID`；或用户登出 → `TeamCollectionsService.clearCollections`。
+2. `GQLClient.ts` 里 `platform.auth.onBackendGQLClientShouldReconnect` 收到登出事件 → `subscriptionClient.client.close()` → `initBackendGQLClient` 把 `subscriptionClient` 置 `null`。
+3. 但要注意：**这两个清理是并行的，没有同步关系**。`TeamCollectionsService.unsubscribeSubscriptions` 在 Wonka 侧调用 `unsubscribe()` 时，如果 `subscriptionClient` 已经被 close 了，Wonka 会得到一个 "Client is not connected" 错误被吞掉（看源码 Wonka 的 `SubscriptionClient` source 在 closed 状态下 `unsubscribe` 只是静默）。所以先后顺序无影响，但代码里没有 `try/catch` 保护，理论上极端时序下可能有 warning。
+
+---
+
+## 8. 离线恢复补偿的真实边界
+
+"离线恢复补偿"分三段：WebSocket 重连、期间事件补放、本地 pending 操作 replay。Hoppscotch 的"补偿"只做了第一段，后面两段都没有。下面把代码里能体现边界的细节列出来。
+
+### 8.1 `expandCollection` 的错误兜底（离线时仍能展开 UI 壳）
+
+`team-collection.service.ts:1030-1071`：
+
+```ts
+async expandCollection(collectionID, reFetch = false) {
+  if (this.loadingCollections.value.includes(collectionID)) return;   // ← 节流：正在展开就不重复
+
+  const tree = this.collections.value;
+  const collection = findCollInTree(tree, collectionID);
+  if (!collection) return;
+  if (collection.children !== null && !reFetch) return;              // ← 已展开过且不强制刷新就不再拉
+
+  this.loadingCollections.value.push(collectionID);
+  try {
+    const [collections, requests] = await Promise.all([
+      this.getCollectionChildren(collection),
+      this.getCollectionRequests(collection),
+    ]);
+    collection.children = collections;
+    collection.requests = requests;
+    collections.forEach(c => this.entityIDs.add(`collection-${c.id}`));
+    requests.forEach(r => this.entityIDs.add(`request-${r.id}`));
+    this.collections.value = [...tree];
+  } catch (error) {
+    console.error(`Error expanding collection ${collectionID}:`, error);
+    // 关键兜底：把 children / requests 设成 [] 而不是 null，
+    // 防止下次再点展开时陷入"永远失败→每次都重试"的无限循环
+    collection.children = [];
+    collection.requests = [];
+    this.collections.value = [...tree];
+  } finally {
+    this.loadingCollections.value = this.loadingCollections.value.filter(x => x !== collectionID);
+  }
+}
+```
+
+这段体现的补偿策略是：
+- **一旦某次展开失败，就把该 collection 标成"已展开但空"**，后续再调 `expandCollection` 时 `collection.children !== null` 直接 return，避免无限爆错。
+- 代价是用户需要切 team 回来或刷新页面才能重新展开——没有重试机制，也没有"重新加载"按钮。
+
+### 8.2 `loadingCollections` 作为同步标记
+
+`loadingCollections` 同时承担三个职责：
+1. UI 层显示 loading spinner（外部订阅 `loadingCollections$`）。
+2. 作为"我正在展开 collection X"的软锁——防止并发展开同个 collection（`:1031`）。
+3. 被 `waitForCollectionLoading(collectionID)`（`:1247-1251`）当作忙等待信号：
+
+```ts
+private async waitForCollectionLoading(collectionID: string) {
+  while (this.loadingCollections.value.includes(collectionID)) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+```
+
+这用在 `cascadeParentCollectionForPropertiesAsync` 里，级联查 path 上每个 collection 的继承属性时，如果某个 collection 还没展开就先等它展开完。**缺点是纯轮询**，超时没有上限，理论上网络挂死会一直等。
+
+### 8.3 `collectionLoadingWatcher`：loading 归零时刷继承属性
+
+`team-collection.service.ts:179-196`：
+
+```ts
+private collectionLoadingWatcher() {
+  watch(
+    () => this.loadingCollections.value.length,
+    (loadingCount) => {
+      if (loadingCount === 0 &&
+          this.pendingTeamCollectionPath.value &&
+          this.collections.value.length > 0) {
+        updateInheritedPropertiesForAffectedRequests(
+          this.pendingTeamCollectionPath.value,
+          'rest',
+        );
+        this.pendingTeamCollectionPath.value = null;
+      }
+    },
+  );
+}
+```
+
+这是"补偿"的另一种形式：当某个 collection 正在展开期间有人想算它的继承属性，不直接失败，而是把 path 存到 `pendingTeamCollectionPath`，等 `loadingCollections` 清空后自动重算。
+
+### 8.4 `loadRootCollections(replace=true)` 是唯一的全量补偿入口
+
+`team-collection.service.ts:302-372` 里 `replace=true` 时：
+```ts
+if (replace) {
+  this.collections.value = [];
+  this.entityIDs.clear();
+  totalCollections.push(...);
+} else {
+  totalCollections.push(...);
+}
+// ...
+this.collections.value.push(...totalCollections);
+```
+
+注意 **`replace=true` 只清了 root collections，不会清掉已展开的子 collection 的 `children/requests`**——但因为子 collection 是从父 collection 的 `children` 数组里引用的，父 collection 被整棵替换掉后子树自然就没了。`entityIDs.clear()` 保证下一次重新展开不会被幂等挡掉。
+
+### 8.5 订阅重连时不自动触发 `loadRootCollections(replace=true)`
+
+这是最明显的"没做补偿"的地方。`runGQLSubscription` 返回的流不会在 WebSocket 重连后补发任何东西；`registerSubscriptions` 里也没有订阅 `subscriptionClient.onReconnected` 然后重新 `loadRootCollections(true)`。实际效果是：
+- 断线期间别人做的改动在重连后**不会自动反映**；
+- 用户如果知道有这个问题，可以手动切换 team 或刷新；
+- 如果只靠 `subscriptionClient.reconnect:true`，UI 会表现成"数据停留在断网前最后一帧，直到自己再触发一条 mutation 才把那边的最新值推回来"。
+
+### 8.6 离线写：没有 replay，没有乐观更新队列
+
+所有写操作（`createTeamRequest` / `updateTeamRequest` / `moveRequest` / `moveCollection` / `updateRequestOrder` 等）都是直接 `runGQLQuery` 调 Mutation，失败就返回 `E.Left`。没有：
+- 本地 pending queue
+- `offline-first` 乐观更新
+- 上线后自动 replay
+- 基于 vector clock / version 的冲突合并
+
+离线读体验相对可接受——`collections.value` 已经是 vue ref 的完整内存树，断网后仍能翻树、选中请求、看详情；但断网期间任何写都会 toast 报错。
+
+### 8.7 边界清单
+
+| 场景 | 实际行为 | 代码位置 |
+| --- | --- | --- |
+| 拖动集合到一个它自己的子树里 | 返回 `TEAM_COLL_IS_PARENT_COLL` | `team-collection.service.ts:802-809` |
+| 拖动请求时源/目标集合已被别人删 | 事务内再查一次，静默空操作 | `team-request.service.ts:439-451` |
+| 拖动集合时集合已被别人删 | `getCollection` 返回 `TEAM_COLL_NOT_FOUND` 早返回 | `team-collection.service.ts:751-752` |
+| 同 team 内双向同时 move collection | 按 parentID 字典序上锁，防止死锁 | `team-collection.service.ts:813-845` |
+| 同 team 内双向同时 move request | 按 collectionID 列表上锁，不排序，可能死锁 | `team-request.service.ts:434-437` |
+| 死锁 / 唯一冲突 / 事务超时 | `move*` 直接失败，`updateOrderIndex*` 重试 5 次 | `team-collection.service.ts:560-616` |
+| 展开 collection 失败 | 标成空数组防无限重试，下次刷新才能再开 | `team-collection.service.ts:1057-1065` |
+| 级联继承属性计算时遇到未展开 collection | `waitForCollectionLoading` 轮询，无超时 | `team-collection.service.ts:1247-1251` |
+| WebSocket 重连后数据对齐 | 不自动拉全量，需手动切 team 或刷新 | `GQLClient.ts` + `TeamCollectionsService` |
+| 离线写 | 直接失败，无队列 | 所有 Mutation 调用处 |
+
+## 9. 现状的边界（重要）
 
 阅读代码时容易误判的几点：
 
