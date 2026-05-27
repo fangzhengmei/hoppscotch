@@ -163,7 +163,7 @@ dbTeamRequest = await this.prisma.$transaction(async (tx) => {
 this.pubsub.publish(`team_req/${teamRequest.teamID}/req_created`, teamRequest);
 ```
 
-`moveCollection` / `moveRequest` 用 `MAX_RETRIES = 5` 做死锁重试（`PrismaError.TRANSACTION_DEADLOCK / UNIQUE_CONSTRAINT_VIOLATION / TRANSACTION_TIMEOUT`），每次退避 `retryCount * 100ms`。这是"写时合并"的关键：多端同时拖同一个集合时，数据库的锁 + 重试保证最终有一个顺序，客户端用订阅到的结果对齐。
+死锁重试**仅存在于删除集合的场景**：`deleteCollectionAndUpdateSiblingsOrderIndex`（`team-collection.service.ts:555-616`）用 `MAX_RETRIES = 5` 对 `TRANSACTION_DEADLOCK / UNIQUE_CONSTRAINT_VIOLATION / TRANSACTION_TIMEOUT` 做退避重试，每次 `retryCount * 100ms`。**`moveCollection` / `moveRequest` / `updateCollectionOrder` / `updateLookUpRequestOrder` 都没有重试机制**，数据库的锁 + 行级顺序保证最终有一个结果，冲突时直接失败返回给用户，客户端靠订阅通知对齐最终状态。
 
 ### 2.2 客户端：幂等合并靠 entityIDs
 
@@ -190,7 +190,9 @@ private addRequest(request) {
 
 ### 2.3 客户端：远端改动落到本地树的策略
 
-针对不同事件类型，合并策略不一样（都在 `team-collection.service.ts`）：
+针对不同事件类型，合并策略不一样（都在 `team-collection.service.ts`）。注意**排序（order_updated）与移动（moved）是两个独立事件**：
+- `*_order_updated`：同集合/同父节点内改 orderIndex，不改变父节点，前端做数组 splice；
+- `*_moved`：跨集合/跨父节点移动，改变父节点，前端做"删了再加"。
 
 | 事件 | 处理方法 | 说明 |
 | --- | --- | --- |
@@ -200,10 +202,10 @@ private addRequest(request) {
 | `teamRequestAdded` | `addRequest(req)` | 若所在 collection 未展开则跳过 |
 | `teamRequestUpdated` | `updateRequest({id, collectionID, request, title})` | 只改已在树里的节点 |
 | `teamRequestDeleted` | `removeRequest(id)` | |
-| `teamRequestMoved` | `moveRequest(req)` → 先 `removeRequest` 再 `addRequest` 到新 collection | |
-| `teamRequestOrderUpdated` | `updateRequestOrder(src, dst, coll)` → 用 `reorderItems` 做本地 array splice | 只动客户端数组，不重新拉数据 |
-| `teamCollectionMoved` | `moveCollection(id, parentID, title, data)` → 先 remove 再按新 parent add | |
-| `teamCollectionOrderUpdated` | `updateCollectionOrder` | 同上，处理 root / child 两种情况 |
+| `teamRequestMoved` | `moveRequest(req)` → 先 `removeRequest` 再 `addRequest` 到新 collection | 跨集合移动时触发 |
+| `teamRequestOrderUpdated` | `updateRequestOrder(src, dst, coll)` → 用 `reorderItems` 做本地 array splice | 同集合内排序时触发，只动 orderIndex |
+| `teamCollectionMoved` | `moveCollection(id, parentID, title, data)` → 先 remove 再按新 parent add | 跨父节点移动时触发 |
+| `teamCollectionOrderUpdated` | `updateCollectionOrder` | 同父节点内排序时触发 |
 | `teamRootCollectionsSorted` | `loadRootCollections(true)` | 整段重拉，replace 模式 |
 | `teamChildCollectionsSorted` | `expandCollection(id, true)` | 强制 reFetch 子节点 |
 
@@ -263,7 +265,7 @@ Hoppscotch 选择了"最后写入者胜（last-write-wins）+ 不回滚本地"�
                                           │
                                      NestJS Resolver
                                           │
-                                     Prisma (行锁 + 事务 + 死锁重试)  ← 权威源
+                                     Prisma (行锁 + 事务 + 仅删除集合时有死锁重试)  ← 权威源
                                           │
                                      PubSubService.publish(`team_req/${id}/req_updated`, req)
                                           │
@@ -286,7 +288,7 @@ Hoppscotch 选择了"最后写入者胜（last-write-wins）+ 不回滚本地"�
 | TeamRequest 订阅 Resolver | `packages/hoppscotch-backend/src/team-request/team-request.resolver.ts` |
 | TeamRequest 写操作 + 行锁 + publish | `packages/hoppscotch-backend/src/team-request/team-request.service.ts` |
 | TeamCollection 订阅 Resolver | `packages/hoppscotch-backend/src/team-collection/team-collection.resolver.ts` |
-| TeamCollection 写操作 + 死锁重试 | `packages/hoppscotch-backend/src/team-collection/team-collection.service.ts` |
+| TeamCollection 写操作（仅删除集合有死锁重试） | `packages/hoppscotch-backend/src/team-collection/team-collection.service.ts` |
 | 前端 GQL 客户端、SubscriptionClient、reconnect、authExchange | `packages/hoppscotch-common/src/helpers/backend/GQLClient.ts` |
 | 业务层订阅注册、entityIDs 幂等、合并策略 | `packages/hoppscotch-common/src/services/team-collection.service.ts` |
 | 订阅的 .graphql 文档 | `packages/hoppscotch-common/src/helpers/backend/gql/subscriptions/` |
@@ -688,20 +690,26 @@ this.collections.value.push(...totalCollections);
 
 ## 9. 现状的边界（重要）
 
-阅读代码时容易误判的几点，统一口径如下：
+阅读代码时容易误判的几点，**与第 8 节分层结构一一对应**，统一口径如下：
 
-1. **没有操作队列，也没有 CRDT/OT**。任何"断网期间编辑，上线后自动合并"的想象都不成立。所有写操作都是同步 HTTP Mutation，失败即结束。
+### 传输层（第 8.1 节）
+- WebSocket 自动重连已实现，但仅保证连接不断，不保证数据不丢。
 
-2. **PubSub 是进程内的**。多实例部署时订阅事件不会跨节点广播，需替换成 RedisPubSub 或外部 broker 才能真正多活。
+### 客户端本地兜底（第 8.2 节）
+- **仅防崩溃、防死循环，不补数据**：`expandCollection` 失败标空、`loadingCollections` 防并发、`collectionLoadingWatcher` 延迟重算继承属性，这些都是防御性编程，不会把断线期间丢失的事件补回来。
 
-3. **`MAX_RETRIES = 5` 仅用于删除集合时的 orderIndex 重排**。`moveCollection` / `moveRequest` / `updateCollectionOrder` / `updateLookUpRequestOrder` 都没有重试机制，冲突时直接失败。
+### 业务层（第 8.3 节）
+- 全量重拉入口 `loadRootCollections(replace=true)` 已实现，但** WebSocket 重连后不会自动触发**，需手动切 team 或刷新。
+- **请求排序和请求移动复用同一套 Service 逻辑**：`updateLookUpRequestOrder` 走的是 `moveRequest` 内部实现，靠 `callerFunction` 参数分流发布不同的 Topic（`req_order_updated` vs `req_moved`）。
 
-4. **请求排序和请求移动复用同一套 Service 逻辑**。`updateLookUpRequestOrder` 走的是 `moveRequest` 内部实现，靠 `callerFunction` 参数分流发布不同的 Topic（`req_order_updated` vs `req_moved`）。
+### 写时冲突处理（第 2.1 节）
+- **`MAX_RETRIES = 5` 仅用于删除集合时的 orderIndex 重排**。`moveCollection` / `moveRequest` / `updateCollectionOrder` / `updateLookUpRequestOrder` 都没有重试机制，冲突时直接失败。
+- **"合并"只是幂等应用远端增量**，不处理本地未提交修改与远端修改的细粒度冲突；冲突时以后到者为准（last-write-wins）。
 
-5. **"合并"只是幂等应用远端增量**，不处理本地未提交修改与远端修改的细粒度冲突；冲突时以后到者为准（last-write-wins）。
+### 架构层
+- **没有操作队列，也没有 CRDT/OT**。任何"断网期间编辑，上线后自动合并"的想象都不成立。所有写操作都是同步 HTTP Mutation，失败即结束。
+- **PubSub 是进程内的**。多实例部署时订阅事件不会跨节点广播，需替换成 RedisPubSub 或外部 broker 才能真正多活。
+- **没有持久化的重放游标**，WebSocket 重连后不会自动补发离线期间的事件。
 
-6. **没有持久化的重放游标**，WebSocket 重连后需要手动拉全量（切 team 或刷新），目前没有自动触发逻辑。
-
-7. **客户端本地兜底只防崩溃不补数据**。`expandCollection` 失败标空、`collectionLoadingWatcher` 延迟重算继承属性，这些都是防御性编程，不会把丢失的事件补回来。
-
-8. `packages/hoppscotch-common/src/newstore/*Session.ts` 和 `helpers/realtime/*` 那几个文件是"前端作为 WebSocket/SSE/Socket.IO/MQTT 客户端去调试外部服务"的功能，**与团队协作无关**，别把它们当成同步通道。
+### 容易混淆的代码边界
+- `packages/hoppscotch-common/src/newstore/*Session.ts` 和 `helpers/realtime/*` 那几个文件是"前端作为 WebSocket/SSE/Socket.IO/MQTT 客户端去调试外部服务"的功能，**与团队协作无关**，别把它们当成同步通道。
