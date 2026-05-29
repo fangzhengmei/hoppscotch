@@ -229,8 +229,21 @@ persistence/index.ts → Store.set(namespace, key, value)
 
 #### 3.0.2 HOST_SCOPED_STORE_PATH 生成规则
 
-**核心代码**（`packages/hoppscotch-common/src/kernel/store.ts:27-30`）：
+**核心代码**（`packages/hoppscotch-common/src/kernel/store.ts:14-30`）：
 ```typescript
+// on desktop, org webviews share the same app:// origin as the main webview
+// (to keep Tauri IPC working). the org context is passed as a query param
+// (?org=test-org.hoppscotch.io) instead. we include it in the store path so
+// each org gets its own store file on disk, preserving per-org isolation for
+// auth tokens, settings, collections, etc.
+//
+// the org param is the raw host (e.g. "test-org.hoppscotch.io") so we
+// sanitize it the same way Tauri sanitizes window labels: replace all
+// non-alphanumeric chars with underscores. this produces the same filename
+// as the old per-hostname approach (test_org_hoppscotch_io.hoppscotch.store)
+// the ?org= query param is preserved across Vue Router navigations by
+// a beforeEach guard in modules/router.ts, and survives full-page reloads
+// because Tauri sets it on the initial webview URL
 const orgParam = new URLSearchParams(window.location.search).get("org")
 const HOST_SCOPED_STORE_PATH = orgParam
   ? `${orgParam.replace(/[^a-zA-Z0-9]/g, "_")}.hoppscotch.store`
@@ -238,21 +251,28 @@ const HOST_SCOPED_STORE_PATH = orgParam
 ```
 
 **生成规则**：
-1. 优先检查 URL 查询参数 `org`（如 `?org=acme-corp`）
+1. 优先检查 URL 查询参数 `org`（桌面端典型值如 `?org=test-org.hoppscotch.io`）
 2. 如果存在 `org` 参数：
-   - 清理非法字符（只保留字母和数字，其他替换为 `_`）
+   - **所有非字母数字字符**（包括点号、连字符、空格等）都替换为 `_`
    - 生成文件名：`{cleaned_org}.hoppscotch.store`
 3. 如果不存在 `org` 参数：
-   - 使用 `window.location.host` 作为文件名
-   - 生成文件名：`{host}.hoppscotch.store`
+   - 使用 `window.location.host`（包含端口号）
+   - 对 host 同样执行 `replace(/[^a-zA-Z0-9]/g, "_")` 清理
+   - 生成文件名：`{cleaned_host}.hoppscotch.store`
 
-**示例**：
-| URL | org 参数 | 生成的 STORE_PATH |
-|-----|---------|-------------------|
-| `https://hoppscotch.io` | 无 | `hoppscotch.io.hoppscotch.store` |
-| `https://hoppscotch.io?org=acme-corp` | `acme-corp` | `acme-corp.hoppscotch.store` |
-| `https://hoppscotch.io?org=Acme Corp!` | `Acme Corp!` | `Acme_Corp_.hoppscotch.store` |
-| `http://localhost:3000` | 无 | `localhost_3000.hoppscotch.store` |
+**真实场景示例**：
+| URL | org 参数 / host | 清理后 | 生成的 STORE_PATH |
+|-----|----------------|--------|-------------------|
+| `https://hoppscotch.io` | `hoppscotch.io` | `hoppscotch_io` | `hoppscotch_io.hoppscotch.store` |
+| `app://.?org=test-org.hoppscotch.io` | `test-org.hoppscotch.io` | `test_org_hoppscotch_io` | `test_org_hoppscotch_io.hoppscotch.store` |
+| `app://.?org=acme-corp.com` | `acme-corp.com` | `acme_corp_com` | `acme_corp_com.hoppscotch.store` |
+| `http://localhost:3000` | `localhost:3000` | `localhost_3000` | `localhost_3000.hoppscotch.store` |
+| `https://192.168.1.100:8080` | `192.168.1.100:8080` | `192_168_1_100_8080` | `192_168_1_100_8080.hoppscotch.store` |
+
+**关键点**：
+- `org` 参数是**完整主机名**格式，不是简单的组织名
+- 清理规则对 `org` 参数和 `host` 是**完全相同**的
+- 点号 `.`、连字符 `-`、冒号 `:` 等都会被替换为 `_`
 
 #### 3.0.3 多组织隔离机制
 
@@ -265,9 +285,9 @@ const HOST_SCOPED_STORE_PATH = orgParam
 
 **隔离方式**：
 1. **不同组织使用不同的物理存储文件**：
-   - 组织 A：`acme-corp.hoppscotch.store`
-   - 组织 B：`beta-corp.hoppscotch.store`
-   - 无组织：`hoppscotch.io.hoppscotch.store`
+   - 组织 A（test-org.hoppscotch.io）：`test_org_hoppscotch_io.hoppscotch.store`
+   - 组织 B（acme-corp.com）：`acme_corp_com.hoppscotch.store`
+   - 无组织（hoppscotch.io）：`hoppscotch_io.hoppscotch.store`
 
 2. **数据完全隔离**：
    - 每个组织的历史记录、环境变量、集合、设置等存储在独立文件中
@@ -501,9 +521,9 @@ async function getUserHistoryStatus() {
 ```
 
 **设置规则**：
-- 默认值：`false`（`index.ts:318`）
-- 未登录用户：`true`（`index.ts:133`）
-- 已登录用户：从后端 `getUserHistoryStore` 查询（`index.ts:139-148`）
+- 默认值：`false`（`platform/history/web/index.ts:318`）
+- 未登录用户：`true`（`platform/history/web/index.ts:133`）
+- 已登录用户：从后端 `getUserHistoryStore` 查询（`platform/history/web/index.ts:139-148`）
 
 ### 4.3 getUserHistoryStatus 与 loadHistoryEntries 的触发顺序与并发关系
 
@@ -557,7 +577,7 @@ T3: getUserHistoryStatus 后返回 → 设置 isHistoryStoreEnabled
   - ✅ UI 会正确显示 "History Disabled" 占位图（因为 `v-if="isHistoryStoreEnabled"`）
   - ⚠️ 内存中已经加载了历史记录数据（但不显示）
   - ⚠️ 本地持久化会自动保存这些数据
-  - ✅ 不会同步到后端（因为 `syncHistory` 会检查 `isHistoryStoreEnabled`）
+  - ✅ 不会同步到后端（因为 `addEntry` 在 sync definition 中会检查 `isHistoryStoreEnabled`）
 
 **场景2：用户登录时的竞态**
 
@@ -693,7 +713,7 @@ function setupUserHistoryStoreStatusChangedSubscription() {
 1. **`syncHistory`**（用户设置）：总开关，控制是否启用历史记录同步功能
 2. **`isHistoryStoreEnabled`**（隐私开关）：细粒度控制，只影响新增记录
 
-**同步机制核心**（`packages/hoppscotch-selfhost-web/src/lib/sync/index.ts:54-72`）：
+**同步机制核心**（`packages/hoppscotch-selfhost-web/src/lib/sync/index.ts:54-86`）：
 ```typescript
 function startStoreSync() {
   store.dispatches$.subscribe((actionParams) => {
@@ -728,7 +748,7 @@ function startStoreSync() {
 
 1. **addEntry（新增记录）**
    - 受两个开关双重控制：`syncHistory` 必须为 true 且 `isHistoryStoreEnabled` 必须为 true
-   - 代码位置：`sync.ts:29-32`（REST）、`sync.ts:65-68`（GraphQL）
+   - 代码位置：`platform/history/web/sync.ts:29-32`（REST）、`platform/history/web/sync.ts:65-68`（GraphQL）
    ```typescript
    async addEntry({ entry }) {
      if (!isHistoryStoreEnabled.value) {
@@ -741,7 +761,7 @@ function startStoreSync() {
 2. **deleteEntry（删除记录）**
    - 只受 `syncHistory` 控制
    - 只要记录有 `id`（说明曾经同步过），就会同步删除
-   - 代码位置：`sync.ts:47-51`（REST）、`sync.ts:83-87`（GraphQL）
+   - 代码位置：`platform/history/web/sync.ts:47-51`（REST）、`platform/history/web/sync.ts:83-87`（GraphQL）
    ```typescript
    deleteEntry({ entry }) {
      if (entry.id) {  // 只检查是否有 id，不检查 isHistoryStoreEnabled
@@ -753,7 +773,7 @@ function startStoreSync() {
 3. **toggleStar（收藏切换）**
    - 只受 `syncHistory` 控制
    - 只要记录有 `id`，就会同步收藏状态
-   - 代码位置：`sync.ts:52-56`（REST）、`sync.ts:88-92`（GraphQL）
+   - 代码位置：`platform/history/web/sync.ts:52-56`（REST）、`platform/history/web/sync.ts:88-92`（GraphQL）
    ```typescript
    toggleStar({ entry }) {
      if (entry.id) {  // 只检查是否有 id，不检查 isHistoryStoreEnabled
@@ -765,17 +785,29 @@ function startStoreSync() {
 4. **clearHistory（清空历史）**
    - 只受 `syncHistory` 控制
    - 总是同步到后端
-   - 代码位置：`sync.ts:57-59`（REST）、`sync.ts:93-95`（GraphQL）
+   - 代码位置：`platform/history/web/sync.ts:57-59`（REST）、`platform/history/web/sync.ts:93-95`（GraphQL）
    ```typescript
    clearHistory() {
      deleteAllUserHistory(ReqType.Rest)  // 不检查 isHistoryStoreEnabled
    }
    ```
 
+**Sync 层总开关检查**（`lib/sync/index.ts:80-86`）：
+```typescript
+if (
+  operationMapperFunction &&          // dispatcher 有对应的 sync handler
+  _isRunningDispatchWithoutSyncing &&  // 没被 runDispatchWithOutSyncing 包裹
+  shouldSyncValue()                    // settingsStore.value.syncHistory = true
+) {
+  operationMapperFunction(payload)
+}
+```
+
 **重要结论**：
 - `isHistoryStoreEnabled = false` 只**阻止新记录同步**，不影响已有记录的删除、收藏、清空操作
 - 这意味着即使关闭了隐私开关，之前同步过的记录仍然可以被删除和收藏
 - 清空操作也会同步到后端，删除云端所有历史记录
+- `syncHistory` 是**总开关**，关闭后所有同步操作都会停止，这是 `lib/sync/index.ts` 中统一检查的
 
 ### 4.7 UI 层对开关的响应
 
@@ -809,31 +841,34 @@ function startStoreSync() {
 │  │   ↓ clearHistoryActionEnabledCombined 检查                    │
 │  │   ↓ invokeAction("history.clear")                            │
 │  │                                                              │
-│  └─ 键盘快捷键 (actions.ts:89-97)                               │
+│  └─ 键盘快捷键 (helpers/actions.ts:275-281)                     │
 │      ↓ invokeAction("history.clear")                            │
 │                                                                 │
 │  [Action 系统]                                                  │
-│  ↓ boundActions["history.clear"] 遍历处理器                       │
+│  ↓ boundActions["history.clear"] 遍历处理器（数组 forEach）     │
 │  ↓ Personal.vue:371-373 处理器执行                               │
 │  ↓ confirmRemove.value = true                                   │
 │  ↓ 用户确认 → clearHistory()                                    │
 │                                                                 │
 │  [Store 层]                                                     │
-│  ↓ clearRESTHistory() (history.ts:291-295)                       │
+│  ↓ clearRESTHistory() (newstore/history.ts:291-295)             │
 │  ↓ restHistoryStore.dispatch({ dispatcher: "clearHistory" })    │
-│  ↓ DispatchingStore.dispatches$.next() (DispatchingStore.ts:76) │
+│  ↓ DispatchingStore.dispatches$.next() (DispatchingStore.ts:72-77) │
 │  ↓ DispatchingStore 内部处理 (DispatchingStore.ts:46-57)         │
-│     ├─ 调用 dispatcher 清空 state = [] (history.ts:157-161)     │
+│     ├─ 调用 dispatcher 清空 state = [] (newstore/history.ts:157-161) │
 │     └─ 更新 BehaviorSubject 状态                                │
 │                                                                 │
 │  [Sync 层]                                                      │
-│  ↓ sync.ts 监听 dispatches$ (sync/index.ts:54-72)               │
-│  ↓ shouldSyncValue() 检查 syncHistory                           │
-│  ↓ clearHistory() → deleteAllUserHistory() (sync.ts:57-59)      │
+│  ↓ lib/sync/index.ts 监听 dispatches$ (lib/sync/index.ts:54-71) │
+│  ↓ 三重条件检查 (lib/sync/index.ts:80-86)                       │
+│     ├─ operationMapperFunction 存在                             │
+│     ├─ _isRunningDispatchWithoutSyncing = true                  │
+│     └─ shouldSyncValue() = true (syncHistory)                   │
+│  ↓ clearHistory() → deleteAllUserHistory() (platform/history/web/sync.ts:57-59) │
 │  ↓ 同步到后端                                                   │
 │                                                                 │
 │  [Persistence 层]                                               │
-│  ↓ persistence 订阅 store 变化 (persistence/index.ts:53-62)     │
+│  ↓ persistence 订阅 store 变化 (services/persistence/index.ts:53-62) │
 │  ↓ 保存到本地存储                                               │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -842,7 +877,7 @@ function startStoreSync() {
 │                  绕过 UI（直接调用 Store）                       │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  代码直接调用 clearRESTHistory() (history.ts:291-295)           │
+│  代码直接调用 clearRESTHistory() (newstore/history.ts:291-295)           │
 │    ↓ 跳过所有 UI 检查                                           │
 │    ↓ 跳过 Action 系统                                           │
 │    ↓ 直接进入 Store 层 → 同上述流程                             │
@@ -855,21 +890,30 @@ function startStoreSync() {
 
 **Step 1: Action 系统实现**
 
-**核心代码**（`helpers/actions.ts:1-108`）：
+**核心代码**（`helpers/actions.ts:235-281`）：
 
 ```typescript
-// 定义处理器集合
-const boundActions: Partial<
-  Record<HoppAction, Set<(args: any, trigger?: InvocationTriggers) => void>>
-> = {}
+// 处理器存储结构（响应式对象，值为数组，不是 Set）
+type BoundActionList = {
+  [A in HoppAction]?: Array<ActionFunc<A>>
+}
 
-// 定义 Action 处理器（组件挂载时调用）
-export function defineActionHandler<A extends HoppAction>(
+const boundActions: BoundActionList = reactive({})
+
+export const activeActions$ = new BehaviorSubject<HoppAction[]>([])
+
+// 绑定 Action
+export function bindAction<A extends HoppAction>(
   action: A,
-  handler: (args: ArgOfHoppAction<A>, trigger?: InvocationTriggers) => void
+  handler: ActionFunc<A>
 ) {
-  if (!boundActions[action]) boundActions[action] = new Set()
-  boundActions[action]!.add(handler as any)
+  if (boundActions[action]) {
+    boundActions[action]?.push(handler)  // 数组 push，不是 Set.add
+  } else {
+    boundActions[action] = [handler] as any  // 初始化为数组
+  }
+
+  activeActions$.next(Object.keys(boundActions) as HoppAction[])
 }
 
 // 触发 Action
@@ -880,6 +924,50 @@ export const invokeAction: InvokeActionFunc = <A extends HoppAction>(
 ) => {
   boundActions[action]?.forEach((handler) => handler(args! as any, trigger))
 }
+
+// 解除绑定
+export function unbindAction<A extends HoppAction>(
+  action: A,
+  handler: ActionFunc<A>
+) {
+  boundActions[action] = boundActions[action]?.filter(
+    (x) => x !== handler
+  ) as any
+
+  if (boundActions[action]?.length === 0) {
+    delete boundActions[action]
+  }
+
+  activeActions$.next(Object.keys(boundActions) as HoppAction[])
+}
+
+// defineActionHandler 组合了 mount/unmount 生命周期
+export function defineActionHandler<A extends HoppAction>(
+  action: A,
+  handler: ActionFunc<A>,
+  isActive: Ref<boolean> | undefined = undefined
+) {
+  let mounted = false
+  let bound = false
+
+  onMounted(() => {
+    mounted = true
+    if (isActive === undefined || isActive.value === true) {
+      bound = true
+      bindAction(action, handler)  // 调用 bindAction，不是直接操作 boundActions
+    }
+  })
+
+  onBeforeUnmount(() => {
+    mounted = false
+    bound = false
+    unbindAction(action, handler)  // 调用 unbindAction
+  })
+
+  if (isActive) {
+    watch(isActive, (active) => { /* ... */ })
+  }
+}
 ```
 
 **绑定位置**（`components/history/Personal.vue:371-373`）：
@@ -888,6 +976,12 @@ defineActionHandler("history.clear", () => {
   confirmRemove.value = true  // 仅打开确认模态框，不直接清空
 })
 ```
+
+**关键事实**：
+- `boundActions` 是 `reactive({})`，值为**数组**（`Array<ActionFunc<A>>`），**不是 Set**
+- 绑定使用 `push()`，解绑使用 `filter()`，触发使用 `forEach()`
+- `defineActionHandler` 是一个组合函数，在 `onMounted` 时调用 `bindAction`，在 `onBeforeUnmount` 时调用 `unbindAction`
+- `activeActions$` 是 `BehaviorSubject`，用于广播当前可用的 action 列表
 
 **Step 2: Store dispatch 实现**
 
@@ -941,38 +1035,120 @@ clearHistory(_, {}) {
 
 **Step 3: Sync 层监听实现**
 
-**核心代码**（`platform/history/sync.ts:54-72`）：
+**核心类型**（`lib/sync/index.ts:11-19`）：
 ```typescript
-export function createHistorySyncHandlers<T extends HistoryEntry>(
-  ...
-): DispatchesSyncHandlers<any, any> {
+export type StoreSyncDefinitionOf<T extends DispatchingStore<any, any>> = {
+  [x in DispatchersOf<T>]?: T extends DispatchingStore<any, infer U>
+    ? U extends Record<x, any>
+      ? U[x] extends (x: any, y: infer Y) => any
+        ? (payload: Y) => void
+        : never
+      : never
+    : never
+}
+```
+
+**sync 定义**（`platform/history/web/sync.ts:26-60`）：
+```typescript
+export const restHistoryStoreSyncDefinition: StoreSyncDefinitionOf<
+  typeof restHistoryStore
+> = {
+  async addEntry({ entry }) {
+    if (!isHistoryStoreEnabled.value) {  // 只在 addEntry 检查隐私开关
+      return
+    }
+    const res = await createUserHistory(...)
+    // ...
+  },
+  deleteEntry({ entry }) {
+    if (entry.id) {
+      removeRequestFromHistory(entry.id)  // 不检查 isHistoryStoreEnabled
+    }
+  },
+  toggleStar({ entry }) {
+    if (entry.id) {
+      toggleHistoryStarStatus(entry.id)  // 不检查 isHistoryStoreEnabled
+    }
+  },
+  clearHistory() {
+    deleteAllUserHistory(ReqType.Rest)  // 不检查 isHistoryStoreEnabled
+  },
+}
+```
+
+**sync 初始化**（`lib/sync/index.ts:32-103`）：
+```typescript
+export const getSyncInitFunction = <T extends DispatchingStore<any, any>>(
+  store: T,
+  storeSyncDefinition: StoreSyncDefinitionOf<T>,
+  shouldSyncValue: () => boolean,           // () => settingsStore.value.syncHistory
+  shouldSyncObservable?: Observable<boolean>
+) => {
+  function startStoreSync() {
+    store.dispatches$.subscribe((actionParams) => {
+      if ((storeSyncDefinition as any)[actionParams.dispatcher]) {
+        const dispatcher = actionParams.dispatcher
+        const payload = actionParams.payload
+        const operationMapperFunction = (storeSyncDefinition as any)[dispatcher]
+
+        // 关键检查条件
+        if (
+          operationMapperFunction &&
+          _isRunningDispatchWithoutSyncing &&   // runDispatchWithOutSyncing 设为 false
+          shouldSyncValue()                     // syncHistory 总开关
+        ) {
+          operationMapperFunction(payload)
+        }
+      }
+    })
+  }
+
   return {
-    store: store as any,
-    syncCondition: syncHistory$,
-    dispatches: {
-      clearHistory() {
-        deleteAllUserHistory(reqType)  // 无条件调用 API
-      },
-      // ... 其他 dispatcher
-    },
+    startStoreSync,
+    setupSubscriptions,
+    startListeningToSubscriptions,
+    stopListeningToSubscriptions,
   }
 }
 ```
 
-**sync 注册**（`platform/history/index.ts:54-72`）：
+**sync 注册**（`platform/history/web/sync.ts:98-110`）：
 ```typescript
-export function initHistorySync() {
-  createSyncForStore(
-    createHistorySyncHandlers(
-      restHistoryStore,
-      ReqType.Rest,
-      syncHistory$,
-      toRaw
-    ),
-    // ... GraphQL handlers
-  )
+export const restHistorySyncer = getSyncInitFunction(
+  restHistoryStore,
+  restHistoryStoreSyncDefinition,
+  () => settingsStore.value.syncHistory,  // shouldSyncValue
+  getSettingSubject("syncHistory")        // shouldSyncObservable
+)
+
+export const gqlHistorySyncer = getSyncInitFunction(
+  graphqlHistoryStore,
+  gqlHistoryStoreSyncDefinition,
+  () => settingsStore.value.syncHistory,
+  getSettingSubject("syncHistory")
+)
+```
+
+**sync 启动**（`platform/history/web/index.ts:42-70`）：
+```typescript
+function initHistorySync() {
+  restHistorySyncer.startStoreSync()
+  restHistorySyncer.setupSubscriptions(setupSubscriptions)
+
+  gqlHistorySyncer.startStoreSync()
+  // ...
 }
 ```
+
+**关键事实**：
+- 没有 `createHistorySyncHandlers`、`DispatchesSyncHandlers`、`createSyncForStore` 这些函数/类型
+- 实际使用的是 `getSyncInitFunction` 和 `StoreSyncDefinitionOf`
+- Sync 层有三个检查条件：
+  1. `operationMapperFunction` 存在（dispatcher 有对应的 sync handler）
+  2. `_isRunningDispatchWithoutSyncing` 为 `true`（没被 `runDispatchWithOutSyncing` 包裹）
+  3. `shouldSyncValue()` 返回 `true`（`settingsStore.value.syncHistory` 为 `true`）
+- `clearHistory` 在 sync definition 中**不检查** `isHistoryStoreEnabled`
+- `addEntry` 在 sync definition 中**会检查** `isHistoryStoreEnabled`
 
 **Step 4: Persistence 层实现**
 
@@ -994,10 +1170,11 @@ restHistory$.subscribe(async (entries) => {
 | `isFetchingHistoryStoreStatus` 检查 | ✅ 是 | ❌ 否 | `Personal.vue:55` |
 | 用户确认模态框 | ✅ 是 | ❌ 否 | `Personal.vue:305-328` |
 | `activeActions$` 检查（Spotlight） | ✅ 是 | ❌ 否 | `history.searcher.ts:63` |
-| `syncHistory` 检查（同步层） | ✅ 是 | ✅ 是 | `sync/index.ts:64-67` |
-| 内存状态清空 | ✅ 是 | ✅ 是 | `history.ts:157-161` |
-| 本地持久化更新 | ✅ 是 | ✅ 是 | `persistence/index.ts:53-62` |
-| 同步到后端（syncHistory=true） | ✅ 是 | ✅ 是 | `sync.ts:57-59` |
+| `syncHistory` 检查（同步层） | ✅ 是 | ✅ 是 | `lib/sync/index.ts:80-86` |
+| `_isRunningDispatchWithoutSyncing` 检查 | ✅ 是 | ✅ 是 | `lib/sync/index.ts:82` |
+| 内存状态清空 | ✅ 是 | ✅ 是 | `newstore/history.ts:157-161` |
+| 本地持久化更新 | ✅ 是 | ✅ 是 | `services/persistence/index.ts:53-62` |
+| 同步到后端（syncHistory=true） | ✅ 是 | ✅ 是 | `platform/history/web/sync.ts:57-59` |
 
 **差异分析**：
 
@@ -1006,9 +1183,10 @@ restHistory$.subscribe(async (entries) => {
    - 包括：空记录检查、开关状态检查、加载状态检查、用户确认
 
 2. **Sync 层检查仍然有效**：
-   - `syncHistory$` 的检查在 Sync 层执行，不受调用路径影响
+   - `shouldSyncValue()`（即 `settingsStore.value.syncHistory`）的检查在 Sync 层执行，不受调用路径影响
+   - `_isRunningDispatchWithoutSyncing` 检查也在 Sync 层执行，用于防止同步循环
    - 如果 `syncHistory = false`，无论通过什么路径调用都不会同步到后端
-   - 代码位置：`sync/index.ts:64-67`（`shouldSyncValue()` 检查）
+   - 代码位置：`lib/sync/index.ts:80-86`
 
 3. **数据层操作完全一致**：
    - 内存状态清空、本地持久化更新、后端同步（如果 syncHistory=true）的行为完全相同
@@ -1034,6 +1212,18 @@ restHistory$.subscribe(async (entries) => {
 3. **syncHistory 是唯一的跨层保护**：
    - `syncHistory = false` 时，无论通过什么路径调用都不会同步到后端
    - 这是设计中唯一有效的跨层控制机制
+   - 注意：`isHistoryStoreEnabled` 只在 `addEntry` 中检查，`clearHistory` 不检查
+
+4. **Sync 层有三个检查条件**：
+   ```typescript
+   if (
+     operationMapperFunction &&          // dispatcher 有对应的 sync handler
+     _isRunningDispatchWithoutSyncing &&  // 没被 runDispatchWithOutSyncing 包裹
+     shouldSyncValue()                    // settingsStore.value.syncHistory = true
+   ) {
+     operationMapperFunction(payload)
+   }
+   ```
 
 ---
 
@@ -1079,7 +1269,7 @@ confirmRemove.value = true
     ↓
 clearHistory() → clearRESTHistory() / clearGraphqlHistory()
     ↓
-sync.ts clearHistory() → deleteAllUserHistory() [同步到后端]
+platform/history/web/sync.ts clearHistory() → deleteAllUserHistory() [同步到后端]
 ```
 
 **按钮禁用条件**（`Personal.vue:53-57`）：
@@ -1091,7 +1281,7 @@ sync.ts clearHistory() → deleteAllUserHistory() [同步到后端]
 "
 ```
 
-**路径2：Spotlight 搜索**（`history.searcher.ts:101-118, 246-247`）
+**路径2：Spotlight 搜索**（`services/spotlight/searchers/history.searcher.ts:101-118, 246-247`）
 ```
 用户搜索 "clear" 或 "history"
     ↓
@@ -1126,23 +1316,29 @@ confirmRemove.value = true → 后续同路径1
 | 页面按钮禁用 | ✅ 是（`!isHistoryStoreEnabled`） | ❌ 否 | `Personal.vue:53-57` |
 | Spotlight 选项显示 | ✅ 是（`clearHistoryActionEnabledCombined`） | ❌ 否 | `history.searcher.ts:62-65` |
 | 动作触发（action handler） | ❌ 否（仅打开模态框） | ❌ 否 | `Personal.vue:371-373` |
-| 内存清空（Store） | ❌ 否（直接清空 state） | ❌ 否 | `history.ts:157-161` |
-| 同步到后端（sync.ts） | ❌ 否（直接调用 API） | ✅ 是（`shouldSyncValue()`） | `sync.ts:57-59, index.ts:54-72` |
-| 同步到后端（API 调用） | ❌ 否（直接调用 deleteAllUserHistory） | ❌ 否 | `sync.ts:57-59` |
+| 内存清空（Store） | ❌ 否（直接清空 state） | ❌ 否 | `newstore/history.ts:157-161` |
+| Sync 层总开关 | ❌ 否 | ✅ 是（`shouldSyncValue()`） | `lib/sync/index.ts:80-86` |
+| sync definition 中的 clearHistory | ❌ 否（直接调用 API） | ❌ 否 | `platform/history/web/sync.ts:57-59` |
+| sync definition 中的 addEntry | ✅ 是（先检查再调用） | ❌ 否 | `platform/history/web/sync.ts:30-32` |
 
 **代码级结论：存在行为边界不一致**
 
 **不一致点1：UI 层与同步层的控制不一致**
 - UI 层（按钮/Spotlight）：`isHistoryStoreEnabled = false` 时，用户**无法触发**清空操作
-- 同步层（sync.ts）：`isHistoryStoreEnabled = false` 时，如果清空操作被触发，**仍然会同步**到后端
-- 风险：如果绕过 UI 直接调用 `clearRESTHistory()`，即使开关关闭也会同步清空后端数据
+- 同步层（sync definition）：`isHistoryStoreEnabled = false` 时，如果清空操作被触发，**仍然会同步**到后端（因为 `clearHistory` 不检查该开关）
+- 风险：如果绕过 UI 直接调用 `clearRESTHistory()`，即使隐私开关关闭也会同步清空后端数据
 
 **不一致点2：syncHistory 与 isHistoryStoreEnabled 的职责交叉**
-- `syncHistory = false` 时：不会触发任何同步（包括清空）
-- `isHistoryStoreEnabled = false` 时：UI 禁用，但同步层不检查
+- `syncHistory = false` 时：不会触发任何同步（包括清空），这是 Sync 层的总开关
+- `isHistoryStoreEnabled = false` 时：UI 禁用，但同步层 `clearHistory` 不检查
 - 风险：两个开关的控制逻辑不统一，容易造成理解混淆
 
-**不一致点3：直接 Store 操作无任何检查**
+**不一致点3：不同 dispatcher 的检查不一致**
+- `addEntry`：在 sync definition 中检查 `isHistoryStoreEnabled`
+- `deleteEntry`、`toggleStar`、`clearHistory`：在 sync definition 中**不检查** `isHistoryStoreEnabled`
+- 设计意图：`isHistoryStoreEnabled` 只控制**新增**记录的同步，不影响已有记录的操作
+
+**不一致点4：直接 Store 操作无任何检查**
 - `clearRESTHistory()`、`clearGraphqlHistory()` 本身不检查任何开关
 - 只要调用就会清空内存和本地存储
 - 风险：其他模块调用这些函数时，可能绕过所有控制逻辑
@@ -1226,7 +1422,7 @@ function setupUserHistoryAllDeletedSubscription() {
 
 ### 5.6 Store 清空实现
 
-**核心代码**：`history.ts:157-161, 219-224`
+**核心代码**：`newstore/history.ts:157-161, 219-224`
 
 ```typescript
 // REST
@@ -1246,7 +1442,7 @@ clearHistory(_, {}) {
 
 ### 5.7 登出行为
 
-**核心代码**：`index.ts:61-69`
+**核心代码**：`platform/history/web/index.ts:61-69`
 
 ```typescript
 authEvents$.subscribe((event) => {
@@ -1269,7 +1465,7 @@ authEvents$.subscribe((event) => {
 
 ### 6.1 同步配置
 
-**核心文件**：`sync.ts:98-110`
+**核心文件**：`platform/history/web/sync.ts:98-110`
 
 ```typescript
 export const restHistorySyncer = getSyncInitFunction(
@@ -1291,17 +1487,20 @@ export const restHistorySyncer = getSyncInitFunction(
     ↓
 executedResponses$ 事件 (REST) / addQueryToHistory (GQL)
     ↓
-写入内存 Store (history.ts)
-    ├─→ 本地持久化 (persistence/index.ts) → Store.set()
-    └─→ 云端同步 (sync.ts)
-          ├─ 检查 syncHistory 设置
+写入内存 Store (newstore/history.ts)
+    ├─→ 本地持久化 (services/persistence/index.ts) → Store.set()
+    └─→ 云端同步 (platform/history/web/sync.ts)
+          ├─ Sync 层总检查 (lib/sync/index.ts:80-86)
+          │   ├─ 检查 dispatcher 有对应的 sync handler
+          │   ├─ 检查 _isRunningDispatchWithoutSyncing = true
+          │   └─ 检查 shouldSyncValue() = true (syncHistory 总开关)
           ├─ 检查 isHistoryStoreEnabled 开关（仅 addEntry）
           └─ 调用 createUserHistory API
 ```
 
 ### 6.3 避免重复插入
 
-**核心代码**：`sync.ts:40-45, 76-81`
+**核心代码**：`platform/history/web/sync.ts:40-45, 76-81`
 
 ```typescript
 if (E.isRight(res)) {
@@ -1328,8 +1527,8 @@ if (E.isRight(res)) {
 | GraphQL 响应时间 Bug | `packages/hoppscotch-common/src/helpers/graphql/connection.ts` | 477-488 |
 | 隐私开关实现 | `packages/hoppscotch-selfhost-web/src/platform/history/web/index.ts` | 129-151, 318 |
 | 开关作用范围 | `packages/hoppscotch-selfhost-web/src/platform/history/web/sync.ts` | 29-95 |
-| 同步机制 | `packages/hoppscotch-selfhost-web/src/lib/sync/index.ts` | 54-72 |
-| 实时更新订阅 | `packages/hoppscotch-selfhost-web/src/platform/history/web/index.ts` | 286-300 |
+| 同步机制 | `packages/hoppscotch-selfhost-web/src/lib/sync/index.ts` | 32-103 |
+| 实时更新订阅 | `packages/hoppscotch-selfhost-web/src/platform/history/web/index.ts` | 318-332 |
 | 手动清理 | `packages/hoppscotch-common/src/components/history/Personal.vue` | 312-316 |
 | 后端批量删除 | `packages/hoppscotch-selfhost-web/src/platform/history/web/index.ts` | 269-284 |
 | 后端全部删除 | `packages/hoppscotch-selfhost-web/src/platform/history/web/index.ts` | 302-316 |
@@ -1337,10 +1536,12 @@ if (E.isRight(res)) {
 | UI 响应 | `packages/hoppscotch-common/src/components/history/Personal.vue` | 53-57, 66, 119 |
 | Web 端存储 | `packages/hoppscotch-kernel/src/store/impl/web/v/1.ts` | 39-88 |
 | 桌面端存储 | `packages/hoppscotch-kernel/src/store/impl/desktop/v/1.ts` | 87-95, 216-226 |
-| Store 路径 | `packages/hoppscotch-selfhost-web/src/kernel/store.ts` | 11, 74-92 |
-| 历史记录初始化 | `packages/hoppscotch-selfhost-web/src/platform/history/web/index.ts` | 42-59 |
+| Store 路径 | `packages/hoppscotch-common/src/kernel/store.ts` | 14-30 |
+| 历史记录初始化 | `packages/hoppscotch-selfhost-web/src/platform/history/web/index.ts` | 42-70 |
 | 历史记录加载 | `packages/hoppscotch-selfhost-web/src/platform/history/web/index.ts` | 97-127 |
 | 清空动作注册 | `packages/hoppscotch-common/src/components/history/Personal.vue` | 371-373 |
+| Action 系统 | `packages/hoppscotch-common/src/helpers/actions.ts` | 235-361 |
+| Sync 定义 | `packages/hoppscotch-selfhost-web/src/platform/history/web/sync.ts` | 26-110 |
 | Spotlight 搜索器 | `packages/hoppscotch-common/src/services/spotlight/searchers/history.searcher.ts` | 44-66, 101-118 |
 
 ---
@@ -1348,11 +1549,14 @@ if (E.isRight(res)) {
 ## 八、架构设计特点
 
 1. **分层清晰**：内存 Store、本地持久化、云端同步三层分离，职责明确
-2. **隐私分级**：`isHistoryStoreEnabled` 只控制云端同步，本地持久化始终可用
-3. **响应式设计**：通过 RxJS 流和 Vue 响应式系统实现数据自动同步
+2. **隐私分级**：`isHistoryStoreEnabled` 只控制新增记录的云端同步，本地持久化始终可用；`syncHistory` 是总开关，控制所有同步
+3. **响应式设计**：通过 RxJS 流（`dispatches$`、`restHistory$` 等）和 Vue 响应式系统（`reactive`、`computed`）实现数据自动同步
 4. **容错机制**：Schema 验证失败时自动备份，数据迁移支持多版本
 5. **实时同步**：通过 GraphQL 订阅实现后端状态实时更新到前端
 6. **跨平台兼容**：抽象的 Store 接口，Web 端用 localStorage，桌面端用 Tauri Store
+7. **多组织隔离**：通过 `HOST_SCOPED_STORE_PATH` 实现不同组织的数据物理隔离
+8. **Sync 层统一检查**：`lib/sync/index.ts` 中的 `getSyncInitFunction` 提供统一的三个检查条件，避免重复代码
+9. **Action 系统解耦**：通过 `defineActionHandler` 和 `invokeAction` 实现组件间的解耦通信，支持键盘快捷键、Spotlight 等多种触发方式
 
 ---
 
@@ -1391,21 +1595,25 @@ if (E.isRight(res)) {
 
 ### 9.2 功能设计注意事项
 
-1. **多组织数据隔离**：不同组织（通过 URL `org` 参数区分）的历史记录存储在独立的 Store 文件中，完全隔离，互不干扰
-2. **HOST_SCOPED_STORE_PATH 生成规则**：优先使用 `org` 参数（清理非法字符），否则使用 `window.location.host`，作为存储文件名
+1. **多组织数据隔离**：不同组织（通过 URL `org` 参数区分，值为完整主机名如 `test-org.hoppscotch.io`）的历史记录存储在独立的 Store 文件中，完全隔离，互不干扰
+2. **HOST_SCOPED_STORE_PATH 生成规则**：优先使用 `org` 参数（**所有非字母数字字符**包括点号、连字符、冒号等都替换为 `_`），否则使用 `window.location.host`（同样清理），作为存储文件名
 3. **隐私开关不影响本地存储**：即使 `isHistoryStoreEnabled = false`，历史记录仍会保存在浏览器/本地存储中
 4. **登出不清除本地数据**：用户登出后，本地历史记录仍然保留，需要手动清除
 5. **历史记录上限**：内存中最多保留 50 条记录（`HISTORY_LIMIT = 50`）
 6. **数据迁移**：本地存储支持数据格式迁移，从旧版本自动升级到新版本
 7. **4xx/5xx 响应进入历史记录**：HTTP 错误响应只要响应体格式正确就会进入历史记录
 8. **网络失败不进入历史记录**：`network_fail`、`script_fail` 等类型不会进入历史记录
-9. **隐私开关关闭时已有记录仍可操作**：关闭 `isHistoryStoreEnabled` 后，之前同步的记录仍然可以删除、收藏、清空
+9. **隐私开关关闭时已有记录仍可操作**：关闭 `isHistoryStoreEnabled` 后，之前同步的记录仍然可以删除、收藏、清空（因为这些操作在 sync definition 中不检查该开关）
 10. **loadHistoryEntries 不检查开关状态**：无论 `isHistoryStoreEnabled` 是什么状态，只要 API 返回成功就会覆盖内存中的历史记录
 11. **loadHistoryEntries 失败时静默处理**：网络错误、GraphQL 错误、JSON 解析失败等情况不会提示用户，也不会设置错误状态，历史记录保持原样
 12. **clearRESTHistory 不检查开关状态**：直接调用会清空内存和本地存储
-13. **syncHistory 是唯一的跨层保护**：`syncHistory = false` 时，无论通过什么路径调用都不会同步到后端
-14. **直接调用 Store 函数会绕过 UI 控制**：`clearRESTHistory()`、`clearGraphqlHistory()` 是公开导出的函数，没有任何参数检查或状态校验
-15. **历史记录存储在组织级 Store 中**：与 `UnifiedStore`（全局级）不同，历史记录按组织隔离，切换组织后历史记录自动隔离
+13. **Sync 层有三个检查条件**：同步操作需要同时满足：① dispatcher 有对应的 sync handler；② 没被 `runDispatchWithOutSyncing` 包裹；③ `settingsStore.value.syncHistory = true`
+14. **syncHistory 是唯一的跨层保护**：`syncHistory = false` 时，无论通过什么路径调用都不会同步到后端，这是 `lib/sync/index.ts` 中统一检查的
+15. **isHistoryStoreEnabled 只在 addEntry 中检查**：`addEntry` 会先检查 `isHistoryStoreEnabled`，但 `deleteEntry`、`toggleStar`、`clearHistory` 都不检查
+16. **boundActions 是响应式对象，值为数组**：不是 Set，绑定用 `push()`，解绑用 `filter()`，触发用 `forEach()`
+17. **直接调用 Store 函数会绕过 UI 控制**：`clearRESTHistory()`、`clearGraphqlHistory()` 是公开导出的函数，没有任何参数检查或状态校验
+18. **历史记录存储在组织级 Store 中**：与 `UnifiedStore`（全局级）不同，历史记录按组织隔离，切换组织后历史记录自动隔离
+19. **没有 `createHistorySyncHandlers`、`DispatchesSyncHandlers`、`createSyncForStore`**：实际使用的是 `getSyncInitFunction` 和 `StoreSyncDefinitionOf`
 
 ### 9.3 跨平台差异
 
