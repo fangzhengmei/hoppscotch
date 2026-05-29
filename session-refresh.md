@@ -18,10 +18,10 @@ Hoppscotch 自托管版本采用 **双 Token 机制**（Access Token + Refresh T
 
 ```typescript
 export type AuthEvent =
-  | { event: "probable_login"; user: HoppUser }  // 有历史登录态，等待确认
-  | { event: "login"; user: HoppUser }            // 已认证
-  | { event: "logout" }                           // 未认证且无历史状态
-  | { event: "token_refresh"; user: HoppUser }    // Token 已刷新
+  | { event: "probable_login"; user: HoppUser }
+  | { event: "login"; user: HoppUser }
+  | { event: "logout" }
+  | { event: "token_refresh"; user: HoppUser }
 ```
 
 通用层定义 `token_refresh` **携带 `user` 字段**。这是为 Firebase 等能在刷新时立即拿到用户信息的平台设计的。
@@ -31,14 +31,13 @@ export type AuthEvent =
 **文件**: `packages/hoppscotch-selfhost-web/src/platform/auth/web/index.ts:16`
 
 ```typescript
-// 注意类型 widening：AuthEvent | { event: "token_refresh" }
 export const authEvents$ = new Subject<AuthEvent | { event: "token_refresh" }>()
 ```
 
 实际发射时（`web/index.ts:164-166`）：
 
 ```typescript
-authEvents$.next({ event: "token_refresh" })  // 无 user 字段！
+authEvents$.next({ event: "token_refresh" })  // 无 user 字段
 ```
 
 **关键差异**：自托管 Web 平台发射的 `token_refresh` **不携带 `user` 字段**。
@@ -53,7 +52,7 @@ authEvents$.next({ event: "token_refresh" })  // 无 user 字段！
 export type AuthEvent =
   | { event: 'login'; user: HoppUser }
   | { event: 'logout' }
-  | { event: 'token_refresh' }   // 也不带 user
+  | { event: 'token_refresh' }
 ```
 
 Admin 后台干脆在本地类型中移除了 `probable_login` 和 `token_refresh` 的 `user` 字段。
@@ -63,13 +62,12 @@ Admin 后台干脆在本地类型中移除了 `probable_login` 和 `token_refres
 | 事件 | 通用层 AuthEvent | 自托管 Web 实际发射 | Admin 实际发射 |
 |------|-----------------|-------------------|---------------|
 | `probable_login` | `{ event, user }` | **从未发射** | **不存在** |
-| `login` | `{ event, user }` | `{ event, user }` ✅ | `{ event, user }` ✅ |
-| `logout` | `{ event }` | `{ event }` ✅ | `{ event }` ✅ |
-| `token_refresh` | `{ event, user }` | `{ event }` ❌无 user | `{ event }` ❌无 user |
+| `login` | `{ event, user }` | `{ event, user }` | `{ event, user }` |
+| `logout` | `{ event }` | `{ event }` | `{ event }` |
+| `token_refresh` | `{ event, user }` | `{ event }` 无 user | `{ event }` 无 user |
 
 > **结论**：通用层的 `AuthEvent.token_refresh.user` 在自托管场景下永远不会被填充。
-> `probable_login` 事件在自托管 Web 中也从未被发射（初始化时直接设置 `probableUser$`，
-> 而非通过事件通知）。
+> `probable_login` 事件在自托管 Web 中也从未被发射。
 
 ---
 
@@ -88,19 +86,6 @@ GQL 请求 → GqlAuthGuard(使用 jwt Strategy)
                 │
                 └─ JWT 有效但用户不存在
                     → UnauthorizedException("user/not_found")
-```
-
-**文件**: `packages/hoppscotch-backend/src/auth/strategies/jwt.strategy.ts:64-73`
-
-```typescript
-const extractToken = (request: Request): E.Either<Error, string> =>
-  pipe(
-    extractFromCookie(request),        // 先从 Cookie 取 access_token
-    O.alt(() => extractFromAuthHeaders(request)),  // 再从 Authorization header 取
-    E.fromOption(() => {
-      return new ForbiddenException(COOKIES_NOT_FOUND);  // 两个都没有 → "auth/cookies_not_found"
-    }),
-  );
 ```
 
 ### 3.2 前端 setInitialUser() 中的分支映射
@@ -122,22 +107,15 @@ const extractToken = (request: Request): E.Either<Error, string> =>
 didAuthError(error) {
   return error.graphQLErrors.some(
     (e) =>
-      e.message.includes("auth/fail") ||        // 后端 AUTH_FAIL 常量
-      e.message.includes("jwt expired") ||       // JWT 过期
-      e.extensions?.code === "UNAUTHENTICATED"   // Apollo 错误码
+      e.message.includes("auth/fail") ||
+      e.message.includes("jwt expired") ||
+      e.extensions?.code === "UNAUTHENTICATED"
   )
 }
 ```
 
-| 错误模式 | 来源场景 |
-|---------|---------|
-| `"auth/fail"` | 后端 `errors.ts:25` 中的 `AUTH_FAIL` 常量 |
-| `"jwt expired"` | Passport-JWT 在 Token 过期时抛出 |
-| `"UNAUTHENTICATED"` | GraphQL 扩展错误码 |
-
 > **注意**：`setInitialUser()` 和 `didAuthError()` 使用了**不同的错误识别策略**。
 > 初始化时通过 GQL `errors[0].message` 精确匹配，运行时通过字符串包含判断。
-> 初始化时不识别 `"auth/fail"`，运行时不识别 `"auth/cookies_not_found"`。
 
 ---
 
@@ -150,16 +128,13 @@ didAuthError(error) {
 ```typescript
 waitProbableLoginToConfirm() {
   return new Promise<void>((resolve, reject) => {
-    // 检查点 1：currentUser$ 已有值 → 立即放行
     if (this.getCurrentUser()) {
-      resolve()
+      resolve()              // 检查点 1
     }
 
-    // 检查点 2：probableUser$ 为空 → 立即拒绝
-    if (!probableUser$.value) reject(new Error("no_probable_user"))
+    if (!probableUser$.value) reject(new Error("no_probable_user"))  // 检查点 2
 
-    // 检查点 3：监听 isGettingInitialUser 的变化
-    const unwatch = watch(isGettingInitialUser, (val) => {
+    const unwatch = watch(isGettingInitialUser, (val) => {           // 检查点 3
       if (val === true || val === false) {
         resolve()
         unwatch()
@@ -169,43 +144,54 @@ waitProbableLoginToConfirm() {
 },
 ```
 
-### 4.2 放行条件的三态分析
+### 4.2 放行条件的精确语义
 
-`isGettingInitialUser` 是一个 `Ref<null | boolean>`，有三种状态：
+**关键纠正**：`val === true` 时 resolve 并不意味着"认证已确认"。
+`true` 表示初始化仍在进行中，`currentUser$` 必然为 null。
 
-| 状态 | 含义 | watch 触发？ | Promise 结果 |
-|------|------|------------|------------|
-| `null` | 初始状态，尚未开始获取 | 否 | 等待 |
-| `true` | 正在获取用户信息中 | 是 | resolve |
-| `false` | 获取完成（无论成功或失败） | 是 | resolve |
+| `isGettingInitialUser` 值 | 含义 | `currentUser$` 可能值 | resolve 后效果 |
+|--------------------------|------|---------------------|--------------|
+| `null` | 初始化尚未开始 | null | 不触发 watch |
+| `true` | 初始化进行中 | **必定 null** | resolve 但 `willAuthError()` 返回 true |
+| `false` | 初始化已完成 | HoppUser 或 null | resolve，状态已确定 |
 
-**关键发现**：`watch` 的触发条件是 `val === true || val === false`，
-这意味着：
-- 从 `null` → `true` 会触发 `resolve`
-- 从 `true` → `true` **不会触发**（值未变）
-- 从 `true` → `false` 会触发 `resolve`
+**`true` 放行的实际后果**：
 
-### 4.3 三个检查点的优先级
+当 `authExchange` 初始化时调用 `waitProbableLoginToConfirm()`，
+如果在 `isGettingInitialUser = true` 阶段 resolve，`authExchange` 立即获得 `AuthConfig`，
+其中 `willAuthError()` 检查 `currentUser$` → 仍为 null → 返回 true →
+`authExchange` 在第一个请求前就会调用 `refreshAuth()`。
 
-```
-waitProbableLoginToConfirm() 被调用
-    │
-    ├─ 检查点 1：currentUser$ 有值？
-    │    ├─ 是 → 立即 resolve()
-    │    │    └─ Promise 完成，不注册 watch
-    │    └─ 否 → 继续
-    │
-    ├─ 检查点 2：probableUser$ 为空？
-    │    ├─ 是 → reject("no_probable_user")
-    │    │    └─ Promise 失败，不注册 watch
-    │    └─ 否 → 继续
-    │
-    └─ 检查点 3：注册 watch
-         └─ 等待 isGettingInitialUser 变为 true 或 false
-```
+这解释了初始化路径中 `token_refresh` 后的**冗余刷新**现象：
+不是因为"竞态"，而是因为 `waitProbableLoginToConfirm` 在 `true` 阶段就放行了。
 
-> **设计意图**：只要初始化流程开始了（true）或完成了（false），
-> 就认为已经过了"不确定"阶段，可以放行后续操作。
+### 4.3 `null` → `true` 的触发时机问题
+
+`watch(isGettingInitialUser)` 只在**值变化**时触发。
+`isGettingInitialUser` 从 `null` → `true` 是第一次变化，
+如果 `watch` 是在 `null` 阶段注册的，这次变化会触发 resolve。
+
+但如果 `watch` 注册时 `isGettingInitialUser` 已经是 `true`（例如在递归调用期间），
+则 `true` → `true` **不会触发**，watch 会一直等到 `false` 变化。
+
+### 4.4 检查点 1 和检查点 3 的重叠
+
+如果 `waitProbableLoginToConfirm` 被调用时 `isGettingInitialUser = false`（初始化已完成）：
+- 检查点 1：`currentUser$` 有值 → resolve（已登录场景）
+- 检查点 1：`currentUser$` 为 null → 不 resolve
+- 检查点 3：`isGettingInitialUser` 已经是 `false`，但 watch 只监听**变化**，
+  不会因为当前值就是 `false` 而立即触发
+
+**这意味着**：如果初始化已完成且用户未登录（`currentUser$ = null`，`isGettingInitialUser = false`），
+`waitProbableLoginToConfirm` 会**永远挂起**，因为：
+- 检查点 1 不满足（`currentUser$` 为 null）
+- 检查点 2 不满足（`probableUser$` 可能有旧值）
+- 检查点 3 的 watch 永远不会触发（`isGettingInitialUser` 不会从 `false` 再变化）
+
+> **实际影响**：这个死挂不会发生在正常流程中，因为 `authExchange` 只在
+> `probableUser !== null` 时才调用 `waitProbableLoginToConfirm`。
+> 如果 `probableUser` 为 null（用户从未登录），`authExchange` 跳过等待直接返回 `AuthConfig`。
+> 但在 `setUser(null)` 将 `probableUser$` 清空之后、初始化完成之前注册的 watch 可能遇到此问题。
 
 ---
 
@@ -216,272 +202,271 @@ waitProbableLoginToConfirm() 被调用
 **文件**: `packages/hoppscotch-selfhost-web/src/platform/auth/web/index.ts:83`
 
 ```typescript
-const isGettingInitialUser: Ref<null | boolean> = ref(null)  // 初始值 null
+const isGettingInitialUser: Ref<null | boolean> = ref(null)
 ```
 
 ### 5.2 场景一：Token 有效，无需刷新
 
 ```
-时刻 0: isGettingInitialUser = null
-
 performAuthInit()
-  ↓
-setInitialUser()
-  ├─ isGettingInitialUser = true    (时刻 1: null → true，触发 watch)
-  ├─ getInitialUserDetails() → 成功
-  ├─ setUser(hoppUser)
-  └─ isGettingInitialUser = false   (时刻 2: true → false，触发 watch)
+  └─ await setInitialUser()
+       ├─ [行93] isGettingInitialUser = true    (null → true)
+       ├─ [行94] await getInitialUserDetails() → 成功
+       ├─ [行139] await setUser(hoppUser)
+       ├─ [行141] isGettingInitialUser = false   (true → false)
+       └─ [行143] authEvents$.next("login")
 ```
-
-| 时刻 | isGettingInitialUser | 触发 watch？ |
-|-----|---------------------|-------------|
-| 0 | `null` | - |
-| 1 | `true` | ✅ 是 |
-| 2 | `false` | ✅ 是 |
 
 ### 5.3 场景二：Token 过期，刷新成功（递归调用）
 
+**核心纠正**：行 116 的递归调用是 `setInitialUser()` **不带 await**。
+这意味着第一次调用不会等待递归调用完成就 return 了。
+但 `performAuthInit()` 中 `await setInitialUser()` 只等待第一次调用，
+递归调用是"fire-and-forget"。
+
 ```
-时刻 0: isGettingInitialUser = null
-
-setInitialUser() [第一次调用]
-  ├─ isGettingInitialUser = true     (时刻 1: null → true，触发 watch)
-  ├─ getInitialUserDetails() → "Unauthorized"
-  ├─ refreshToken()
-  │    └─ authEvents$.next("token_refresh")  ← 事件发射
-  └─ 递归调用 setInitialUser() [第二次调用]
-       ├─ isGettingInitialUser = true  (时刻 2: true → true，**不触发**)
-       ├─ getInitialUserDetails() → 成功
-       ├─ setUser(hoppUser)
-       └─ isGettingInitialUser = false (时刻 3: true → false，触发 watch)
+performAuthInit()
+  └─ await setInitialUser()  [第一次调用]
+       │
+       ├─ [行93] isGettingInitialUser = true       (null → true)
+       ├─ [行94] await getInitialUserDetails() → "Unauthorized"
+       ├─ [行113] await refreshToken()
+       │    ├─ GET /auth/refresh → 200 OK
+       │    ├─ [行164] authEvents$.next("token_refresh")  ← 事件发射
+       │    └─ return true
+       │
+       ├─ [行116] setInitialUser()  [第二次调用，不带 await！]
+       │    │
+       │    ├─ [行93] isGettingInitialUser = true   (true → true，无变化)
+       │    ├─ [行94] await getInitialUserDetails() → 成功
+       │    ├─ [行139] await setUser(hoppUser)
+       │    ├─ [行141] isGettingInitialUser = false (true → false)
+       │    └─ [行143] authEvents$.next("login")
+       │
+       └─ [行123] return  ← 第一次调用结束（不等待递归调用）
 ```
 
-| 时刻 | isGettingInitialUser | 触发 watch？ | 备注 |
-|-----|---------------------|-------------|------|
-| 0 | `null` | - | 初始 |
-| 1 | `true` | ✅ 是 | 第一次调用开始 |
-| 2 | `true` | ❌ 否 | 递归调用，值未变 |
-| 3 | `false` | ✅ 是 | 最终完成 |
+**关键发现**：
 
-**关键点**：递归调用时 `isGettingInitialUser` 从 `true` → `true` **不会触发 watch**。
-如果 watch 是在递归调用期间注册的（例如 token_refresh 事件触发的 GQL 客户端重建），
-它会等到 `false` 变化时才 resolve。
+1. 第一次调用在行 123 `return` 后结束
+2. 第二次调用是异步执行的（`await getInitialUserDetails()` 会在微任务中继续）
+3. `performAuthInit()` 的 `await` 只等到了第一次调用的 return，
+   此时 `isGettingInitialUser` 仍为 `true`，`currentUser$` 仍为 null
+4. 但递归调用的 `await getInitialUserDetails()` 已经在事件循环中排队
+
+**这意味着**：`performAuthInit()` 返回时，初始化**可能尚未完成**。
+
+| 时刻 | 调用栈 | isGettingInitialUser | currentUser$ |
+|-----|-------|---------------------|-------------|
+| T0 | performAuthInit 开始 | null | null |
+| T1 | setInitialUser(1) 行93 | true | null |
+| T2 | getInitialUserDetails 返回 "Unauthorized" | true | null |
+| T3 | refreshToken 返回 true | true | null |
+| T4 | authEvents$.next("token_refresh") | true | null |
+| T5 | setInitialUser(2) 行93（无 await） | true（无变化） | null |
+| T6 | setInitialUser(1) 行123 return | true | null |
+| T7 | performAuthInit 的 await 结束 | true | null |
+| T8 | setInitialUser(2) getInitialUserDetails 返回成功 | true | null |
+| T9 | setUser(hoppUser) | true | HoppUser |
+| T10 | isGettingInitialUser = false | false | HoppUser |
+| T11 | authEvents$.next("login") | false | HoppUser |
 
 ### 5.4 场景三：Token 过期，刷新失败
 
 ```
-时刻 0: isGettingInitialUser = null
-
-setInitialUser()
-  ├─ isGettingInitialUser = true    (时刻 1: null → true，触发 watch)
-  ├─ getInitialUserDetails() → "Unauthorized"
-  ├─ refreshToken() → return false
-  ├─ setUser(null)
-  └─ isGettingInitialUser = false   (时刻 2: true → false，触发 watch)
+performAuthInit()
+  └─ await setInitialUser()
+       ├─ [行93] isGettingInitialUser = true
+       ├─ [行94] await getInitialUserDetails() → "Unauthorized"
+       ├─ [行113] await refreshToken() → return false
+       ├─ [行118] await setUser(null)
+       ├─ [行119] isGettingInitialUser = false
+       ├─ [行120] await logout()
+       └─ [行123] return
 ```
 
-### 5.4 场景四：无 Cookie
+此处 `performAuthInit()` 返回时初始化已完成。
+
+### 5.5 场景四：无 Cookie
 
 ```
-时刻 0: isGettingInitialUser = null
-
-setInitialUser()
-  ├─ isGettingInitialUser = true    (时刻 1: null → true，触发 watch)
-  ├─ getInitialUserDetails() → "auth/cookies_not_found"
-  ├─ setUser(null)
-  └─ isGettingInitialUser = false   (时刻 2: true → false，触发 watch)
+performAuthInit()
+  └─ await setInitialUser()
+       ├─ [行93] isGettingInitialUser = true
+       ├─ [行94] await getInitialUserDetails() → "cookies_not_found"
+       ├─ [行100] await setUser(null)
+       ├─ [行101] isGettingInitialUser = false
+       └─ [行102] return
 ```
+
+此处 `performAuthInit()` 返回时初始化已完成。
 
 ---
 
-## 六、token_refresh 与 login 事件与状态更新的先后关系
+## 六、setInitialUser 递归调用与 token_refresh、login 事件的精确时序
 
-### 6.1 初始化路径刷新成功的精确时序
+### 6.1 刷新成功路径的完整时序（含调用栈分析）
 
-**文件**: `packages/hoppscotch-selfhost-web/src/platform/auth/web/index.ts:92-149`
+```typescript
+// 第一次调用（由 performAuthInit 触发）
+async function setInitialUser() {                   // 调用帧 #1
+  isGettingInitialUser.value = true                 // [1] null → true
+  const res = await getInitialUserDetails()          // [2] 发起网络请求，让出执行
 
-```
-setInitialUser() [第一次调用]
-  │
-  ├─ [行 93] isGettingInitialUser = true
-  │
-  ├─ [行 94] await getInitialUserDetails() → "Unauthorized"
-  │
-  ├─ [行 112] 检测到 "Unauthorized" 错误
-  │
-  ├─ [行 113] const isRefreshSuccess = await refreshToken()
-  │    │
-  │    ├─ [行 154] GET /auth/refresh → 200 OK
-  │    │
-  │    ├─ [行 164-166] authEvents$.next({ event: "token_refresh" })  ← 【事件 1 发射】
-  │    │    └─ 此时：
-  │    │        • currentUser$ = null
-  │    │        • probableUser$ = 旧用户（从 localStorage 来）
-  │    │        • isGettingInitialUser = true
-  │    │
-  │    └─ [行 169] return true
-  │
-  ├─ [行 115] isRefreshSuccess = true
-  │
-  ├─ [行 116] setInitialUser()  ← 递归调用
-  │    │
-  │    ├─ [行 93] isGettingInitialUser = true  (true → true，无变化)
-  │    │
-  │    ├─ [行 94] await getInitialUserDetails() → 成功
-  │    │
-  │    ├─ [行 139] await setUser(hoppUser)
-  │    │    ├─ currentUser$.next(hoppUser)        ← 【状态更新 1】
-  │    │    ├─ probableUser$.next(hoppUser)       ← 【状态更新 2】
-  │    │    └─ persistence.setLocalConfig(...)    ← 【持久化】
-  │    │
-  │    ├─ [行 141] isGettingInitialUser = false   ← 【状态更新 3】
-  │    │
-  │    └─ [行 143-146] authEvents$.next({         ← 【事件 2 发射】
-  │         event: "login",
-  │         user: hoppUser
-  │       })
-  │
-  └─ return (隐式)
+  // ... 网络请求返回，微任务恢复 ...
+
+  if (error && error.message === "Unauthorized") {   // [3]
+    const isRefreshSuccess = await refreshToken()     // [4] 发起网络请求，让出执行
+
+    // ... 网络请求返回，微任务恢复 ...
+
+    // refreshToken 内部：
+    //   authEvents$.next({ event: "token_refresh" })  // [5] 同步通知所有订阅者
+    //     → onBackendGQLClientShouldReconnect 回调同步执行
+    //       → createHoppClient() 同步执行
+    //         → authExchange(async () => { ... }) 同步执行到第一个 await
+    //           → waitProbableLoginToConfirm() 同步执行
+    //             → getCurrentUser() → null
+    //             → probableUser$ 有值 → 不 reject
+    //             → watch(isGettingInitialUser) 注册
+    //                → isGettingInitialUser 当前为 true，无变化，不触发
+    //           → await watch 等待... (Promise 挂起)
+    //     → 业务 syncers.startListening() 同步执行
+    //   return true                                    // [6]
+
+    if (isRefreshSuccess) {                          // [7] true
+      setInitialUser()                               // [8] 递归调用，无 await！
+    }                                                // [8a] 递归调用同步执行到第一个 await
+
+    // 第二次调用（递归）
+    // async function setInitialUser() {              // 调用帧 #2
+    //   isGettingInitialUser.value = true            // [9] true → true，无变化
+    //   const res = await getInitialUserDetails()     // [10] 发起网络请求，让出执行
+    // }
+
+    return                                           // [11] 第一次调用结束
+  }
+}
 ```
 
-### 6.2 先后关系总结
+**时序要点**：
 
-| 顺序 | 操作 | currentUser$ | isGettingInitialUser | 发射的事件 |
-|-----|------|-------------|---------------------|----------|
-| 1 | 第一次 setInitialUser 开始 | null | true | - |
-| 2 | refreshToken 成功 | null | true | `token_refresh` |
-| 3 | 递归 setInitialUser 开始 | null | true | - |
-| 4 | setUser(hoppUser) | HoppUser | true | - |
-| 5 | isGettingInitialUser = false | HoppUser | false | - |
-| 6 | 发射 login 事件 | HoppUser | false | `login` |
+- [5] `token_refresh` 事件的副作用在 `refreshToken()` 内同步执行，
+  此时递归调用 [8] 尚未发生
+- [8] 递归调用**不带 await**，所以 [9][10] 同步执行到 `await` 后让出
+- [11] 第一次调用的 `return` 在递归调用让出后执行
+- [10] 递归调用的网络请求在后续微任务中完成
+
+### 6.2 事件与状态更新的先后关系
+
+| 顺序 | 操作 | currentUser$ | isGettingInitialUser | 调用帧 |
+|-----|------|-------------|---------------------|-------|
+| 1 | setInitialUser(1) 开始 | null | true | #1 |
+| 2 | refreshToken 网络请求完成 | null | true | #1 |
+| 3 | authEvents$.next("token_refresh") | null | true | #1 |
+| 4 | GQL 客户端重建 + watch 注册 | null | true | #1 |
+| 5 | setInitialUser(2) 开始（无 await） | null | true | #2 |
+| 6 | setInitialUser(1) return | null | true | #1 结束 |
+| 7 | getInitialUserDetails(2) 网络请求完成 | null | true | #2 |
+| 8 | setUser(hoppUser) | **HoppUser** | true | #2 |
+| 9 | isGettingInitialUser = false | HoppUser | **false** | #2 |
+| 10 | watch 触发 resolve | HoppUser | false | #2 |
+| 11 | authEvents$.next("login") | HoppUser | false | #2 |
 
 **关键结论**：
-1. `token_refresh` 事件发射时，`currentUser$` **仍为 null**
-2. `currentUser$` 更新发生在 `login` 事件发射**之前**
-3. `isGettingInitialUser = false` 也发生在 `login` 事件发射**之前**
-4. 两个事件之间有一个"状态不一致窗口"：`token_refresh` 已发射但用户信息还未更新
+
+1. `token_refresh` 事件（步骤 3）在递归调用开始（步骤 5）**之前**发射
+2. `token_refresh` 事件发射时，`currentUser$` 必然为 null（步骤 3 时递归还没开始）
+3. `login` 事件（步骤 11）在 `currentUser$` 更新（步骤 8）**之后**发射
+4. `isGettingInitialUser = false`（步骤 9）在 `login` 事件**之前**
+5. 步骤 4 注册的 watch 在步骤 9 时被触发（`true` → `false`）
 
 ---
 
-## 七、token_refresh 事件触发时的竞态分析
+## 七、竞态分析（统一结论）
 
-### 7.1 token_refresh 事件的副作用链
+### 7.1 唯一真实的竞态窗口
 
-`token_refresh` 事件触发后，会同步执行以下操作：
+初始化路径刷新成功时，**只存在一个竞态窗口**，不存在"场景 A / 场景 B"两个独立场景。
 
-**文件**: `packages/hoppscotch-selfhost-web/src/platform/auth/web/index.ts:232-242`
+因为 JavaScript 单线程模型决定了 `authEvents$.next("token_refresh")` 的订阅者回调
+一定是同步执行的，递归调用 `setInitialUser()` 一定在订阅者回调完成之后才开始。
 
-```typescript
-onBackendGQLClientShouldReconnect(func) {
-  authEvents$.subscribe((event) => {
-    if (
-      event.event == "login" ||
-      event.event == "logout" ||
-      event.event == "token_refresh"
-    ) {
-      func()  // 同步执行回调
-    }
-  })
-},
-```
-
-所以 `token_refresh` 事件发射后，**同步**触发：
-1. `createHoppClient()` → 重建 GQL 客户端
-2. 各业务 syncer 的 `startListeningToSubscriptions()`
-
-### 7.2 GQL 客户端重建时的 authExchange 初始化
-
-**文件**: `packages/hoppscotch-common/src/helpers/backend/GQLClient.ts:74-80`
-
-```typescript
-authExchange(async (): Promise<AuthConfig> => {
-  const probableUser = platform.auth.getProbableUser()
-  if (probableUser !== null)
-    await platform.auth.waitProbableLoginToConfirm()  // ← 等待确认
-  // ...
-})
-```
-
-`probableUser` 来自 `performAuthInit()` 时从 localStorage 读取的旧值，
-所以在 `token_refresh` 事件触发时通常不为 null，会进入等待。
-
-### 7.3 竞态窗口分析
-
-`token_refresh` 事件在 `refreshToken()` 的第 164 行发射，
-此时 `isGettingInitialUser = true`，`currentUser$ = null`。
-
-**竞态场景 A：副作用先于递归调用执行**
+**确定的执行时序**：
 
 ```
-时序 (同步执行)
-───────────────────────────────────────────────
-1. authEvents$.next("token_refresh")           [refreshToken 内]
-2. └─ onBackendGQLClientShouldReconnect 回调     [同步]
-3.    └─ createHoppClient()                     [同步]
-4.       └─ authExchange 初始化                  [同步]
-5.          └─ waitProbableLoginToConfirm()     [同步]
-6.             ├─ getCurrentUser() → null       [同步]
-7.             ├─ probableUser$ 有值            [同步]
-8.             └─ watch 注册                    [同步]
-9.                (等待 isGettingInitialUser 变化)
-10. return true 从 refreshToken() 返回          [第 169 行]
-11. setInitialUser() 递归调用                   [第 116 行]
-12. ├─ isGettingInitialUser = true              [无变化]
-13. ├─ getInitialUserDetails() 成功             
-14. ├─ setUser(hoppUser)                        [currentUser$ 更新]
-15. ├─ isGettingInitialUser = false             [true → false，变化！]
-16. └─ 触发 watch → resolve()                   ✓
-───────────────────────────────────────────────
-结果：安全 ✓
+authEvents$.next("token_refresh")          ← 同步
+  ├─ onBackendGQLClientShouldReconnect       ← 同步回调
+  │    └─ createHoppClient()                 ← 同步
+  │         └─ authExchange(async ...)       ← 同步执行到第一个 await
+  │              └─ waitProbableLoginToConfirm()
+  │                   ├─ getCurrentUser() → null
+  │                   ├─ probableUser$ 有值
+  │                   └─ watch 注册          ← Promise 挂起
+  ├─ syncer1.startListening()                ← 同步
+  ├─ syncer2.startListening()                ← 同步
+  └─ ...所有订阅者回调完成
+
+return true                                 ← refreshToken 返回
+
+setInitialUser()  [递归，无 await]           ← 此时才开始递归
+  ├─ isGettingInitialUser = true (无变化)
+  └─ await getInitialUserDetails()           ← 让出执行，后续在微任务中
 ```
 
-**竞态场景 B：递归调用非常快，先于副作用执行**
+**结论**：不存在"递归调用先于副作用执行"的可能性。
+`Subject.next()` 的订阅者回调一定在 `next()` 返回之前全部同步完成。
 
-理论上，如果 JavaScript 事件循环有其他微任务插队，
-递归调用可能先执行完成：
+### 7.2 watch 等待的确切放行时机
 
-```
-时序 (微任务插队)
-───────────────────────────────────────────────
-1. authEvents$.next("token_refresh")
-2. [微任务插队] setInitialUser() 递归调用先完成
-3.    ├─ setUser(hoppUser) → currentUser$ = HoppUser
-4.    └─ isGettingInitialUser = false
-5. onBackendGQLClientShouldReconnect 回调执行
-6. └─ createHoppClient()
-7.    └─ authExchange 初始化
-8.       └─ waitProbableLoginToConfirm()
-9.          └─ getCurrentUser() → HoppUser  ✓
-10.            └─ 立即 resolve()            ✓
-───────────────────────────────────────────────
-结果：安全 ✓
-```
+| watch 注册时机 | 当前 isGettingInitialUser | 何时 resolve |
+|--------------|-------------------------|------------|
+| token_refresh 副作用期间（isGettingInitialUser = true） | true | 递归调用中 `isGettingInitialUser = false` 时 |
+| login 副作用期间（isGettingInitialUser = false） | false | **不触发**，靠检查点 1 `getCurrentUser()` 有值直接 resolve |
 
-**结论**：两种竞态场景都是安全的。
-- 场景 A 靠 `watch` 等待 `false` 变化
-- 场景 B 靠 `getCurrentUser()` 检查直接放行
+### 7.3 冗余刷新的根因分析
 
-### 7.4 潜在的冗余刷新问题
-
-虽然竞态是安全的，但存在一个**冗余刷新**问题：
+冗余刷新不是竞态导致的，而是 `waitProbableLoginToConfirm` 的设计语义导致的：
 
 ```
-token_refresh 事件发射 → GQL 客户端重建
-  ↓
-authExchange 初始化时 willBackendHaveAuthError() = true
-  (因为 currentUser$ 仍为 null)
-  ↓
-第一个 GQL 请求发起时 willAuthError() 返回 true
-  ↓
-触发 refreshAuth() → 再次调用 refreshToken()
-  ↓
-第二次 GET /auth/refresh 请求
+token_refresh 事件
+  → createHoppClient()
+    → authExchange 初始化
+      → waitProbableLoginToConfirm()
+        → isGettingInitialUser = true 时 resolve  ← 问题根源
+      → willAuthError() 检查 currentUser$ → null → true
+      → 第一个请求前触发 refreshAuth()
+        → refreshToken()  ← 冗余的第二次 /auth/refresh
 ```
 
-后果：
-- 不必要的 HTTP 请求（但功能上无害）
-- 可能导致 Refresh Token Rotation 的额外一轮轮换
-- `authRetryGuard.failCount` 可能被意外影响
+**为什么 `true` 时就 resolve？**
+
+这是有意为之的设计。`waitProbableLoginToConfirm` 的目的是防止 GQL 客户端
+在初始化完成之前发出请求。当 `isGettingInitialUser = true` 时，
+说明初始化流程已经在进行中，GQL 客户端可以开始工作，
+由 `authExchange` 的 `willAuthError()` / `refreshAuth()` 机制来处理
+尚未获取到用户信息的情况。
+
+**冗余刷新的实际影响**：
+
+- Cookie 已被第一次刷新更新，第二次 `/auth/refresh` 会成功但产生无意义的 Token 轮换
+- `authRetryGuard` 记录一次成功（failCount 重置为 0），无害
+- 多消耗一次 HTTP 请求
+
+### 7.4 双重客户端重建
+
+初始化路径刷新成功时会触发两次 `createHoppClient()`：
+
+1. **第一次**：`token_refresh` 事件 → `onBackendGQLClientShouldReconnect` 回调
+   - `currentUser$ = null`，WebSocket 不会被创建
+   - 新 GQL 客户端的 `authExchange` 会因 `willAuthError() = true` 触发冗余刷新
+
+2. **第二次**：`login` 事件 → `onBackendGQLClientShouldReconnect` 回调
+   - `currentUser$ = HoppUser`，WebSocket 会被创建
+   - 新 GQL 客户端正常工作
+
+**第一次重建的 GQL 客户端是短暂的**：它只在 `token_refresh` 和 `login` 事件之间存在，
+被第二次重建覆盖。这期间它可能发出冗余刷新请求，但不会造成数据问题。
 
 ---
 
@@ -496,32 +481,25 @@ authExchange 初始化时 willBackendHaveAuthError() = true
 ```
 performAuthInit()
   ├─ 从 localStorage 读取 login_state → probableUser$.next(旧用户)
-  └─ setInitialUser()
+  └─ await setInitialUser()
        ├─ isGettingInitialUser = true
-       ├─ getInitialUserDetails() → GQL /me 查询（withCredentials: true）
-       └─ 无错误，res.data.me 存在
-            ├─ setUser(hoppUser)
-            │    ├─ currentUser$.next(hoppUser)      ← 状态更新
-            │    ├─ probableUser$.next(hoppUser)     ← 状态更新
-            │    └─ persistence.setLocalConfig(...)   ← 持久化
-            ├─ isGettingInitialUser = false
-            └─ authEvents$.next({ event: "login", user: hoppUser })  ← 发射事件
+       ├─ await getInitialUserDetails() → GQL /me 查询成功
+       ├─ await setUser(hoppUser)
+       │    ├─ currentUser$.next(hoppUser)
+       │    ├─ probableUser$.next(hoppUser)
+       │    └─ persistence.setLocalConfig(...)
+       ├─ isGettingInitialUser = false
+       └─ authEvents$.next({ event: "login", user: hoppUser })
 ```
 
-**此时状态**：
-| 状态 | 值 |
-|------|-----|
-| `currentUser$` | `HoppUser` |
-| `probableUser$` | `HoppUser` |
-| `login_state` (localStorage) | 用户 JSON |
-| `authRetryGuard` | 不涉及（初始化路径不走 retryGuard） |
+此时 `performAuthInit` 的 `await` 结束时，初始化已完成。
 
 #### 失败路径 A1：无 Cookie（cookies_not_found）
 
 ```
 setInitialUser()
-  ├─ getInitialUserDetails() → GQL 返回 errors[0].message = "auth/cookies_not_found"
-  ├─ setUser(null)
+  ├─ await getInitialUserDetails() → "auth/cookies_not_found"
+  ├─ await setUser(null)
   │    ├─ currentUser$.next(null)
   │    ├─ probableUser$.next(null)
   │    └─ persistence.setLocalConfig("login_state", "null")
@@ -536,182 +514,132 @@ setInitialUser()
 #### 失败路径 A3：Access Token 过期（Unauthorized）→ 刷新成功
 
 ```
-setInitialUser()
-  ├─ getInitialUserDetails() → GQL 返回 errors[0].message = "Unauthorized"
-  ├─ refreshToken()
-  │    ├─ GET /auth/refresh (withCredentials: true)
-  │    ├─ 后端验证 RT → 生成新 Token → Set-Cookie 写入
-  │    ├─ res.status === 200 → 成功
-  │    ├─ authEvents$.next({ event: "token_refresh" })  ← 发射事件（无 user）
+setInitialUser() [第一次调用，有 await]
+  ├─ isGettingInitialUser = true
+  ├─ await getInitialUserDetails() → "Unauthorized"
+  ├─ await refreshToken()
+  │    ├─ GET /auth/refresh → 200 OK
+  │    ├─ authEvents$.next("token_refresh")     ← 事件 1
+  │    │    → GQL 客户端重建（第一次，currentUser$ = null）
+  │    │    → syncers.startListening()
   │    └─ return true
-  ├─ 【token_refresh 事件的副作用】
-  │    ├─ onBackendGQLClientShouldReconnect 回调触发
-  │    │    ├─ createHoppClient() → 重建 GQL 客户端
-  │    │    └─ （此时 currentUser$ 仍为 null！）
-  │    └─ 各业务模块（settings/collections/environments/history）
-  │         └─ syncer.startListeningToSubscriptions()
-  ├─ setInitialUser()  ← 递归重试
-  │    ├─ getInitialUserDetails() → 用新 Cookie 查询 /me
-  │    └─ 成功 → setUser(hoppUser)
-  │         ├─ currentUser$.next(hoppUser)
-  │         ├─ isGettingInitialUser = false
-  │         └─ authEvents$.next({ event: "login", user: hoppUser })  ← 第二次事件
-  └─ 【login 事件的副作用】
-       ├─ onBackendGQLClientShouldReconnect 回调再次触发
-       │    └─ createHoppClient() → 再次重建 GQL 客户端
-       └─ authRetryGuard.reset()  ← 重置重试计数器
+  ├─ setInitialUser() [第二次调用，无 await！]   ← 递归
+  │    ├─ isGettingInitialUser = true (无变化)
+  │    ├─ await getInitialUserDetails() → 成功
+  │    ├─ await setUser(hoppUser)
+  │    │    ├─ currentUser$.next(hoppUser)
+  │    │    ├─ probableUser$.next(hoppUser)
+  │    │    └─ persistence.setLocalConfig(...)
+  │    ├─ isGettingInitialUser = false           ← 触发 watch
+  │    └─ authEvents$.next("login", user)        ← 事件 2
+  │         → GQL 客户端重建（第二次，currentUser$ = HoppUser）
+  │         → WebSocket 创建
+  │         → authRetryGuard.reset()
+  └─ return                                      ← 第一次调用结束
 ```
+
+**注意**：`performAuthInit` 的 `await` 在"第一次调用结束"时结束，
+此时递归调用的 `getInitialUserDetails` 可能还在网络请求中。
+`performAuthInit` 返回不等于初始化完成。
 
 **状态变化时序**：
 
-| 时间点 | currentUser$ | probableUser$ | login_state | authRetryGuard |
-|-------|-------------|--------------|-------------|----------------|
-| performAuthInit 开始 | null | 旧用户(从 localStorage) | 旧用户 JSON | 初始状态 |
-| refreshToken() 成功后 | **null**（未变） | 旧用户（未变） | 旧用户 JSON（未变） | 初始状态 |
-| setInitialUser() 重试成功后 | HoppUser | HoppUser | 新用户 JSON | 初始状态 |
-
-> **关键点**：`token_refresh` 事件发射时，`currentUser$` 仍为 null。
-> 如果此时有 GQL 请求发起，`willAuthError()` 会返回 `true`，
-> 触发 `authExchange` 尝试再次刷新。但 Cookie 已刷新，所以后续 `/me` 查询会成功。
+| 时间点 | currentUser$ | probableUser$ | isGettingInitialUser | performAuthInit 已返回？ |
+|-------|-------------|--------------|---------------------|----------------------|
+| performAuthInit 开始 | null | 旧用户 | null | 否 |
+| setInitialUser(1) 开始 | null | 旧用户 | true | 否 |
+| refreshToken 成功 | null | 旧用户 | true | 否 |
+| token_refresh 事件 | null | 旧用户 | true | 否 |
+| setInitialUser(2) 开始 | null | 旧用户 | true | 否 |
+| **setInitialUser(1) return** | **null** | **旧用户** | **true** | **是** |
+| setUser(hoppUser) | HoppUser | HoppUser | true | 是 |
+| isGettingInitialUser = false | HoppUser | HoppUser | false | 是 |
+| login 事件 | HoppUser | HoppUser | false | 是 |
 
 #### 失败路径 A4：Access Token 过期（Unauthorized）→ 刷新失败
 
 ```
 setInitialUser()
-  ├─ getInitialUserDetails() → "Unauthorized"
-  ├─ refreshToken()
-  │    ├─ GET /auth/refresh → 抛异常或非 200
-  │    └─ return false
-  ├─ setUser(null)
+  ├─ await getInitialUserDetails() → "Unauthorized"
+  ├─ await refreshToken() → return false
+  ├─ await setUser(null)
   │    ├─ currentUser$.next(null)
   │    ├─ probableUser$.next(null)
   │    └─ persistence.setLocalConfig("login_state", "null")
   ├─ isGettingInitialUser = false
-  ├─ logout() → GET /auth/logout → 后端清除 Cookie
+  ├─ await logout()
   └─ 【不发射 logout 事件】
-       注意：这里调用的是内部 logout() 函数，不是 signOutUser()。
-       内部 logout() 只发 HTTP 请求，不发射 authEvent。
 ```
 
-> **关键点**：初始化路径刷新失败时，**不发射 `logout` 事件**。
-> 这与 GQL 运行时路径（通过 retryGuard 触发 `signOutUser()`）行为不同。
-> 此时 GQL 客户端不会被重建，可能导致旧连接残留。
+> 初始化路径刷新失败时，**不发射 `logout` 事件**。
+> GQL 客户端不会被重建，可能导致旧连接残留。
 
 ### 8.2 路径 B：GQL 运行时刷新（authExchange + retryGuard）
 
 **触发时机**：已登录状态下 GQL 请求遇到认证错误
 
-#### 触发条件一：willAuthError() 前置检查
+#### 触发条件
 
-```typescript
-willAuthError() {
-  return !currentUser$.value  // currentUser$ 为 null 时返回 true
-}
-```
-
-返回 `true` → authExchange 在发起请求**之前**先调用 `refreshAuth()`。
-
-#### 触发条件二：didAuthError() 后置检查
-
-请求已经发出并返回错误后，检查错误内容：
-
-```typescript
-didAuthError(error) {
-  return error.graphQLErrors.some(
-    (e) =>
-      e.message.includes("auth/fail") ||
-      e.message.includes("jwt expired") ||
-      e.extensions?.code === "UNAUTHENTICATED"
-  )
-}
-```
-
-返回 `true` → authExchange 调用 `refreshAuth()` 并重试原始请求。
+1. `willAuthError()`：`currentUser$` 为 null → 请求前刷新
+2. `didAuthError()`：响应包含 `"auth/fail"` / `"jwt expired"` / `"UNAUTHENTICATED"` → 请求后刷新
 
 #### 成功路径
 
 ```
-GQL 请求 → didAuthError() = true（或 willAuthError() = true）
+GQL 请求 → didAuthError() = true
   └─ refreshAuth()
-       └─ authRetryGuard.execute(() => platform.auth.refreshAuthToken())
-            │
+       └─ authRetryGuard.execute(() => refreshAuthToken())
             ├─ refreshToken()
             │    ├─ GET /auth/refresh → 200 OK
-            │    ├─ authEvents$.next({ event: "token_refresh" })
+            │    ├─ authEvents$.next("token_refresh")
+            │    │    → GQL 客户端重建（currentUser$ 有值，正常工作）
+            │    │    → WebSocket 关闭并重建
             │    └─ return true
-            │
-            ├─ authRetryGuard: failCount = 0, return true
-            └─ authExchange 用新 Cookie 重试原始 GQL 请求
+            ├─ failCount = 0
+            └─ return true → authExchange 重试原始请求
 ```
 
-**token_refresh 事件副作用**：
-
-| 订阅者 | 响应行为 |
-|-------|---------|
-| `onBackendGQLClientShouldReconnect` | `createHoppClient()` 重建 GQL 客户端 |
-| settings syncer | `startListeningToSubscriptions()` |
-| collections syncer | `startListeningToSubscriptions()` |
-| environments syncer | `startListeningToSubscriptions()` |
-| history syncer | `startListeningToSubscriptions()` |
-
-> **注意**：与初始化路径不同，运行时刷新成功后 **不会自动调用 setInitialUser()**。
-> `currentUser$` 保持原有值（不为 null），所以 `willAuthError()` 返回 `false`，
-> 后续请求直接使用新 Cookie 即可。这是两条路径最大的状态差异。
+> 运行时刷新成功后 `currentUser$` 保持旧值（不为 null），
+> `willAuthError()` 返回 false，后续请求直接使用新 Cookie。
+> 不需要重新获取用户信息。
 
 #### 失败路径：第 N 次（N < 3）失败
 
 ```
-refreshAuth()
-  └─ authRetryGuard.execute(...)
-       ├─ refreshToken() → return false
-       ├─ failCount++  (例如 failCount = 1)
-       └─ return false
-            └─ authExchange 得到 false → 原始 GQL 请求失败，返回错误给调用方
+authRetryGuard.execute(...)
+  ├─ refreshToken() → false
+  ├─ failCount++
+  └─ return false → authExchange 放弃，请求失败
 ```
-
-**状态**：
-| 状态 | 值 |
-|------|-----|
-| `currentUser$` | **不变**（仍为旧 HoppUser） |
-| `authRetryGuard.failCount` | +1 |
-| `authRetryGuard.isExhausted` | false |
 
 #### 失败路径：第 3 次失败（耗尽重试）
 
 ```
-refreshAuth()
-  └─ authRetryGuard.execute(...)
-       ├─ refreshToken() → return false
-       ├─ failCount = 3
-       ├─ isExhausted = true
-       ├─ onExhausted() → platform.auth.signOutUser()
-       │    ├─ logout() → GET /auth/logout
-       │    ├─ probableUser$.next(null)
-       │    ├─ currentUser$.next(null)
-       │    ├─ persistence.removeLocalConfig("login_state")
-       │    └─ authEvents$.next({ event: "logout" })  ← 发射 logout 事件
-       └─ return false
+authRetryGuard.execute(...)
+  ├─ refreshToken() → false
+  ├─ failCount = 3
+  ├─ isExhausted = true
+  ├─ onExhausted() → signOutUser()
+  │    ├─ await logout()   → GET /auth/logout
+  │    ├─ probableUser$.next(null)
+  │    ├─ currentUser$.next(null)
+  │    ├─ persistence.removeLocalConfig("login_state")
+  │    └─ authEvents$.next("logout")
+  │         → GQL 客户端重建（无用户）
+  │         → WebSocket 关闭
+  │         → syncers.stopListening()
+  └─ return false
 ```
-
-**logout 事件副作用**：
-
-| 订阅者 | 响应行为 |
-|-------|---------|
-| `onBackendGQLClientShouldReconnect` | `createHoppClient()` 重建（无用户）+ 关闭 WebSocket |
-| settings syncer | `stopListeningToSubscriptions()` |
-| collections syncer | `stopListeningToSubscriptions()` |
-| environments syncer | `stopListeningToSubscriptions()` |
-| history syncer | `stopListeningToSubscriptions()` |
 
 #### 耗尽后的后续请求
 
 ```
 authRetryGuard.execute(...)
-  ├─ isExhausted = true → 直接 return false（不再调用 refreshToken）
-  └─ 所有后续 GQL 请求的 refreshAuth() 都直接返回 false
+  ├─ isExhausted = true → 直接 return false
+  └─ 不再调用 refreshToken
 ```
 
-只有当用户重新登录（`login` 事件触发 `authRetryGuard.reset()`）后，守卫才会恢复。
+只有 `login` 事件触发 `authRetryGuard.reset()` 后才恢复。
 
 ---
 
@@ -720,15 +648,16 @@ authRetryGuard.execute(...)
 | 维度 | 路径 A：初始化刷新 | 路径 B：GQL 运行时刷新 |
 |------|------------------|---------------------|
 | **触发入口** | `performAuthInit()` → `setInitialUser()` | urql `authExchange` |
-| **错误识别** | GQL `errors[0].message` 精确匹配 | `didAuthError()` 字符串包含判断 |
-| **刷新调用** | 直接调用 `refreshToken()` | 通过 `authRetryGuard.execute()` 间接调用 |
-| **重试上限** | 无限制（递归调用 `setInitialUser()`） | 最多 3 次 |
-| **刷新成功后** | 递归调用 `setInitialUser()` 重新获取用户 | 仅重建 GQL 客户端，不重新获取用户 |
-| **刷新失败后** | `setUser(null)` + `logout()`（不发事件） | `failCount++`，第 3 次触发 `signOutUser()`（发 `logout` 事件） |
-| **`token_refresh` 事件** | 发射（无 user 字段） | 发射（无 user 字段） |
-| **`currentUser$` 在刷新成功后** | 仍为 null（等待 setInitialUser 重试） | 保持旧值（已登录用户） |
-| **retryGuard 影响** | 不涉及 | 核心机制 |
-| **`waitProbableLoginToConfirm` 交互** | 有，token_refresh 触发 GQL 重建时会等待 | 无，currentUser$ 已有值直接放行 |
+| **错误识别** | `errors[0].message` 精确匹配 | `didAuthError()` 字符串包含 |
+| **刷新调用** | 直接调用 `refreshToken()` | `authRetryGuard.execute()` 间接调用 |
+| **重试上限** | 无限制（递归） | 最多 3 次 |
+| **刷新成功后** | 递归 `setInitialUser()` 重新获取用户 | 仅重建 GQL 客户端 |
+| **刷新失败后** | `setUser(null)` + `logout()`（不发事件） | `failCount++`，3 次后 `signOutUser()`（发 `logout` 事件） |
+| **递归调用** | **无 await**（fire-and-forget） | 不涉及 |
+| **performAuthInit 返回时** | 可能初始化尚未完成 | 不涉及 |
+| **`currentUser$` 刷新成功后** | 仍为 null（等待递归完成） | 保持旧值 |
+| **`waitProbableLoginToConfirm`** | 在 `true` 阶段 resolve | 在检查点 1 直接 resolve（`currentUser$` 有值） |
+| **GQL 客户端重建次数** | 2 次（token_refresh + login） | 1 次（token_refresh） |
 
 ---
 
@@ -736,43 +665,39 @@ authRetryGuard.execute(...)
 
 ### 10.1 刷新端点
 
-**文件**: `packages/hoppscotch-backend/src/auth/auth.controller.ts:87-100`
-
 ```
 GET /api/v1/auth/refresh
   │
   ├─ RTJwtAuthGuard (passport jwt-refresh 策略)
   │    ├─ 从 Cookie 提取 refresh_token
-  │    ├─ JWT 签名验证（secretOrKey = INFRA.JWT_SECRET）
-  │    ├─ JWT 过期检查（expiresIn = INFRA.REFRESH_TOKEN_VALIDITY）
-  │    └─ validate(payload) → 查询用户 → 附加到 @GqlUser()
+  │    ├─ JWT 签名验证
+  │    ├─ JWT 过期检查
+  │    └─ validate(payload) → 查询用户
   │
   ├─ authService.refreshAuthTokens(refreshToken, user)
   │    ├─ 验证用户存在
   │    ├─ argon2.verify(dbHashedToken, refreshToken)  ← 二次验证
   │    └─ generateAuthTokens(userUid)
-  │         ├─ generateRefreshToken() → JWT签名 + argon2哈希存DB
-  │         └─ 签名 accessToken
   │
   └─ authCookieHandler(res, newTokens)
-       ├─ Set-Cookie: access_token=xxx (httpOnly, sameSite=lax)
-       └─ Set-Cookie: refresh_token=xxx (httpOnly, sameSite=lax)
+       ├─ Set-Cookie: access_token=xxx
+       └─ Set-Cookie: refresh_token=xxx
 ```
 
 ### 10.2 双重验证机制
 
-1. **第一层**：Passport-JWT 验证 Refresh Token 的签名和过期时间（`RTJwtStrategy`）
-2. **第二层**：`refreshAuthTokens()` 用 argon2 验证 Token 哈希与数据库存储匹配
+1. **第一层**：Passport-JWT 验证签名和过期时间
+2. **第二层**：`argon2.verify()` 验证 Token 哈希与数据库匹配
 
-第二层的作用：即使 JWT 本身有效，但如果用户已在新设备上登录（新 Refresh Token 覆盖了旧哈希），
-旧设备上的 Refresh Token 虽然签名正确但哈希不匹配，会被拒绝。
+第二层的作用：即使 JWT 有效，但如果用户已在新设备登录（新 RT 覆盖旧哈希），
+旧 RT 签名正确但哈希不匹配，会被拒绝。
 
 ### 10.3 Refresh Token Rotation
 
 每次刷新成功后：
-- 后端生成**全新的** Access Token + Refresh Token 对
-- 新 Refresh Token 的 argon2 哈希覆盖数据库中旧值
-- 旧 Refresh Token 即刻失效（数据库哈希已变）
+- 后端生成全新 Access Token + Refresh Token 对
+- 新 RT 的 argon2 哈希覆盖数据库中旧值
+- 旧 RT 即刻失效
 
 ---
 
@@ -780,15 +705,15 @@ GET /api/v1/auth/refresh
 
 **文件**: `packages/hoppscotch-selfhost-web/src/platform/*/web/index.ts`
 
-所有订阅 `authEvents$` 的业务模块对 `token_refresh` 事件的处理一致：
+所有业务模块对 `token_refresh` 的处理一致：
 
 ```typescript
 authEvents$.subscribe((event) => {
   if (event.event == "login" || event.event == "token_refresh") {
-    syncer.startListeningToSubscriptions()  // 重新开启 GQL Subscription 监听
+    syncer.startListeningToSubscriptions()
   }
   if (event.event == "logout") {
-    syncer.stopListeningToSubscriptions()   // 停止 GQL Subscription 监听
+    syncer.stopListeningToSubscriptions()
   }
 })
 ```
@@ -800,31 +725,31 @@ authEvents$.subscribe((event) => {
 | Environments | `platform/environments/web/index.ts:49` | 同上模式 |
 | History | `platform/history/web/index.ts:62` | 同上模式 |
 
-`login` 和 `token_refresh` 被同等对待——都触发"重新开始监听"。
-这是因为 `token_refresh` 后 Cookie 已更新，需要用新凭证重建 GQL Subscription。
-
 ---
 
 ## 十二、GQL 客户端重建的决策逻辑
 
-**文件**: `packages/hoppscotch-common/src/helpers/backend/GQLClient.ts:169-189`
+**文件**: `packages/hoppscotch-common/src/helpers/backend/GQLClient.ts:155-190`
 
-`onBackendGQLClientShouldReconnect` 回调在 `login`/`logout`/`token_refresh` 三个事件时触发：
+`initBackendGQLClient()` 注册 `onBackendGQLClientShouldReconnect` 回调，
+在 `login`/`logout`/`token_refresh` 事件时触发：
 
 ```
 回调触发
   ├─ currentUser 有值 && subscriptionClient 存在
-  │    → 关闭旧 WebSocket，新的会在 createHoppClient 中创建
-  │
+  │    → 关闭旧 WebSocket
   ├─ currentUser 有值 && subscriptionClient 不存在
-  │    → 创建新 WebSocket（首次登录场景）
-  │
+  │    → 创建新 WebSocket
   ├─ currentUser 为空 && subscriptionClient 存在
-  │    → 关闭 WebSocket，置 null（登出场景）
-  │
-  └─ 无论哪种情况 → createHoppClient()
-       → 重建 urql 客户端（包含新的 authExchange 实例）
+  │    → 关闭 WebSocket，置 null
+  └─ client.value = createHoppClient()  ← 重建 GQL 客户端
 ```
+
+**token_refresh 时（初始化路径）**：`currentUser$ = null`，WebSocket 不存在，
+创建新 GQL 客户端但不创建 WebSocket。此客户端短暂存在后被 `login` 事件触发第二次重建覆盖。
+
+**token_refresh 时（运行时路径）**：`currentUser$` 有值，WebSocket 关闭并重建，
+新 GQL 客户端正常工作。
 
 ### authExchange 初始化逻辑
 
@@ -832,83 +757,91 @@ authEvents$.subscribe((event) => {
 authExchange(async (): Promise<AuthConfig> => {
   const probableUser = platform.auth.getProbableUser()
   if (probableUser !== null)
-    await platform.auth.waitProbableLoginToConfirm()  // 等待初始化完成
+    await platform.auth.waitProbableLoginToConfirm()
   // ...
 })
 ```
 
-`waitProbableLoginToConfirm()` 通过 `watch(isGettingInitialUser)` 等待初始化流程完成。
-这确保了新建的 GQL 客户端在认证状态确认后才开始工作。
+| 场景 | probableUser | 等待行为 | resolve 时机 |
+|------|-------------|---------|------------|
+| 初始化路径 token_refresh | 旧用户（非 null） | 进入等待 | `isGettingInitialUser = false` 时 |
+| 初始化路径 login | HoppUser | 检查点 1 直接 resolve | `getCurrentUser()` 有值 |
+| 运行时 token_refresh | HoppUser | 检查点 1 直接 resolve | `getCurrentUser()` 有值 |
+| 运行时 logout | null | 跳过等待 | `probableUser` 为 null |
+| 从未登录 | null | 跳过等待 | `probableUser` 为 null |
 
 ---
 
 ## 十三、完整状态变化矩阵
 
-### 13.1 初始化路径（路径 A）的状态变化
+### 13.1 初始化路径（路径 A）
 
-| 时刻 | currentUser$ | probableUser$ | login_state | 发射的事件 | isGettingInitialUser |
-|-----|-------------|--------------|-------------|----------|---------------------|
-| performAuthInit 开始 | null | 旧用户(从 localStorage) | 旧值 | 无 | null |
-| setInitialUser 开始 | null | 旧用户 | 旧值 | 无 | true |
-| Token 有效成功 | HoppUser | HoppUser | 新值 | `login` | false |
-| 无 Cookie 失败 | null | null | "null" | **无** | false |
-| 用户不存在失败 | null | null | "null" | **无** | false |
-| Token 过期→refreshToken 成功 | null | 旧用户 | 旧值 | `token_refresh` | true |
-| Token 过期→递归成功 | HoppUser | HoppUser | 新值 | `login` | false |
-| Token 过期→刷新失败 | null | null | "null" | **无** | false |
+| 时刻 | currentUser$ | probableUser$ | isGettingInitialUser | performAuthInit 已返回 | 发射的事件 |
+|-----|-------------|--------------|---------------------|----------------------|----------|
+| T0 performAuthInit 开始 | null | 旧用户 | null | 否 | - |
+| T1 setInitialUser(1) 开始 | null | 旧用户 | true | 否 | - |
+| T2 Token 有效成功 | HoppUser | HoppUser | false | 是 | `login` |
+| T2 无 Cookie 失败 | null | null | false | 是 | **无** |
+| T2 用户不存在失败 | null | null | false | 是 | **无** |
+| T3 refreshToken 成功 | null | 旧用户 | true | 否 | `token_refresh` |
+| T4 setInitialUser(1) return | **null** | **旧用户** | **true** | **是** | - |
+| T5 setUser(hoppUser) | HoppUser | HoppUser | true | 是 | - |
+| T6 isGettingInitialUser = false | HoppUser | HoppUser | false | 是 | - |
+| T7 login 事件 | HoppUser | HoppUser | false | 是 | `login` |
+| T2 刷新失败 | null | null | false | 是 | **无** |
 
-### 13.2 GQL 运行时路径（路径 B）的状态变化
+### 13.2 GQL 运行时路径（路径 B）
 
-| 时刻 | currentUser$ | probableUser$ | login_state | authRetryGuard | 发射的事件 |
-|-----|-------------|--------------|-------------|---------------|----------|
-| 刷新成功 | 不变(旧 HoppUser) | 不变 | 不变 | failCount=0 | `token_refresh` |
-| 刷新失败(1-2次) | 不变(旧 HoppUser) | 不变 | 不变 | failCount++ | **无** |
-| 刷新失败(3次) | null | null | 已删除 | isExhausted=true | `logout` |
-| 耗尽后的请求 | null | null | 已删除 | 直接返回 false | **无** |
+| 时刻 | currentUser$ | probableUser$ | authRetryGuard | 发射的事件 |
+|-----|-------------|--------------|---------------|----------|
+| 刷新成功 | 不变(HoppUser) | 不变 | failCount=0 | `token_refresh` |
+| 刷新失败(1-2次) | 不变(HoppUser) | 不变 | failCount++ | **无** |
+| 刷新失败(3次) | null | null | isExhausted=true | `logout` |
+| 耗尽后请求 | null | null | 直接返回 false | **无** |
 
 ---
 
 ## 十四、时序图：初始化路径刷新成功
 
 ```
-Frontend                                Backend
-    │                                      │
-    │  performAuthInit()                   │
-    │  probableUser$ ← localStorage        │
-    │                                      │
-    │  setInitialUser() [第1次]            │
-    │  ├─ isGettingInitialUser = true      │
-    │  └─── GQL /me (with cookies) ───────▶│
-    │  ◀─── errors: "Unauthorized" ────────│  (Access Token 过期)
-    │                                      │
-    │  refreshToken()                      │
-    │  ──── GET /auth/refresh ────────────▶│
-    │                                      │  RTJwtStrategy 验证
-    │                                      │  refreshAuthTokens()
-    │                                      │  argon2.verify() ✅
-    │                                      │  generateAuthTokens()
-    │  ◀─── 200 + Set-Cookie ─────────────│  (新 access_token + refresh_token)
-    │                                      │
-    │  authEvents$.next("token_refresh")   │
-    │    → GQL 客户端重建                   │
-    │    → syncers.startListening()         │
-    │    → authExchange 初始化               │
-    │      → waitProbableLoginToConfirm()   │
-    │        → watch 注册                   │
-    │  (currentUser$ 仍为 null!)            │
-    │                                      │
-    │  setInitialUser() [第2次，递归]       │
-    │  ├─ isGettingInitialUser = true       │  (true→true，无变化)
-    │  └─── GQL /me (with 新 cookies) ─────▶│
-    │  ◀─── { data: { me: {...} } } ───────│
-    │                                      │
-    │  setUser(hoppUser)                   │
-    │  currentUser$ ← hoppUser             │
-    │  isGettingInitialUser = false        │  (true→false，触发 watch!)
-    │  authEvents$.next("login")           │
-    │    → GQL 客户端再次重建               │
-    │    → authRetryGuard.reset()           │
-    │                                      │
+Frontend                                      Backend
+    │                                            │
+    │  performAuthInit()                         │
+    │  probableUser$ ← localStorage              │
+    │                                            │
+    │  await setInitialUser() [调用#1]           │
+    │  ├─ isGettingInitialUser = true            │
+    │  └─── GQL /me ──────────────────────────▶ │
+    │  ◀─── errors: "Unauthorized" ───────────── │
+    │                                            │
+    │  await refreshToken()                      │
+    │  ──── GET /auth/refresh ─────────────────▶ │
+    │                                            │  验证 RT ✅
+    │                                            │  生成新 Token
+    │  ◀─── 200 + Set-Cookie ────────────────── │
+    │                                            │
+    │  authEvents$.next("token_refresh")         │
+    │    ├─ GQL 客户端重建 #1 (currentUser=null) │
+    │    ├─ watch 注册 (等待 isGettingInitialUser)
+    │    └─ syncers.startListening()             │
+    │                                            │
+    │  setInitialUser() [调用#2，无 await]       │
+    │  ├─ isGettingInitialUser = true (无变化)   │
+    │  └─── GQL /me ──────────────────────────▶ │
+    │                                            │
+    │  setInitialUser(1) return                  │  ← performAuthInit 的 await 结束
+    │  (performAuthInit 返回，但初始化未完成！)    │
+    │                                            │
+    │  ◀─── { data: { me: {...} } } ─────────── │
+    │                                            │
+    │  setUser(hoppUser)                         │
+    │  currentUser$ ← hoppUser                   │
+    │  isGettingInitialUser = false              │  ← watch 触发 resolve
+    │  authEvents$.next("login")                 │
+    │    ├─ GQL 客户端重建 #2 (currentUser=用户)  │
+    │    ├─ WebSocket 创建                       │
+    │    └─ authRetryGuard.reset()               │
+    │                                            │
 ```
 
 ---
@@ -916,57 +849,39 @@ Frontend                                Backend
 ## 十五、时序图：GQL 运行时刷新耗尽
 
 ```
-Frontend                                Backend
-    │                                      │
-    │  GQL 请求 (已登录状态)               │
-    │  ──── GQL query ───────────────────▶│
-    │  ◀─── errors: "jwt expired" ────────│
-    │                                      │
-    │  didAuthError() → true               │
-    │  refreshAuth()                       │
-    │  └─ authRetryGuard.execute()         │
-    │     └─ refreshToken()                │
-    │        ──── GET /auth/refresh ──────▶│
-    │        ◀─── 401 (RT 也过期) ─────────│
-    │        return false                  │
-    │     failCount = 1                    │
-    │     return false                     │
-    │  authExchange 放弃，请求失败          │
-    │                                      │
-    │  [下一次 GQL 请求]                   │
-    │  ──── GQL query ───────────────────▶│
-    │  ◀─── errors: "auth/fail" ──────────│
-    │                                      │
-    │  didAuthError() → true               │
-    │  refreshAuth()                       │
-    │  └─ authRetryGuard.execute()         │
-    │     └─ refreshToken() → false        │
-    │     failCount = 2                    │
-    │     return false                     │
-    │                                      │
-    │  [第三次 GQL 请求]                   │
-    │  ──── GQL query ───────────────────▶│
-    │  ◀─── errors: "UNAUTHENTICATED" ────│
-    │                                      │
-    │  refreshAuth()                       │
-    │  └─ authRetryGuard.execute()         │
-    │     └─ refreshToken() → false        │
-    │     failCount = 3                    │
-    │     isExhausted = true               │
-    │     onExhausted() → signOutUser()    │
-    │        ├─ logout() ── GET /auth/logout ─▶│
-    │        ├─ currentUser$.next(null)    │
-    │        ├─ probableUser$.next(null)   │
-    │        ├─ removeLocalConfig()        │
-    │        └─ authEvents$.next("logout") │
-    │           → GQL 客户端重建(无用户)    │
-    │           → WebSocket 关闭            │
-    │           → syncers.stopListening()  │
-    │     return false                     │
-    │                                      │
-    │  [后续所有请求]                       │
-    │  authRetryGuard.execute() → false    │
-    │  (isExhausted, 不再调用 refreshToken)│
+Frontend                                      Backend
+    │                                            │
+    │  GQL 请求 (已登录)                         │
+    │  ──── GQL query ────────────────────────▶ │
+    │  ◀─── errors: "jwt expired" ───────────── │
+    │                                            │
+    │  didAuthError() → true                     │
+    │  authRetryGuard.execute() → refreshToken() │
+    │  ──── GET /auth/refresh ────────────────▶ │
+    │  ◀─── 401 ─────────────────────────────── │
+    │  failCount = 1                             │
+    │                                            │
+    │  [下一次 GQL 请求]                         │
+    │  ──── GQL query ────────────────────────▶ │
+    │  ◀─── errors: "auth/fail" ─────────────── │
+    │  failCount = 2                             │
+    │                                            │
+    │  [第三次 GQL 请求]                         │
+    │  ──── GQL query ────────────────────────▶ │
+    │  ◀─── errors: "UNAUTHENTICATED" ───────── │
+    │  failCount = 3                             │
+    │  isExhausted = true                        │
+    │  signOutUser()                             │
+    │  ──── GET /auth/logout ─────────────────▶ │
+    │  currentUser$ = null                       │
+    │  authEvents$.next("logout")                │
+    │    ├─ GQL 客户端重建 (无用户)              │
+    │    ├─ WebSocket 关闭                       │
+    │    └─ syncers.stopListening()              │
+    │                                            │
+    │  [后续请求]                                │
+    │  authRetryGuard → false (不再刷新)         │
+    │                                            │
 ```
 
 ---
@@ -979,7 +894,6 @@ Frontend                                Backend
 | `INFRA.ACCESS_TOKEN_VALIDITY` | `86400000` | Access Token 有效期 (ms，1天) |
 | `INFRA.REFRESH_TOKEN_VALIDITY` | `604800000` | Refresh Token 有效期 (ms，7天) |
 | `INFRA.ALLOW_SECURE_COOKIES` | `false` | 是否启用 Secure Cookie |
-| `INFRA.TOKEN_SALT_COMPLEXITY` | - | bcrypt salt 复杂度 |
 
 ---
 
@@ -988,7 +902,7 @@ Frontend                                Backend
 1. **HttpOnly Cookie**：前端 JS 无法读取 Token，防止 XSS 窃取
 2. **Refresh Token Rotation**：每次刷新生成全新 Token 对，旧 Token 即刻失效
 3. **argon2 双重验证**：数据库不存明文，即使 JWT 有效也需哈希匹配
-4. **重试次数限制**（运行时路径）：3 次失败后强制登出，防止无限循环
+4. **重试次数限制**（运行时路径）：3 次失败后强制登出
 5. **SameSite=Lax Cookie**：防止 CSRF 攻击
 6. **Secure Cookie（可选）**：HTTPS 传输加密
 
@@ -999,27 +913,25 @@ Frontend                                Backend
 | 功能模块 | 文件路径 | 关键行号 |
 |---------|---------|---------|
 | AuthEvent 类型定义 | `hoppscotch-common/src/platform/auth.ts` | 37-41 |
-| 自托管 Web authEvents$ 声明 | `hoppscotch-selfhost-web/src/platform/auth/web/index.ts` | 16 |
-| 自托管 Web refreshToken() | 同上 | 152-173 |
-| 自托管 Web setInitialUser() | 同上 | 92-150 |
-| 自托管 Web setUser() | 同上 | 85-90 |
-| 自托管 Web signOutUser() | 同上 | 341-352 |
-| 自托管 Web waitProbableLoginToConfirm() | 同上 | 258-273 |
-| 自托管 Web isGettingInitialUser | 同上 | 83 |
-| 自托管 Web willBackendHaveAuthError() | 同上 | 228-230 |
-| 自托管 Web onBackendGQLClientShouldReconnect() | 同上 | 232-242 |
-| Admin AuthEvent 类型 | `hoppscotch-sh-admin/src/helpers/auth.ts` | 37-40 |
-| Admin setInitialUser() | 同上 | 92-136 |
+| authEvents$ 声明 | `hoppscotch-selfhost-web/src/platform/auth/web/index.ts` | 16 |
+| isGettingInitialUser | 同上 | 83 |
+| setUser() | 同上 | 85-90 |
+| setInitialUser() | 同上 | 92-150 |
+| refreshToken() | 同上 | 152-173 |
+| willBackendHaveAuthError() | 同上 | 228-230 |
+| onBackendGQLClientShouldReconnect() | 同上 | 232-242 |
+| performAuthInit() | 同上 | 250-256 |
+| waitProbableLoginToConfirm() | 同上 | 258-273 |
+| signOutUser() | 同上 | 341-352 |
+| refreshAuthToken() | 同上 | 354-356 |
 | GQL authExchange 配置 | `hoppscotch-common/src/helpers/backend/GQLClient.ts` | 74-118 |
-| GQL 客户端重建逻辑 | 同上 | 155-190 |
+| initBackendGQLClient() | 同上 | 155-190 |
 | authRetryGuard 创建 | 同上 | 69 |
 | authRetryGuard 实现 | `hoppscotch-common/src/helpers/retryAuthGuard.ts` | 1-78 |
+| Admin AuthEvent 类型 | `hoppscotch-sh-admin/src/helpers/auth.ts` | 37-40 |
 | 后端刷新端点 | `hoppscotch-backend/src/auth/auth.controller.ts` | 87-100 |
 | 后端刷新服务 | `hoppscotch-backend/src/auth/auth.service.ts` | 103-127, 335-363 |
 | 后端 RT JWT 策略 | `hoppscotch-backend/src/auth/strategies/rt-jwt.strategy.ts` | 20-49 |
 | 后端 AT JWT 策略 | `hoppscotch-backend/src/auth/strategies/jwt.strategy.ts` | 64-109 |
 | 后端 Cookie 处理 | `hoppscotch-backend/src/auth/helper.ts` | 38-82 |
-| 后端错误常量 | `hoppscotch-backend/src/errors.ts` | 25, 69, 601 |
 | GqlAuthGuard | `hoppscotch-backend/src/guards/gql-auth.guard.ts` | 6-11 |
-| 业务模块 token_refresh 订阅(settings) | `hoppscotch-selfhost-web/src/platform/settings/web/index.ts` | 33-41 |
-| 业务模块 token_refresh 订阅(collections) | `hoppscotch-selfhost-web/src/platform/collections/web/index.ts` | 91-99 |
