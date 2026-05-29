@@ -2,19 +2,71 @@
 
 ## 概述
 
-Hoppscotch 支持三种主要的请求发送路径，它们在 multipart 请求体的组装方式上有显著差异：
+Hoppscotch 支持两种主要的请求发送路径，它们在 multipart 请求体的组装方式上有显著差异：
 
-1. **浏览器路径（Browser/Axios）**：使用浏览器原生 `FormData` API，浏览器自动处理边界生成和报文拼装
-2. **桌面应用路径（Desktop/Relay/libcurl）**：通过 IPC 将结构化数据传递到 Rust 后端，由 libcurl 完成最终拼装
-3. **Native 路径（Native Interceptor）**：使用 Native 拦截器 + Desktop Relay，适用于需要高级认证（Digest/Hawk）
+1. **浏览器路径（Browser Interceptor + Axios Relay）**：使用浏览器原生 `FormData` API，浏览器自动处理边界生成和报文拼装
+2. **桌面应用路径（Native Interceptor + Desktop Relay/libcurl）**：通过 IPC 将结构化数据传递到 Rust 后端，由 libcurl 完成最终拼装
 
 ---
 
-## 1. 数据收集与预处理
+## 1. 组件命名与调用关系核实
 
-### 1.1 前端数据模型
+### 1.1 拦截器（Interceptor）
 
-**文件**: `packages/hoppscotch-data/src/rest/v/9/body.ts`
+**位置**：`packages/hoppscotch-common/src/platform/std/kernel-interceptors/`
+
+| 拦截器类名 | ID | 适用场景 | 底层 Relay |
+|-----------|-----|---------|-----------|
+| `BrowserKernelInterceptorService` | `browser` | Web 版 | Axios Relay (`id: "axios"`) |
+| `NativeKernelInterceptorService` | `native` | Desktop 版 | Desktop Relay (`id: "desktop"`) |
+| `ProxyKernelInterceptorService` | `proxy` | 代理模式 | - |
+| `ExtensionKernelInterceptorService` | `extension` | 浏览器扩展 | - |
+| `AgentKernelInterceptorService` | `agent` | Agent 模式 | - |
+
+> **重要纠正**：不存在 `DesktopKernelInterceptorService`，桌面端使用的是 `NativeKernelInterceptorService`。
+
+### 1.2 Relay 实现
+
+**位置**：`packages/hoppscotch-kernel/src/relay/impl/`
+
+| Relay 实现 | ID | 核心技术 | 支持 multipart |
+|-----------|-----|---------|---------------|
+| Web/Axios Relay | `axios` | Axios + 浏览器 | 是（FormData 透传） |
+| Desktop Relay | `desktop` | Tauri + libcurl | 是 |
+
+### 1.3 调用关系
+
+```
+浏览器路径：
+[BrowserKernelInterceptorService]
+    ↓ (id: "browser")
+[Relay.execute()]
+    ↓
+[getModule("relay")]
+    ↓
+[window.__KERNEL__.relay]
+    ↓
+[WEB_RELAY_IMPLS.v1.api] (id: "axios")
+
+桌面路径：
+[NativeKernelInterceptorService]
+    ↓ (id: "native")
+[Relay.execute()]
+    ↓
+[getModule("relay")]
+    ↓
+[window.__KERNEL__.relay]
+    ↓
+[DESKTOP_RELAY_IMPLS.v1.api] (id: "desktop")
+```
+
+---
+
+## 2. 数据收集与预处理
+
+### 2.1 前端数据模型
+
+**文件**：`packages/hoppscotch-data/src/rest/v/9/body.ts`
 
 ```typescript
 export const FormDataKeyValue = z
@@ -31,9 +83,9 @@ export const FormDataKeyValue = z
   )
 ```
 
-### 1.2 关键预处理步骤
+### 2.2 关键预处理步骤
 
-**文件**: `packages/hoppscotch-common/src/helpers/utils/EffectiveURL.ts:300-337`
+**文件**：`packages/hoppscotch-common/src/helpers/utils/EffectiveURL.ts:300-337`
 
 ```typescript
 if (request.body.contentType === "multipart/form-data") {
@@ -75,7 +127,7 @@ if (request.body.contentType === "multipart/form-data") {
 }
 ```
 
-**预处理要点**:
+**预处理要点**：
 - **过滤**：只保留激活且有效的字段
 - **排序**：文本字段优先，文件字段靠后（影响最终报文顺序）
 - **展开**：多文件数组拆分为独立 FormData 条目
@@ -83,11 +135,11 @@ if (request.body.contentType === "multipart/form-data") {
 
 ---
 
-## 2. FormData 转换（浏览器端）
+## 3. FormData 转换（浏览器端）
 
-### 2.1 转换函数
+### 3.1 转换函数
 
-**文件**: `packages/hoppscotch-common/src/helpers/functional/formData.ts:7-27`
+**文件**：`packages/hoppscotch-common/src/helpers/functional/formData.ts:7-27`
 
 ```typescript
 export const toFormData = (values: FormDataEntry[]) => {
@@ -113,9 +165,9 @@ export const toFormData = (values: FormDataEntry[]) => {
 
 ---
 
-## 3. 路径一：浏览器 Fetch/Axios 路径
+## 4. 路径一：Browser Interceptor + Axios Relay
 
-### 3.1 数据流
+### 4.1 数据流
 
 ```
 用户输入表单
@@ -128,14 +180,16 @@ export const toFormData = (values: FormDataEntry[]) => {
     ↓
 [transformContent] 包装为 ContentType
     ↓
-[BrowserKernelInterceptorService] 调用 Relay
+[BrowserKernelInterceptorService] (id: "browser")
+    ↓
+[Relay.execute()] → Axios Relay (id: "axios")
     ↓
 Axios 发送请求（data: FormData 对象）
     ↓
 浏览器自动拼装 multipart 报文
 ```
 
-### 3.2 边界值生成时机
+### 4.2 边界值生成时机
 
 **关键组件**：浏览器内置的 HTTP 栈（由 Axios 调用）
 
@@ -146,23 +200,23 @@ Axios 发送请求（data: FormData 对象）
 | **浏览器发送请求前** | 浏览器自动生成唯一的 boundary 字符串 |
 | **报文拼装时** | 浏览器将 boundary 写入 Content-Type 头和请求体 |
 
-### 3.3 浏览器自动拼装的报文结构
+### 4.3 浏览器自动拼装的报文结构
 
 ```
 [HTTP Header]
 Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
 
 [Request Body]
-------WebKitFormBoundary7MA4YWxkTrZu0gW\r\n                    ← 边界前缀（-- + boundary）
-Content-Disposition: form-data; name="username"\r\n             ← 字段头
-\r\n                                                             ← 空行（CRLF）
-john_doe\r\n                                                     ← 内容 + CRLF
-------WebKitFormBoundary7MA4YWxkTrZu0gW\r\n                    ← 下一个边界
+------WebKitFormBoundary7MA4YWxkTrZu0gW\r\n
+Content-Disposition: form-data; name="username"\r\n
+\r\n
+john_doe\r\n
+------WebKitFormBoundary7MA4YWxkTrZu0gW\r\n
 Content-Disposition: form-data; name="avatar"; filename="a.png"\r\n
 Content-Type: image/png\r\n
 \r\n
 [二进制图片数据]\r\n
-------WebKitFormBoundary7MA4YWxkTrZu0gW--\r\n                  ← 结束边界（-- + boundary + --）
+------WebKitFormBoundary7MA4YWxkTrZu0gW--\r\n
 ```
 
 **拼装顺序规则**：
@@ -176,9 +230,9 @@ Content-Type: image/png\r\n
 
 ---
 
-## 4. 路径二：Desktop Relay / libcurl 路径
+## 5. 路径二：Native Interceptor + Desktop Relay/libcurl
 
-### 4.1 完整数据流
+### 5.1 完整数据流
 
 ```
 用户输入表单
@@ -189,7 +243,7 @@ Content-Type: image/png\r\n
     ↓
 [transformContent] → { kind: "multipart", content: FormData }
     ↓
-[DesktopKernelInterceptorService] 调用
+[NativeKernelInterceptorService] (id: "native")
     ↓
 [relayRequestToNativeAdapter] 序列化
     ↓
@@ -204,17 +258,10 @@ IPC 跨进程传输到 Rust 后端
 libcurl 发送请求时自动拼装
 ```
 
-### 4.2 拦截器与 Relay 入口核实
+### 5.2 Native 拦截器执行流程
 
-**Native 路径实际使用的组件：
+**文件**：`packages/hoppscotch-common/src/platform/std/kernel-interceptors/native/index.ts:179-226`
 
-| 组件 | 类名/ID | 文件路径 |
-|--------|-----------|----------|
-| **拦截器服务** | `NativeKernelInterceptorService<br>ID: `NATIVE_KERNEL_INTERCEPTOR_SERVICE | `packages/hoppscotch-common/src/platform/std/kernel-interceptors/native/index.ts` |
-| **Relay 入口** | `Relay.execute()` → `getModule("relay")` → `DESKTOP_RELAY_IMPLS.v1.api` | `packages/hoppscotch-kernel/src/relay/impl/desktop/v/1.ts` |
-| **Relay ID** | `id: "desktop"` | Desktop Relay 实现 ID 为 "desktop"，非 "native" |
-
-**Native 拦截器执行流程（native/index.ts:179-226):
 ```typescript
 private async executeRequest(
   request: RelayRequest,
@@ -225,7 +272,7 @@ private async executeRequest(
     preProcessRelayRequest(request)
   )
 
-  // 2. 转换为 native 格式
+  // 2. 转换为 native 格式（包含 FormData 序列化）
   const nativeRequest = await relayRequestToNativeAdapter(
     effectiveRequestWithUserAgent
   )
@@ -233,29 +280,30 @@ private async executeRequest(
   // 3. 后处理（superjson 序列化）
   const postProcessedRequest = postProcessRelayRequest(nativeRequest)
 
-  // 4. 调用 Desktop Relay
+  // 4. 调用 Desktop Relay (id: "desktop")
   const relayExecution = Relay.execute(postProcessedRequest)
 
   return await relayExecution.response
 }
 ```
 
-**Kernel 初始化（kernel/src/index.ts:46-61）：
+**Kernel 初始化**（`packages/hoppscotch-kernel/src/index.ts:46-61`）：
+
 ```typescript
 export function initKernel(mode?: KernelMode): KernelAPI {
   if (mode === "desktop") {
     const kernel: KernelAPI = {
       // ...
-      relay: DESKTOP_RELAY_IMPLS.v1.api,  // ← 使用 Desktop Relay 实现
+      relay: DESKTOP_RELAY_IMPLS.v1.api,  // 使用 Desktop Relay 实现
       // ...
     }
   }
 }
 ```
 
-### 4.3 FormData 序列化（跨进程传输）
+### 5.3 FormData 序列化（跨进程传输）
 
-**文件**: `packages/hoppscotch-kernel/src/relay/v/1.ts:724-761`
+**文件**：`packages/hoppscotch-kernel/src/relay/v/1.ts:724-761`
 
 ```typescript
 const makeFormDataSerializable = async (
@@ -285,65 +333,74 @@ const makeFormDataSerializable = async (
 }
 ```
 
-### 4.4 同名字段交错的顺序变化
+### 5.4 同名字段的顺序变化（完整示例）
 
-**关键问题**：`formData.entries()` 按 `append()` 顺序返回所有条目，但 `Map.set()` 会将同名字段**按键分组，导致**同名字段被合并，**改变相对顺序**。
+**关键问题**：`formData.entries()` 按 `append()` 顺序返回所有条目，但 `Map.set()` 会将同名字段**按键分组**，导致**同名字段被合并**，改变相对顺序。
 
 #### 示例：同名字段交错场景
 
-假设原始 `FormData.append() 顺序如下（文本-文件-文本交错）：
+假设原始 `FormData.append()` 顺序如下（文本-文件-文本交错）：
 
 ```typescript
-formData.append("file", file1)       // 第1个 file 字段
-formData.append("file", "text1")   // 第2个 file 字段（文本）
-formData.append("file", file2)       // 第3个 file 字段
-formData.append("name", "john")        // name 字段
+// 原始 append 顺序（模拟用户在 UI 中的输入顺序）
+formData.append("file", file1)       // 第1个 file 字段（文件）
+formData.append("file", "text1")     // 第2个 file 字段（文本）
+formData.append("file", file2)       // 第3个 file 字段（文件）
+formData.append("name", "john")      // name 字段
 ```
 
-**`formData.entries()` 迭代顺序（原始顺序）：
+**阶段一：FormData.entries() 迭代（原始顺序）**
+
 ```
+formData.entries() 输出顺序：
 1. ["file", file1]
 2. ["file", "text1"]
 3. ["file", file2]
 4. ["name", "john"]
 ```
 
-**`Map` 转换后的顺序（按键分组）：
-```
+**阶段二：Map 聚合（按键分组）**
+
+```typescript
+// 遍历过程
+const m = new Map()
+m.set("file", [file1])              // 第1次：新增键 "file"
+m.get("file")!.push(textEntry1)     // 第2次：同键追加
+m.get("file")!.push(file2)          // 第3次：同键追加
+m.set("name", [textEntry])          // 第4次：新增键 "name"
+
+// Map 内部状态
 Map {
-  "file" → [file1, "text1", file2],  // ← 同名字段被合并
-  "name" → ["john"]
+  "file" → [file1, textEntry1, file2],  // 同名字段被合并为数组
+  "name" → [textEntry]
 }
 ```
 
-**最终 Rust 侧 `Array.from(m.entries()) 输出：
+**阶段三：Array.from(m.entries()) 输出**
+
 ```typescript
+// 最终序列化结果
 [
-  ["file", [file1, textEntry, file2]],  // ← 所有 "file" 字段值合并在一起
+  ["file", [file1, textEntry1, file2]],  // 所有 "file" 字段值合并在一起
   ["name", [textEntry]]
 ]
 ```
 
-**顺序变化影响**：
+**阶段四：Rust 侧遍历拼装（`content.rs:267-285`）**
 
-| 阶段 | 顺序 | 说明 |
-|------|------|------|
-| **原始 append 顺序 | `file(file) → file(text) → file(file) → name | 同名字段交错分布 |
-| **Map 转换后** | `file([file, text, file) → name | 同名字段被合并到一起 |
-
-**Rust 侧拼装顺序（content.rs:267-285）：
 ```rust
 for (key, values) in content {
     for value in values {
         match value {
-            FormValue::Text { value } => { /* 添加文本字段 }
-            FormValue::File { .. } => { /* 添加文件字段 }
+            FormValue::Text { value } => { /* 添加文本字段 */ }
+            FormValue::File { .. } => { /* 添加文件字段 */ }
         }
     }
 }
 ```
 
-**最终报文顺序（Rust 侧）：
+**最终报文顺序（Rust 侧）**：
+
 ```
 --{boundary}\r\n
 Content-Disposition: form-data; name="file"; filename="file1.txt"\r\n
@@ -359,13 +416,22 @@ Content-Disposition: form-data; name="name"\r\n
 ...
 ```
 
-> **重要提示**：同名字段的相对顺序在 Map 转换后保持其内部值的顺序保持不变，但**同名字段会被**连续排列**，而不是交错分布。这符合 RFC 7578 规范的要求，但与原始 append 顺序可能不同。
+**顺序变化对比表**：
+
+| 阶段 | 顺序 | 说明 |
+|------|------|------|
+| **原始 append 顺序** | `file(file) → file(text) → file(file) → name` | 同名字段交错分布 |
+| **Map 转换后** | `file([file, text, file]) → name` | 同名字段被合并到一起 |
+| **最终报文顺序** | `file(file) → file(text) → file(file) → name` | 同名字段连续排列 |
+
+> **重要结论**：同名字段的内部值顺序保持不变，但**同名字段会被连续排列**，而不是保持原始的交错分布。这符合 RFC 7578 规范的要求，但与原始 UI 输入顺序可能不同。
 
 **序列化后的数据结构**：
+
 ```typescript
 // TypeScript 侧
 [
-  ["username", [{ kind: "text", value: "john_doe" }],
+  ["username", [{ kind: "text", value: "john_doe" }]],
   ["avatar", [{ kind: "file", filename: "a.png", contentType: "image/png", data: Uint8Array }]]
 ]
 
@@ -377,9 +443,9 @@ pub enum FormValue {
 pub type FormData = Vec<(String, Vec<FormValue>)>;
 ```
 
-### 4.5 Rust 侧 - libcurl 表单构建
+### 5.5 Rust 侧 - libcurl 表单构建
 
-**文件**: `packages/hoppscotch-desktop/plugin-workspace/relay/src/content.rs:201-347`
+**文件**：`packages/hoppscotch-desktop/plugin-workspace/relay/src/content.rs:201-347`
 
 ```rust
 fn set_form_content(
@@ -416,7 +482,7 @@ fn set_form_content(
 }
 ```
 
-### 4.6 libcurl 边界值生成时机
+### 5.6 libcurl 边界值生成时机
 
 **关键组件**：libcurl 库的内部实现
 
@@ -427,7 +493,7 @@ fn set_form_content(
 | **handle.httppost(form) 时** | 绑定到请求，不生成边界 |
 | **curl_easy_perform() 执行时** | libcurl 内部生成 boundary，拼装完整报文 |
 
-### 4.7 libcurl 拼装的报文结构
+### 5.7 libcurl 拼装的报文结构
 
 libcurl 生成的报文格式与浏览器一致，符合 RFC 7578 规范：
 
@@ -436,7 +502,7 @@ libcurl 生成的报文格式与浏览器一致，符合 RFC 7578 规范：
 Content-Type: multipart/form-data; boundary=------------------------d74496d66958873e
 
 [Request Body]
---------------------------d74496d66958873e\r\n                ← libcurl 生成的边界
+--------------------------d74496d66958873e\r\n
 Content-Disposition: form-data; name="username"\r\n
 \r\n
 john_doe\r\n
@@ -445,23 +511,26 @@ Content-Disposition: form-data; name="avatar"; filename="a.png"\r\n
 Content-Type: image/png\r\n
 \r\n
 [二进制图片数据]\r\n
---------------------------d74496d66958873e--\r\n              ← 结束边界
+--------------------------d74496d66958873e--\r\n
 ```
 
 ---
 
-## 5. Content-Type 头预置与 boundary 自动生成的关联
+## 6. Content-Type 头预置与 boundary 生成的关系
 
-### 5.1 Content-Type 头预置逻辑
+### 6.1 Content-Type 头预置逻辑
 
-**文件**: `packages/hoppscotch-common/src/helpers/utils/EffectiveURL.ts:83-138`
+**文件**：`packages/hoppscotch-common/src/helpers/utils/EffectiveURL.ts:83-138`
 
 ```typescript
 export const getComputedBodyHeaders = (
   req: HoppRESTRequest | { auth: HoppRESTAuth; headers: HoppRESTHeaders }
 ): HoppRESTHeader[] => {
   // 如果用户已手动设置 Content-Type，则跳过自动生成
-  if (req.headers.find(req) req.active && req.key.toLowerCase() === "content-type")
+  if (
+    req.headers.find(
+      (req) => req.active && req.key.toLowerCase() === "content-type"
+    )
   )
     return []
 
@@ -479,38 +548,49 @@ export const getComputedBodyHeaders = (
 }
 ```
 
-### 5.2 预置 Content-Type 与 boundary 生成的交互
+### 6.2 预置 Content-Type 与 boundary 生成的交互
 
 | 场景 | 预置头内容 | 底层库行为 | 最终 Content-Type 头 |
-|------|-------------|-------------|-------------------|
-| **用户未手动设置 | `multipart/form-data` | 浏览器/libcurl 自动添加 boundary | `multipart/form-data; boundary=xxxx |
-| **用户手动设置（无 boundary） | 无（用户自定义 | 浏览器/libcurl 添加 boundary | 用户值 + `; boundary=xxxx |
-| **用户手动设置（含 boundary） | 无（用户自定义） | 浏览器/libcurl 使用用户提供的 boundary | 用户值（包含用户 boundary |
+|------|-----------|-----------|---------------------|
+| **用户未手动设置** | `multipart/form-data` | 浏览器/libcurl 自动添加 boundary | `multipart/form-data; boundary=xxxx` |
+| **用户手动设置（无 boundary）** | 用户自定义值 | 浏览器/libcurl 添加 boundary | `{用户值}; boundary=xxxx` |
+| **用户手动设置（含 boundary）** | 用户自定义值（含 boundary） | 浏览器/libcurl 使用用户提供的 boundary | `{用户值}` |
 
-### 5.3 浏览器（Browser 处理逻辑：
+### 6.3 浏览器（Axios）处理逻辑
 
 1. **预置头**：`Content-Type: multipart/form-data`
 2. **发送时**：浏览器检测到 body 是 FormData，自动在 header 后追加 `; boundary=...`
 3. **最终 header**：`Content-Type: multipart/form-data; boundary=----WebKitFormBoundary...`
 
-### 5.4 libcurl 处理逻辑：
+### 6.4 libcurl 处理逻辑
 
 1. **预置头**：`Content-Type: multipart/form-data`
 2. **执行时**：libcurl 的 `curl_easy_perform()` 内部生成 boundary
 3. **最终 header**：`Content-Type: multipart/form-data; boundary=------------------------...`
 
-### 5.5 关键要点：
+### 6.5 可验证的结论
 
-- **预置的 Content-Type 不包含 boundary**：boundary 是底层库在发送时**动态生成**的
-- **用户手动设置优先**：如果用户手动设置了 Content-Type 头，系统不会自动覆盖
-- **boundary 唯一性保证**：浏览器和 libcurl 都使用随机数生成器确保 boundary 不会出现在内容中
-- **预置头的作用**：告知服务器请求体类型，但具体 boundary 由底层库决定
+**结论 1：预置的 Content-Type 不包含 boundary**
+- boundary 是底层库在发送时**动态生成**的
+- JavaScript 层无法获取或控制实际的 boundary 值
+
+**结论 2：用户手动设置优先**
+- 如果用户手动设置了 Content-Type 头，系统不会自动覆盖
+- 用户可以手动指定 boundary，但不推荐（底层库生成的更安全）
+
+**结论 3：boundary 唯一性由底层库保证**
+- 浏览器和 libcurl 都使用随机数生成器确保 boundary 不会出现在内容中
+- 理论上存在冲突概率，但实际应用中可忽略
+
+**结论 4：预置头仅起告知作用**
+- 预置头的作用是告知服务器请求体类型
+- 具体 boundary 由底层库在发送前决定
 
 ---
 
-## 6. 文本字段 vs 文件字段：拼装细节对比
+## 7. 文本字段 vs 文件字段：拼装细节对比
 
-### 6.1 文本字段拼装
+### 7.1 文本字段拼装
 
 | 组件 | 内容 | 说明 |
 |------|------|------|
@@ -521,7 +601,7 @@ export const getComputedBodyHeaders = (
 | **内容** | 文本字符串 | UTF-8 编码 |
 | **结尾** | `\r\n` | 字段结束 |
 
-### 6.2 文件字段拼装
+### 7.2 文件字段拼装
 
 | 组件 | 内容 | 说明 |
 |------|------|------|
@@ -532,14 +612,15 @@ export const getComputedBodyHeaders = (
 | **内容** | 二进制数据 | 原始字节，不编码 |
 | **结尾** | `\r\n` | 字段结束 |
 
-### 6.3 字段顺序保证
+### 7.3 字段顺序保证
 
 两种路径都通过特定机制保证字段顺序：
 
 1. **浏览器路径**：`FormData.entries()` 按 `append()` 顺序迭代
 2. **Desktop 路径**：使用 `Map` 存储（ES2015 保证插入顺序），序列化后传给 Rust
 
-**排序规则**（EffectiveURL.ts:312-316）：
+**排序规则**（`EffectiveURL.ts:312-316`）：
+
 ```typescript
 // 文本字段在前，文件字段在后
 arraySort((a, b) => {
@@ -551,28 +632,30 @@ arraySort((a, b) => {
 
 ---
 
-## 7. 三条路径对比总结
+## 8. 两条路径对比总结
 
-| 对比项 | 浏览器 Fetch 路径 | Desktop Relay/libcurl 路径 | Native Interceptor 路径 |
-|--------|------------------|---------------------------|-----------------------|
-| **拦截器类名 | `BrowserKernelInterceptorService | `DesktopKernelInterceptorService | `NativeKernelInterceptorService |
-| **Relay 实现 ID | `"axios"` | `"desktop"` | `"desktop"` |
-| **边界生成者 | 浏览器内置 HTTP 栈 | libcurl 库内部 | libcurl 库内部 |
-| **生成时机 | 发送请求瞬间 | curl_easy_perform() 执行时 | curl_easy_perform() 执行时 |
-| **拼装位置** | JavaScript 运行时 + 浏览器内核 | Rust 后端 + libcurl | Rust 后端 + libcurl |
-| **数据传输** | 内存中 FormData 对象 | IPC 序列化的结构化数据 | IPC 序列化的结构化数据 |
-| **Content-Type 头** | 浏览器自动设置 | libcurl 自动设置 | libcurl 自动设置 |
-| **字段顺序** | FormData append 顺序 | Map 插入顺序（预处理时排序） | Map 插入顺序（预处理时排序） |
-| **二进制处理** | 浏览器直接处理 Blob | 转换为 Uint8Array 跨进程传输 | 转换为 Uint8Array 跨进程传输 |
-| **适用场景** | Web 版 Hoppscotch | 桌面版 Hoppscotch | 桌面版（需高级认证） |
+| 对比项 | Browser Interceptor + Axios Relay | Native Interceptor + Desktop Relay |
+|--------|----------------------------------|-----------------------------------|
+| **拦截器类名** | `BrowserKernelInterceptorService` | `NativeKernelInterceptorService` |
+| **拦截器 ID** | `browser` | `native` |
+| **Relay 实现 ID** | `axios` | `desktop` |
+| **边界生成者** | 浏览器内置 HTTP 栈 | libcurl 库内部 |
+| **生成时机** | 发送请求瞬间 | `curl_easy_perform()` 执行时 |
+| **拼装位置** | JavaScript 运行时 + 浏览器内核 | Rust 后端 + libcurl |
+| **数据传输** | 内存中 FormData 对象 | IPC 序列化的结构化数据 |
+| **Content-Type 头** | 浏览器自动设置 | libcurl 自动设置 |
+| **字段顺序** | FormData append 顺序 | Map 插入顺序（预处理时排序） |
+| **二进制处理** | 浏览器直接处理 Blob | 转换为 Uint8Array 跨进程传输 |
+| **适用场景** | Web 版 Hoppscotch | 桌面版 Hoppscotch |
+| **同名字段处理** | 保持原始交错顺序 | 合并为连续条目 |
 
-### 7.1 共同点
+### 8.1 共同点
 
 1. **都不手动拼装报文**：两种路径都依赖底层库（浏览器/libcurl）处理边界生成和报文拼装
 2. **字段排序相同**：预处理时都将文本字段排在前面，文件字段在后面
 3. **最终报文格式一致**：都符合 RFC 7578 规范，服务器端无法区分来源
 
-### 7.2 关键差异
+### 8.2 关键差异
 
 - **边界值可见性**：两种路径下，JavaScript 层都**无法**获取或控制实际的 boundary 值
 - **调试难度**：浏览器路径可通过 DevTools Network 面板查看完整报文；Desktop 路径需要启用 curl 调试日志
@@ -581,18 +664,19 @@ arraySort((a, b) => {
 
 ---
 
-## 8. 边界值（Boundary）深入解析
+## 9. 边界值（Boundary）深入解析
 
-### 8.1 边界值格式规范
+### 9.1 边界值格式规范
 
 根据 RFC 2046 Section 5.1.1：
+
 ```
 boundary := 0*69<bchars> bcharsnospace
 bchars := bcharsnospace / " "
 bcharsnospace := DIGIT / ALPHA / "'" / "(" / ")" / "+" / "_" / "," / "-" / "." / "/" / ":" / "=" / "?"
 ```
 
-### 8.2 典型边界值示例
+### 9.2 典型边界值示例
 
 | 生成源 | 示例 |
 |--------|------|
@@ -601,7 +685,7 @@ bcharsnospace := DIGIT / ALPHA / "'" / "(" / ")" / "+" / "_" / "," / "-" / "." /
 | **libcurl** | `------------------------d74496d66958873e` |
 | **Node.js form-data** | `--------------------------${随机串}` |
 
-### 8.3 边界值唯一性保证
+### 9.3 边界值唯一性保证
 
 - 浏览器和 libcurl 都使用随机数生成器确保边界值不会出现在内容中
 - 理论上存在冲突概率，但实际应用中可忽略
@@ -609,13 +693,13 @@ bcharsnospace := DIGIT / ALPHA / "'" / "(" / ")" / "+" / "_" / "," / "-" / "." /
 
 ---
 
-## 9. CRLF 与换行处理
+## 10. CRLF 与换行处理
 
-### 9.1 规范要求（RFC 7578 Section 4.1）
+### 10.1 规范要求（RFC 7578 Section 4.1）
 
 > The parts are separated by the boundary delimiter line. Each part is preceded by a boundary delimiter line, and the last part is followed by a closing boundary delimiter line. Each boundary delimiter line must be followed immediately by a CRLF.
 
-### 9.2 拼装时的 CRLF 插入点
+### 10.2 拼装时的 CRLF 插入点
 
 ```
 --{boundary}\r\n           ← 边界后必须有 CRLF
@@ -626,7 +710,7 @@ bcharsnospace := DIGIT / ALPHA / "'" / "(" / ")" / "+" / "_" / "," / "-" / "." /
 --{boundary}--\r\n         ← 结束边界后有 CRLF
 ```
 
-### 9.3 常见坑点
+### 10.3 常见坑点
 
 1. **缺失结尾 CRLF**：某些服务器对格式要求严格，缺少会导致解析失败
 2. **LF 代替 CRLF**：Unix 风格换行在 multipart 中是错误的
@@ -634,7 +718,7 @@ bcharsnospace := DIGIT / ALPHA / "'" / "(" / ")" / "+" / "_" / "," / "-" / "." /
 
 ---
 
-## 10. 相关代码文件索引
+## 11. 相关代码文件索引
 
 | 文件路径 | 职责 |
 |----------|------|
@@ -642,16 +726,17 @@ bcharsnospace := DIGIT / ALPHA / "'" / "(" / ")" / "+" / "_" / "," / "-" / "." /
 | `packages/hoppscotch-common/src/helpers/utils/EffectiveURL.ts` | 请求体预处理、排序、环境变量解析 |
 | `packages/hoppscotch-common/src/helpers/functional/formData.ts` | FormData 对象构建 |
 | `packages/hoppscotch-kernel/src/relay/v/1.ts` | FormData 序列化、跨平台传输格式 |
-| `packages/hoppscotch-kernel/src/relay/impl/web/v/1.ts` | 浏览器/Axios 路径实现 |
-| `packages/hoppscotch-kernel/src/relay/impl/desktop/v/1.ts` | Desktop Relay 入口（ID: "desktop" |
-| `packages/hoppscotch-common/src/platform/std/kernel-interceptors/native/index.ts` | Native 拦截器实现 |
+| `packages/hoppscotch-kernel/src/relay/impl/web/v/1.ts` | Axios Relay 实现（ID: "axios"） |
+| `packages/hoppscotch-kernel/src/relay/impl/desktop/v/1.ts` | Desktop Relay 实现（ID: "desktop"） |
+| `packages/hoppscotch-common/src/platform/std/kernel-interceptors/browser/index.ts` | Browser 拦截器（ID: "browser"） |
+| `packages/hoppscotch-common/src/platform/std/kernel-interceptors/native/index.ts` | Native 拦截器（ID: "native"） |
 | `packages/hoppscotch-desktop/plugin-workspace/relay/src/content.rs` | Rust 侧内容处理、libcurl Form 构建 |
 | `packages/hoppscotch-desktop/plugin-workspace/relay/src/interop.rs` | Rust 侧数据结构定义 |
 | `packages/hoppscotch-kernel/src/index.ts` | Kernel 初始化，Relay 实现选择 |
 
 ---
 
-## 11. 参考规范
+## 12. 参考规范
 
 - **RFC 7578**：Returning Values from Forms: multipart/form-data
 - **RFC 2046**：Multipurpose Internet Mail Extensions (MIME) Part Two: Media Types
