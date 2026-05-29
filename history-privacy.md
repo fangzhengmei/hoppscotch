@@ -253,20 +253,68 @@ private async setupRESTHistoryPersistence() {
 
 ### 3.5 Web 端与桌面端本地持久化介质差异
 
+#### 3.5.1 桌面端存储形态的准确实现描述
+
+**文件存储位置**（`packages/hoppscotch-selfhost-web/src/kernel/store.ts:11, 74-92`）：
+```typescript
+const STORE_PATH = "hoppscotch-unified.store"
+
+const getStorePath = async (): Promise<string> => {
+  // 桌面端：存储在系统配置目录下的 store 子目录中
+  // 通过 Tauri 命令 get_store_dir 获取，如 Windows: %APPDATA%\Hoppscotch\store
+  // macOS: ~/Library/Application Support/Hoppscotch/store
+  // Linux: ~/.config/Hoppscotch/store
+  if (getKernelMode() === "desktop") {
+    const storeDir = await getStoreDir()
+    cachedStorePath = await join(storeDir, STORE_PATH)
+    return cachedStorePath
+  }
+
+  // Web 端：仅使用文件名，localStorage 不涉及路径
+  cachedStorePath = STORE_PATH
+  return cachedStorePath
+}
+```
+
+**文件格式与数据结构**（`packages/hoppscotch-kernel/src/store/impl/desktop/v/1.ts:58-71`）：
+```typescript
+async init(): Promise<void> {
+  if (!this.store) {
+    this.store = await Store.load(this.storePath)  // 加载单个 JSON 文件
+    const loadedData = await this.store.get<NamespacedData>("data")
+    this.data = loadedData ?? {}
+  }
+}
+```
+
+**基于代码证据的定性结论**：
+| 定性描述 | 证据链 | 是否成立 |
+|---------|--------|---------|
+| 单文件存储 | `Store.load(this.storePath)` 只加载一个文件 | ✅ 成立 |
+| JSON 格式 | Tauri Store 插件默认使用 JSON 序列化，`get<NamespacedData>("data")` 直接解析对象 | ✅ 成立 |
+| 单键存储 | 所有 namespace 和 key 都存储在 `"data"` 一个键下 | ✅ 成立 |
+| 两级嵌套结构 | `data: { namespace: { key: StoredData } }` | ✅ 成立 |
+| 显式持久化 | `await this.store.save()` 必须显式调用才写入磁盘 | ✅ 成立 |
+| 二进制文件 | 代码中无任何二进制编码/解码逻辑，Tauri Store 默认为 JSON 文本 | ❌ 不成立 |
+| 已启用加密 | 接口定义了 `encrypt` 选项，但所有调用点（`persistence/index.ts`）均未传入 `encrypt: true` | ❌ 不成立 |
+| 支持加密 | capabilities 中声明了 `"secure"`，表明接口层面支持加密能力 | ✅ 成立（仅能力声明） |
+
+#### 3.5.2 Web 端与桌面端对比表
+
 | 对比项 | Web 端（Browser） | 桌面端（Tauri） |
 |-------|------------------|----------------|
 | **存储引擎** | localStorage | Tauri Store（@tauri-apps/plugin-store） |
-| **存储位置** | 浏览器沙箱 | 应用数据目录（二进制文件） |
-| **序列化方式** | superjson.stringify() | 内置 JSON 序列化 |
-| **数据结构** | 扁平化键值对，每个 key 单独存储 | 结构化对象，所有数据在一个文件中 |
-| **键命名** | `namespace:key` 格式 | 两级嵌套：namespace → key |
-| **安全特性** | 无加密能力 | 支持加密（capabilities: "secure"） |
-| **数据持久化** | 受浏览器隐私设置限制，可能被清除 | 持久化存储，除非用户卸载应用 |
+| **存储位置** | 浏览器沙箱（`localStorage`） | 系统配置目录（如 `%APPDATA%\Hoppscotch\store`） |
+| **文件格式** | 多个独立的 localStorage 键 | 单个 JSON 文件（`hoppscotch-unified.store`） |
+| **序列化方式** | superjson.stringify() | Tauri Store 内置 JSON 序列化 |
+| **数据结构** | 扁平化：`"namespace:key" → value` | 嵌套对象：`{ data: { namespace: { key: value } } }` |
+| **安全特性** | 无加密接口 | 接口支持加密（`StorageOptions.encrypt`），但实际未启用 |
+| **数据持久化** | 受浏览器隐私设置限制，可能被清除 | 持久化存储，除非用户卸载应用或手动删除配置 |
 | **存储上限** | 受 localStorage 限制（通常 5MB） | 受磁盘空间限制 |
-| **写入性能** | 同步写入，小数据快 | 异步写入 + 显式 save() 调用 |
+| **写入性能** | 同步写入，小数据快 | 异步写入 + 显式 `save()` 调用 |
 | **实现文件** | `packages/hoppscotch-kernel/src/store/impl/web/v/1.ts` | `packages/hoppscotch-kernel/src/store/impl/desktop/v/1.ts` |
 
-**Web 端实现要点**（`web/v/1.ts`）：
+**Web 端实现要点**（`web/v/1.ts:39-52`）：
 ```typescript
 // 使用 localStorage 存储
 async set(namespace: string, key: string, value: StoredData): Promise<void> {
@@ -279,7 +327,7 @@ async set(namespace: string, key: string, value: StoredData): Promise<void> {
 }
 ```
 
-**桌面端实现要点**（`desktop/v/1.ts`）：
+**桌面端实现要点**（`desktop/v/1.ts:87-95`）：
 ```typescript
 // 使用 Tauri Store 存储
 async set(namespace: string, key: string, value: StoredData): Promise<void> {
@@ -289,7 +337,7 @@ async set(namespace: string, key: string, value: StoredData): Promise<void> {
   this.data[namespace] = this.data[namespace] || {}
   this.data[namespace][key] = validated
   await this.store.set("data", this.data)  // 所有数据存在一个 key 下
-  await this.store.save()  // 需要显式调用 save() 持久化
+  await this.store.save()  // 必须显式调用才写入磁盘
 }
 ```
 
@@ -351,7 +399,96 @@ async function getUserHistoryStatus() {
 - 未登录用户：`true`（`index.ts:133`）
 - 已登录用户：从后端 `getUserHistoryStore` 查询（`index.ts:139-148`）
 
-### 4.3 开关实时更新
+### 4.3 getUserHistoryStatus 与 loadHistoryEntries 的触发顺序与并发关系
+
+**初始化调用链**（`packages/hoppscotch-selfhost-web/src/platform/history/web/index.ts:42-59`）：
+```typescript
+function initHistorySync() {
+  const currentUser$ = platformAuth.getCurrentUserStream()
+
+  restHistorySyncer.startStoreSync()
+  restHistorySyncer.setupSubscriptions(setupSubscriptions)
+  gqlHistorySyncer.startStoreSync()
+
+  getUserHistoryStatus()   // 调用1：无 await
+  loadHistoryEntries()     // 调用2：无 await，与调用1并发执行
+
+  currentUser$.subscribe(async (user) => {
+    getUserHistoryStatus()  // 调用3：用户变化时，无 await
+    
+    if (user) {
+      await loadHistoryEntries()  // 调用4：有用户时 await 加载
+    }
+  })
+  // ...
+}
+```
+
+#### 4.3.1 触发时序分析
+
+| 触发点 | 调用顺序 | 是否 await | 并发风险 |
+|-------|---------|-----------|---------|
+| 模块初始化（`initHistorySync`） | 先 `getUserHistoryStatus()`，后 `loadHistoryEntries()` | ❌ 都无 await | ✅ 高并发风险 |
+| 用户状态变化（`currentUser$`） | 先 `getUserHistoryStatus()`，后 `loadHistoryEntries()` | `getUserHistoryStatus` 无 await<br>`loadHistoryEntries` 有 await（仅当有 user 时） | ⚠️ 部分并发风险 |
+
+#### 4.3.2 并发竞态条件分析
+
+**场景1：初始化时的竞态**
+
+由于两个函数都没有 `await`，实际执行顺序取决于网络延迟：
+
+```
+时间线：
+T0: getUserHistoryStatus() 发起请求 getUserHistoryStore
+T1: loadHistoryEntries() 发起请求 getUserHistoryEntries
+T2: loadHistoryEntries 先返回 → 覆盖内存中的历史记录
+T3: getUserHistoryStatus 后返回 → 设置 isHistoryStoreEnabled
+```
+
+**问题**：
+- `loadHistoryEntries` 不检查 `isHistoryStoreEnabled`，无论开关状态都会加载历史记录
+- 如果 `loadHistoryEntries` 先完成，而 `isHistoryStoreEnabled = false`，则：
+  - ✅ UI 会正确显示 "History Disabled" 占位图（因为 `v-if="isHistoryStoreEnabled"`）
+  - ⚠️ 内存中已经加载了历史记录数据（但不显示）
+  - ⚠️ 本地持久化会自动保存这些数据
+  - ✅ 不会同步到后端（因为 `syncHistory` 会检查 `isHistoryStoreEnabled`）
+
+**场景2：用户登录时的竞态**
+
+```typescript
+currentUser$.subscribe(async (user) => {
+  getUserHistoryStatus()  // 发起请求但不等待
+  
+  if (user) {
+    await loadHistoryEntries()  // 等待加载完成
+  }
+})
+```
+
+**问题**：
+- `getUserHistoryStatus()` 发起后立即执行 `loadHistoryEntries()`
+- `loadHistoryEntries()` 有 `await`，但 `getUserHistoryStatus()` 没有
+- 仍可能出现历史记录先加载完成，开关状态后更新的情况
+
+#### 4.3.3 对数据展示和开关判断的影响
+
+| 影响点 | 行为 | 是否有问题 |
+|-------|------|-----------|
+| **数据展示** | `v-if="isHistoryStoreEnabled"` 控制，开关关闭时不显示历史列表 | ✅ 正确 |
+| **按钮禁用** | `:disabled="!isHistoryStoreEnabled"` 控制，开关关闭时禁用清空按钮 | ✅ 正确 |
+| **内存数据** | 无论开关状态，`loadHistoryEntries` 都会加载数据到内存 | ⚠️ 数据已加载但不显示 |
+| **本地持久化** | 本地持久化订阅内存变化，自动保存加载的数据 | ⚠️ 开关关闭时本地仍有数据 |
+| **云端同步** | `sync.ts` 检查 `isHistoryStoreEnabled`，开关关闭时不同步新增记录 | ✅ 正确 |
+| **Spotlight 搜索** | `clearHistoryActionEnabledCombined` 检查 `isHistoryStoreEnabled`，开关关闭时不显示"清空历史"选项 | ✅ 正确 |
+
+**设计意图分析**：
+- 本地持久化始终保存数据，保证用户即使关闭开关，再次开启时历史记录不会丢失
+- UI 层面严格受开关控制，用户感知是一致的
+- 只有新增记录的同步受开关控制，已有记录的操作（删除、收藏、清空）仍可同步
+
+---
+
+### 4.4 开关实时更新
 
 通过 GraphQL 订阅实时监听开关状态变化：
 
@@ -482,7 +619,122 @@ function startStoreSync() {
 
 ## 五、历史记录清理触发逻辑
 
-### 5.1 用户手动清理
+### 5.1 history.clear 动作注册与触发路径
+
+#### 5.1.1 动作注册
+
+**动作定义**（`components/history/Personal.vue:371-373`）：
+```typescript
+defineActionHandler("history.clear", () => {
+  confirmRemove.value = true  // 仅打开确认模态框，不直接清空
+})
+```
+
+**动作可用性检查**（`services/spotlight/searchers/history.searcher.ts:44-66`）：
+```typescript
+private clearHistoryActionEnabled = useStreamStatic(
+  activeActions$.pipe(map((actions) => actions.includes("history.clear"))),
+  activeActions$.value.includes("history.clear"),
+  () => {}
+)[0]
+
+private clearHistoryActionEnabledCombined = computed(() => {
+  // 必须同时满足：动作可用 + 历史记录存储已启用
+  return (
+    this.clearHistoryActionEnabled.value &&
+    this.isHistoryEnabledPlatformRef?.value  // 即 isHistoryStoreEnabled
+  )
+})
+```
+
+#### 5.1.2 三条触发路径
+
+**路径1：页面按钮点击**（`Personal.vue:50-61`）
+```
+按钮点击
+    ↓
+confirmRemove.value = true
+    ↓
+显示确认模态框
+    ↓
+用户点击确认
+    ↓
+clearHistory() → clearRESTHistory() / clearGraphqlHistory()
+    ↓
+sync.ts clearHistory() → deleteAllUserHistory() [同步到后端]
+```
+
+**按钮禁用条件**（`Personal.vue:53-57`）：
+```typescript
+:disabled="
+  history.length === 0 ||           // 历史记录为空
+  !isHistoryStoreEnabled ||          // 隐私开关关闭
+  isFetchingHistoryStoreStatus       // 正在获取开关状态
+"
+```
+
+**路径2：Spotlight 搜索**（`history.searcher.ts:101-118, 246-247`）
+```
+用户搜索 "clear" 或 "history"
+    ↓
+clearHistoryActionEnabledCombined 检查
+    ├─ 检查 activeActions$.includes("history.clear")
+    └─ 检查 isHistoryStoreEnabled.value
+    ↓
+显示 "Clear History" 选项（仅当两个条件都满足时）
+    ↓
+用户选择该选项
+    ↓
+invokeAction("history.clear")
+    ↓
+confirmRemove.value = true → 后续同路径1
+```
+
+**路径3：键盘快捷键**
+```
+快捷键触发（如果绑定了 history.clear action）
+    ↓
+invokeAction("history.clear")
+    ↓
+confirmRemove.value = true → 后续同路径1
+```
+
+#### 5.1.3 行为边界一致性分析
+
+**控制层对比表**：
+
+| 控制点 | 检查 `isHistoryStoreEnabled` | 检查 `syncHistory` | 代码位置 |
+|-------|-----------------------------|--------------------|---------|
+| 页面按钮禁用 | ✅ 是（`!isHistoryStoreEnabled`） | ❌ 否 | `Personal.vue:53-57` |
+| Spotlight 选项显示 | ✅ 是（`clearHistoryActionEnabledCombined`） | ❌ 否 | `history.searcher.ts:62-65` |
+| 动作触发（action handler） | ❌ 否（仅打开模态框） | ❌ 否 | `Personal.vue:371-373` |
+| 内存清空（Store） | ❌ 否（直接清空 state） | ❌ 否 | `history.ts:157-161` |
+| 同步到后端（sync.ts） | ❌ 否（直接调用 API） | ✅ 是（`shouldSyncValue()`） | `sync.ts:57-59, index.ts:54-72` |
+| 同步到后端（API 调用） | ❌ 否（直接调用 deleteAllUserHistory） | ❌ 否 | `sync.ts:57-59` |
+
+**代码级结论：存在行为边界不一致**
+
+**不一致点1：UI 层与同步层的控制不一致**
+- UI 层（按钮/Spotlight）：`isHistoryStoreEnabled = false` 时，用户**无法触发**清空操作
+- 同步层（sync.ts）：`isHistoryStoreEnabled = false` 时，如果清空操作被触发，**仍然会同步**到后端
+- 风险：如果绕过 UI 直接调用 `clearRESTHistory()`，即使开关关闭也会同步清空后端数据
+
+**不一致点2：syncHistory 与 isHistoryStoreEnabled 的职责交叉**
+- `syncHistory = false` 时：不会触发任何同步（包括清空）
+- `isHistoryStoreEnabled = false` 时：UI 禁用，但同步层不检查
+- 风险：两个开关的控制逻辑不统一，容易造成理解混淆
+
+**不一致点3：直接 Store 操作无任何检查**
+- `clearRESTHistory()`、`clearGraphqlHistory()` 本身不检查任何开关
+- 只要调用就会清空内存和本地存储
+- 风险：其他模块调用这些函数时，可能绕过所有控制逻辑
+
+**正常用户路径是安全的**：
+对于正常用户（通过页面按钮或 Spotlight 操作），UI 层的检查已经足够，`isHistoryStoreEnabled = false` 时无法触发清空。只有通过代码直接调用 Store 函数才会出现不一致。
+
+---
+
+### 5.2 用户手动清理
 
 **触发位置**：`components/history/Personal.vue:312-316`
 
@@ -499,7 +751,7 @@ const clearHistory = () => {
 - 通过 Spotlight 搜索 "Clear History"
 - 键盘快捷键触发 `history.clear` action
 
-### 5.2 后端批量删除订阅
+### 5.3 后端批量删除订阅
 
 **核心代码**：`index.ts:269-284`
 
@@ -524,7 +776,7 @@ function setupUserHistoryDeletedManySubscription() {
 
 **触发场景**：后端发送某类型（REST 或 GraphQL）历史记录全部删除事件
 
-### 5.3 后端全部删除订阅
+### 5.4 后端全部删除订阅
 
 **核心代码**：`index.ts:302-316`
 
@@ -548,13 +800,13 @@ function setupUserHistoryAllDeletedSubscription() {
 
 **触发场景**：后端发送所有历史记录删除事件
 
-### 5.4 单条记录删除
+### 5.5 单条记录删除
 
 **触发方式**：
 - 点击历史记录卡片的删除按钮：`Personal.vue:349-353`
 - 按时间分组批量删除：`Personal.vue:336-347`
 
-### 5.5 Store 清空实现
+### 5.6 Store 清空实现
 
 **核心代码**：`history.ts:157-161, 219-224`
 
@@ -574,7 +826,7 @@ clearHistory(_, {}) {
 }
 ```
 
-### 5.6 登出行为
+### 5.7 登出行为
 
 **核心代码**：`index.ts:61-69`
 
@@ -667,6 +919,11 @@ if (E.isRight(res)) {
 | UI 响应 | `packages/hoppscotch-common/src/components/history/Personal.vue` | 53-57, 66, 119 |
 | Web 端存储 | `packages/hoppscotch-kernel/src/store/impl/web/v/1.ts` | 39-88 |
 | 桌面端存储 | `packages/hoppscotch-kernel/src/store/impl/desktop/v/1.ts` | 87-95, 216-226 |
+| Store 路径 | `packages/hoppscotch-selfhost-web/src/kernel/store.ts` | 11, 74-92 |
+| 历史记录初始化 | `packages/hoppscotch-selfhost-web/src/platform/history/web/index.ts` | 42-59 |
+| 历史记录加载 | `packages/hoppscotch-selfhost-web/src/platform/history/web/index.ts` | 97-127 |
+| 清空动作注册 | `packages/hoppscotch-common/src/components/history/Personal.vue` | 371-373 |
+| Spotlight 搜索器 | `packages/hoppscotch-common/src/services/spotlight/searchers/history.searcher.ts` | 44-66, 101-118 |
 
 ---
 
@@ -695,6 +952,18 @@ if (E.isRight(res)) {
    - 问题：`"fail "` 多了一个空格
    - 影响：实际不影响功能（因为 `type: "fail"` 会被转换为 `network_fail`），但类型定义不准确
 
+3. **getUserHistoryStatus 与 loadHistoryEntries 并发竞态**
+   - 位置：`packages/hoppscotch-selfhost-web/src/platform/history/web/index.ts:42-59`
+   - 问题：两个异步函数无 `await` 并发执行，`loadHistoryEntries` 可能先于 `getUserHistoryStatus` 返回
+   - 影响：`isHistoryStoreEnabled = false` 时，内存和本地存储仍会加载历史记录（但 UI 不显示）
+   - 风险：低，UI 层控制正确，仅内部数据状态不一致
+
+4. **history.clear 行为边界不一致**
+   - 位置：UI 层（`Personal.vue`, `history.searcher.ts`）与同步层（`sync.ts`）
+   - 问题：UI 层检查 `isHistoryStoreEnabled`，但同步层 `clearHistory()` 不检查
+   - 影响：如果绕过 UI 直接调用 `clearRESTHistory()`，即使开关关闭也会同步到后端
+   - 风险：低，正常用户路径安全
+
 ### 9.2 功能设计注意事项
 
 1. **隐私开关不影响本地存储**：即使 `isHistoryStoreEnabled = false`，历史记录仍会保存在浏览器/本地存储中
@@ -704,9 +973,12 @@ if (E.isRight(res)) {
 5. **4xx/5xx 响应进入历史记录**：HTTP 错误响应只要响应体格式正确就会进入历史记录
 6. **网络失败不进入历史记录**：`network_fail`、`script_fail` 等类型不会进入历史记录
 7. **隐私开关关闭时已有记录仍可操作**：关闭 `isHistoryStoreEnabled` 后，之前同步的记录仍然可以删除、收藏、清空
+8. **loadHistoryEntries 不检查开关状态**：无论 `isHistoryStoreEnabled` 是什么状态，都会从后端加载历史记录
+9. **clearRESTHistory 不检查开关状态**：直接调用会清空内存和本地存储，并可能同步到后端
 
 ### 9.3 跨平台差异
 
 1. **Web 端**：使用 localStorage，受浏览器隐私设置限制，可能被清除
-2. **桌面端**：使用 Tauri Store，数据持久化更可靠，支持加密，存储上限更高
-3. **两者 API 一致**：上层代码无需关心底层存储介质差异
+2. **桌面端**：使用 Tauri Store，单个 JSON 文件存储在系统配置目录，持久化更可靠
+3. **桌面端加密**：接口支持加密（`capabilities: "secure"`），但实际未启用
+4. **两者 API 一致**：上层代码无需关心底层存储介质差异
